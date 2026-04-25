@@ -32,6 +32,7 @@ export interface ChatLaunchOptions {
   cloudApiKey?: string;
   cloudModel?: string;
   showReasoning?: boolean;
+  showDecisioningDemo?: boolean;
   selectedHistoryId?: string | null;
   selectedCliSessionId?: string | null;
 }
@@ -100,9 +101,13 @@ export class HimalayaChatPanel {
   initialize(options: ChatLaunchOptions = {}): void {
     // Restore persisted showReasoning preference when not explicitly provided
     const saved = this.context.workspaceState.get<boolean>(this.reasoningPrefKey);
+    const savedDemo = this.context.workspaceState.get<boolean>(this.demoModePrefKey);
     const mergedOptions = { ...options } as ChatLaunchOptions;
     if (saved !== undefined && mergedOptions.showReasoning === undefined) {
       mergedOptions.showReasoning = Boolean(saved);
+    }
+    if (savedDemo !== undefined && mergedOptions.showDecisioningDemo === undefined) {
+      mergedOptions.showDecisioningDemo = Boolean(savedDemo);
     }
     this.currentOptions = mergedOptions;
     this.selectedHistoryId = options.selectedHistoryId ?? this.currentBootstrap.history.activeRecordId;
@@ -130,6 +135,7 @@ export class HimalayaChatPanel {
   private selectedCliSessionId: string | null = null;
   private readonly dangerApprovalKeyPrefix = 'himalayaCode.dangerApproval.v1';
   private readonly reasoningPrefKey = 'himalayaCode.showReasoning.v1';
+  private readonly demoModePrefKey = 'himalayaCode.showDecisioningDemo.v1';
 
   private summarizePrompt(prompt: string): string {
     const compact = prompt.replace(/\s+/gu, ' ').trim();
@@ -179,6 +185,14 @@ export class HimalayaChatPanel {
           const enabled = Boolean((typedMessage as any).enabled);
           this.currentOptions = { ...this.currentOptions, showReasoning: enabled };
           void this.context.workspaceState.update(this.reasoningPrefKey, enabled);
+        }
+        break;
+
+      case 'toggle-decisioning-demo':
+        if ((typedMessage as any).enabled !== undefined) {
+          const enabled = Boolean((typedMessage as any).enabled);
+          this.currentOptions = { ...this.currentOptions, showDecisioningDemo: enabled };
+          void this.context.workspaceState.update(this.demoModePrefKey, enabled);
         }
         break;
       
@@ -249,14 +263,14 @@ export class HimalayaChatPanel {
       return;
     }
 
+    const route = await readModelRoute(this.context);
+    const model = route.model?.trim() || input.model?.trim() || this.currentBootstrap.config.defaultModel;
+    const modelBackend = route.modelBackend || input.modelBackend?.trim() || this.currentBootstrap.config.defaultModelBackend || 'auto';
+
     if (!this.currentBootstrap.trust) {
       this.host.webview.postMessage({ type: 'error', text: 'Prompt execution is blocked in this workspace.' });
       return;
     }
-
-    const route = await readModelRoute(this.context);
-    const model = input.model?.trim() || route.model?.trim() || this.currentBootstrap.config.defaultModel;
-    const modelBackend = input.modelBackend?.trim() || route.modelBackend || this.currentBootstrap.config.defaultModelBackend || 'auto';
     const permissionMode = input.permissionMode?.trim() || this.currentBootstrap.config.defaultPermissionMode;
 
     let gateBlocked = false;
@@ -277,40 +291,36 @@ export class HimalayaChatPanel {
 
     const cwd = input.cwd?.trim() || undefined;
     const resumeTarget = input.resumeTarget?.trim() || undefined;
-    const files = input.files?.filter(f => f.trim()) ?? [];
-    const maxInlineAttachmentBytes = 128 * 1024;
+    const files = input.files?.map((file) => file.trim()).filter((file): file is string => Boolean(file)) ?? [];
+    const attachmentPaths: string[] = [];
     const blockedAttachmentExtensions = new Set(['.pem', '.key', '.p12', '.pfx', '.kdbx']);
     const blockedAttachmentNameSnippets = ['id_rsa', 'id_ed25519', 'credentials', 'secret', 'token'];
 
-    // Read file contents in the extension process and prepend to the prompt
-    let fullPrompt = prompt;
     for (const filePath of files) {
       const name = path.basename(filePath);
       const lowerName = name.toLowerCase();
       const ext = path.extname(filePath).toLowerCase();
-      const textExts = new Set(['.txt', '.md', '.ts', '.js', '.py', '.json', '.yaml', '.yml', '.toml', '.rs', '.go', '.java', '.c', '.cpp', '.h', '.css', '.html', '.xml', '.csv', '.sh', '.env', '.log']);
       try {
         if (blockedAttachmentExtensions.has(ext) || blockedAttachmentNameSnippets.some(snippet => lowerName.includes(snippet))) {
-          fullPrompt = `[Attachment skipped for safety: ${name}]\n\n${fullPrompt}`;
           this.host.webview.postMessage({ type: 'stderrChunk', text: `Skipped sensitive attachment: ${name}\n` });
           continue;
         }
 
-        if (textExts.has(ext)) {
-          const fileStat = fs.statSync(filePath);
-          if (fileStat.size > maxInlineAttachmentBytes) {
-            fullPrompt = `[File: ${name}]\n(omitted inline; file is ${fileStat.size} bytes, above ${maxInlineAttachmentBytes} bytes limit)\n\n${fullPrompt}`;
-            this.host.webview.postMessage({ type: 'stderrChunk', text: `Large text attachment kept as reference only: ${name} (${fileStat.size} bytes)\n` });
-            continue;
-          }
-          const content = fs.readFileSync(filePath, 'utf8');
-          fullPrompt = `[File: ${name}]\n${content}\n\n${fullPrompt}`;
-        } else {
-          // For binary formats (PDF, images, etc.), pass the absolute path so the model can use its read tools
-          fullPrompt = `[Attached file path: ${filePath}]\n\n${fullPrompt}`;
+        if (!fs.existsSync(filePath)) {
+          this.host.webview.postMessage({ type: 'stderrChunk', text: `Attachment not found: ${name}\n` });
+          continue;
         }
+
+        try {
+          fs.accessSync(filePath, fs.constants.R_OK);
+        } catch {
+          this.host.webview.postMessage({ type: 'stderrChunk', text: `Attachment is not readable: ${name}\n` });
+          continue;
+        }
+
+        attachmentPaths.push(filePath);
       } catch {
-        fullPrompt = `[Attachment: ${name} — could not read file]\n\n${fullPrompt}`;
+        this.host.webview.postMessage({ type: 'stderrChunk', text: `Attachment could not be prepared: ${name}\n` });
       }
     }
 
@@ -349,7 +359,7 @@ export class HimalayaChatPanel {
 
     this.host.webview.postMessage({ type: 'assistantStart', historyId: record.id, model });
 
-    const args = this.buildPromptArgs(fullPrompt, model, permissionMode, resumeTarget);
+    const args = this.buildPromptArgs(prompt, model, permissionMode, resumeTarget, attachmentPaths);
     const env = this.buildModelEnv(modelBackend, this.currentBootstrap.config.ollamaBaseUrl, route);
     let assistantText = '';
     let lineBuf = '';
@@ -408,6 +418,15 @@ export class HimalayaChatPanel {
             this.output.appendLine('[reasoning] failed to forward reasoning_step: ' + String(e));
           }
           break;
+        case 'decisioning_event':
+          try {
+            if (event.decisioning_event) {
+              this.host.webview.postMessage({ type: 'decisioningEvent', event: event.decisioning_event });
+            }
+          } catch (e) {
+            this.output.appendLine('[decisioning] failed to forward decisioning_event: ' + String(e));
+          }
+          break;
         case 'done':
         case 'message_start':
         case 'message_stop':
@@ -445,9 +464,13 @@ export class HimalayaChatPanel {
       if (lineBuf.trim()) { handleStreamLine(lineBuf); lineBuf = ''; }
 
       if (result.exitCode !== 0) {
-        const failure = `\n\nHimalaya exited with code ${result.exitCode}.`;
-        assistantText += failure;
-        this.host.webview.postMessage({ type: 'error', text: failure.trim() });
+        const stderr = result.stderr
+          .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+          .replace(/\x1b[()][AB012]/g, '')
+          .trim();
+        const failure = stderr || `Himalaya exited with code ${result.exitCode}.`;
+        assistantText += `\n\n${failure}`;
+        this.host.webview.postMessage({ type: 'error', text: failure });
       }
 
       await this.history.replaceAssistantTail(record.id, assistantText);
@@ -467,7 +490,13 @@ export class HimalayaChatPanel {
     }
   }
 
-  private buildPromptArgs(prompt: string, model: string, permissionMode: string, resumeTarget?: string): string[] {
+  private buildPromptArgs(
+    prompt: string,
+    model: string,
+    permissionMode: string,
+    resumeTarget?: string,
+    attachmentPaths: string[] = []
+  ): string[] {
     const args: string[] = ['--output-format', 'stream-json', '--allow-broad-cwd'];
 
     if (permissionMode) {
@@ -480,6 +509,10 @@ export class HimalayaChatPanel {
 
     if (resumeTarget) {
       args.push('--resume', resumeTarget);
+    }
+
+    for (const filePath of attachmentPaths) {
+      args.push('--file', filePath);
     }
 
     args.push('prompt', prompt);
@@ -597,9 +630,13 @@ export class HimalayaChatPanel {
       });
 
       if (result.exitCode !== 0) {
-        const failure = `\n\nHimalaya exited with code ${result.exitCode}.`;
+        const stderr = result.stderr
+          .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+          .replace(/\x1b[()][AB012]/g, '')
+          .trim();
+        const failure = stderr || `Himalaya exited with code ${result.exitCode}.`;
         assistantText += failure;
-        this.host.webview.postMessage({ type: 'error', text: failure.trim() });
+        this.host.webview.postMessage({ type: 'error', text: failure });
       }
 
       await this.history.replaceAssistantTail(record.id, assistantText);
@@ -810,7 +847,8 @@ export class HimalayaChatPanel {
       resumeTarget,
       isTrusted,
       activeRecordId,
-      showReasoning: Boolean(options.showReasoning)
+      showReasoning: Boolean(options.showReasoning),
+      showDecisioningDemo: Boolean(options.showDecisioningDemo)
     }).replace(/</g, '\\u003c');
 
     const _head = `<!DOCTYPE html>
@@ -876,6 +914,10 @@ export class HimalayaChatPanel {
       border-radius: var(--radius);
       font-size: 12px;
       line-height: 1;
+    }
+    .icon-btn.active {
+      color: var(--accent-text);
+      background: rgba(255,255,255,0.04);
     }
     .icon-btn:hover { background: var(--surface2); color: var(--text); }
     /* ── model pill ── */
@@ -956,6 +998,226 @@ export class HimalayaChatPanel {
     .msg.reasoning-step { background: rgba(76,132,255,0.04); border-left: 2px solid #4c84ff; padding: 6px 8px; align-self: flex-start; max-width: 100%; }
     .msg.reasoning-step .msg-role { color: #4c84ff; }
     .msg.reasoning-step .msg-body { font-size: 12px; color: var(--text-dim); font-family: inherit; }
+    .msg.decisioning-step { background: rgba(255,167,38,0.05); border-left: 2px solid #ffa726; padding: 6px 8px; align-self: flex-start; max-width: 100%; }
+    .msg.decisioning-step .msg-role { color: #ffa726; }
+    .msg.decisioning-step .msg-body { font-size: 12px; color: var(--text-dim); font-family: inherit; }
+    .decisioning-card {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 4px;
+    }
+    .decisioning-header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .decisioning-summary {
+      min-width: 180px;
+      color: var(--text);
+      line-height: 1.45;
+    }
+    .decisioning-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+    .decisioning-badge,
+    .decisioning-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.04);
+      color: var(--text-dim);
+      font-size: 10px;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+    .decisioning-badge.risk-low { border-color: rgba(102,187,106,0.35); background: rgba(102,187,106,0.12); color: #9be28d; }
+    .decisioning-badge.risk-medium { border-color: rgba(255,167,38,0.35); background: rgba(255,167,38,0.12); color: #ffcb7a; }
+    .decisioning-badge.risk-high { border-color: rgba(244,71,71,0.35); background: rgba(244,71,71,0.12); color: #ff9a9a; }
+    .decisioning-badge.action-allow { border-color: rgba(102,187,106,0.35); }
+    .decisioning-badge.action-review { border-color: rgba(255,167,38,0.35); }
+    .decisioning-badge.action-deny { border-color: rgba(244,71,71,0.35); }
+    .decisioning-section {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.03);
+    }
+    .decisioning-section-title {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--accent-text);
+    }
+    .decisioning-section-note {
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    .decisioning-risk-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .decisioning-risk-summary {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .decisioning-risk-label {
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .decisioning-risk-meter {
+      position: relative;
+      height: 10px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(255,255,255,0.06);
+    }
+    .decisioning-risk-meter span {
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, rgba(102,187,106,0.92), rgba(255,167,38,0.92), rgba(244,71,71,0.92));
+      box-shadow: 0 0 12px rgba(244,71,71,0.14);
+    }
+    .decisioning-risk-details {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      color: var(--text-dim);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+    .decisioning-score-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .decisioning-score-item {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(0,0,0,0.12);
+    }
+    .decisioning-score-item.selected {
+      border-color: rgba(255,167,38,0.32);
+      background: rgba(255,167,38,0.08);
+    }
+    .decisioning-score-header,
+    .decisioning-tree-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .decisioning-score-name,
+    .decisioning-tree-text {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      color: var(--text);
+    }
+    .decisioning-score-meta,
+    .decisioning-tree-meta,
+    .decisioning-node-notes {
+      color: var(--text-dim);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .decisioning-score-value {
+      color: var(--accent-text);
+      font-size: 12px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .decisioning-score-bar {
+      position: relative;
+      height: 7px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(255,255,255,0.06);
+    }
+    .decisioning-score-bar span {
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, rgba(255,167,38,0.92), rgba(78,201,176,0.92));
+      box-shadow: 0 0 12px rgba(255,167,38,0.18);
+    }
+    .decisioning-chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .decisioning-chip.selected {
+      border-color: rgba(255,167,38,0.32);
+      background: rgba(255,167,38,0.14);
+      color: #ffd7a1;
+    }
+    .decisioning-chip.selected-tag {
+      margin-left: 4px;
+      border-color: rgba(255,167,38,0.32);
+      background: rgba(255,167,38,0.14);
+      color: #ffd7a1;
+    }
+    .decisioning-tree {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .decisioning-tree-node {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px 10px 8px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(0,0,0,0.1);
+      border-left: 3px solid rgba(255,167,38,0.38);
+    }
+    .decisioning-tree-node.kind-task { border-left-color: rgba(255,167,38,0.68); }
+    .decisioning-tree-node.kind-step { border-left-color: rgba(78,201,176,0.68); }
+    .decisioning-tree-node.level-0 { margin-left: 0; }
+    .decisioning-tree-node.level-1 { margin-left: 12px; }
+    .decisioning-tree-node.level-2 { margin-left: 24px; }
+    .decisioning-tree-title {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .decisioning-tree-kind {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+    .decisioning-tree-children {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 2px;
+    }
     
     
     .msg-role {
@@ -1171,6 +1433,42 @@ export class HimalayaChatPanel {
       gap: 6px;
     }
     .trust-banner[hidden] { display: none; }
+    .decisioning-demo-surface {
+      flex: 0 0 auto;
+      margin: 8px 10px 0;
+      padding: 10px;
+      border-radius: 12px;
+      border: 1px dashed rgba(76,132,255,0.40);
+      background: linear-gradient(180deg, rgba(76,132,255,0.08), rgba(255,255,255,0.02));
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
+    }
+    .decisioning-demo-surface[hidden] { display: none; }
+    .decisioning-demo-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+      color: var(--text-dim);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+    .decisioning-demo-kicker {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .decisioning-demo-title {
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .03em;
+    }
+    .decisioning-badge.demo {
+      border-color: rgba(76,132,255,0.35);
+      background: rgba(76,132,255,0.12);
+      color: #a8c7ff;
+    }
   </style>
 `;
     const _body = `</head>
@@ -1181,6 +1479,7 @@ export class HimalayaChatPanel {
     <button class="icon-btn" id="btnHistory" title="Toggle history">&#9776;</button>
     <button class="icon-btn" id="btnNew" title="New session">&#43;</button>
     <button class="icon-btn" id="btnReasoning" title="Toggle reasoning visualization">🔎</button>
+    <button class="icon-btn" id="btnDemo" title="Force-visible decisioning demo mode">✨</button>
     <button class="icon-btn" id="btnRefresh" title="Refresh">&#8635;</button>
   </div>
 
@@ -1203,6 +1502,8 @@ export class HimalayaChatPanel {
     <button class="icon-btn" id="btnDoctor" title="Doctor">&#10003;</button>
     <button class="icon-btn" id="btnStatus" title="Status">&#9432;</button>
   </div>
+
+  <div class="decisioning-demo-surface" id="decisioningDemoSurface" hidden></div>
 
   <!-- history drawer (collapsed by default) -->
   <div class="history-drawer" id="historyDrawer">
@@ -1274,8 +1575,10 @@ export class HimalayaChatPanel {
       isTrusted: INIT.isTrusted,
       activeRecordId: INIT.activeRecordId,
       showReasoning: INIT.showReasoning || false,
+      showDecisioningDemo: INIT.showDecisioningDemo || false,
       historyOpen: false,
       streaming: false,
+      lastRunFailed: false,
       messages: [],   /* {role, text} */
       historyRecords: HISTORY
     };
@@ -1295,6 +1598,7 @@ export class HimalayaChatPanel {
     const historyDrawer= document.getElementById('historyDrawer');
     const historyList  = document.getElementById('historyList');
     const trustBanner  = document.getElementById('trustBanner');
+    const decisioningDemoSurface = document.getElementById('decisioningDemoSurface');
 
     /* ── attachment state ── */
     let attachedFiles = [];
@@ -1337,6 +1641,21 @@ export class HimalayaChatPanel {
     function setStatus(text, kind) {
       statusText.textContent = text;
       statusDot.className = 'status-dot' + (kind ? ' ' + kind : '');
+    }
+
+    function updateSendButtonState() {
+      try {
+        if (!sendBtn) { return; }
+        const blocked = !state.isTrusted;
+        sendBtn.disabled = state.streaming || blocked;
+        sendBtn.title = blocked
+          ? 'Trust the workspace or enable himalayaCode.allowUntrustedRuns to run prompts'
+          : state.streaming
+            ? 'A request is already running'
+            : 'Send prompt';
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'updateSendButtonState failed: ' + String(e) }); } catch (_) {}
+      }
     }
 
     function updateModelBar() {
@@ -1481,6 +1800,364 @@ export class HimalayaChatPanel {
       }
     }
 
+    function normalizeDecisioningRiskLevel(event) {
+      const explicit = String(event && event.risk_level ? event.risk_level : '').toLowerCase();
+      if (explicit === 'low' || explicit === 'medium' || explicit === 'high') {
+        return explicit;
+      }
+      const action = String(event && event.action ? event.action : '').toLowerCase();
+      if (action === 'deny') { return 'high'; }
+      if (action === 'review') { return 'medium'; }
+      if (action === 'allow') { return 'low'; }
+      const score = typeof event.risk_score === 'number' ? event.risk_score : undefined;
+      if (typeof score === 'number') {
+        if (score >= 0.7) { return 'high'; }
+        if (score >= 0.35) { return 'medium'; }
+        return 'low';
+      }
+      return 'unknown';
+    }
+
+    function renderDecisioningSummaryBadge(label, className) {
+      return '<span class="decisioning-badge' + (className ? ' ' + className : '') + '">' + esc(label) + '</span>';
+    }
+
+    function getDecisioningDemoEvent() {
+      return {
+        kind: 'tool_selection',
+        title: 'Forced-visible decisioning demo',
+        summary: 'Synthetic snapshot showing tool scores, risk grading, and plan structure even before live decisioning events arrive.',
+        task_id: 'demo-turn',
+        confidence: 0.87,
+        risk_score: 0.42,
+        risk_level: 'medium',
+        selected_tools: ['search', 'planner'],
+        parallelizable: true,
+        action: 'review',
+        tool_scores: [
+          {
+            name: 'search',
+            score: 0.92,
+            success_rate: 0.96,
+            latency_ms: 42,
+            cost: 0.05,
+            parallelizable: true,
+            capabilities: ['search', 'read', 'context'],
+            selected: true
+          },
+          {
+            name: 'planner',
+            score: 0.84,
+            success_rate: 0.90,
+            latency_ms: 88,
+            cost: 0.12,
+            parallelizable: true,
+            capabilities: ['planning', 'analysis'],
+            selected: true
+          },
+          {
+            name: 'writer',
+            score: 0.63,
+            success_rate: 0.81,
+            latency_ms: 120,
+            cost: 0.10,
+            parallelizable: false,
+            capabilities: ['write', 'edit'],
+            selected: false
+          }
+        ],
+        plan_tree: {
+          kind: 'task',
+          id: 'demo-turn',
+          title: 'Inspect and summarize the workspace',
+          parallelizable: true,
+          estimated_effort: 4,
+          candidate_tools: ['search', 'planner', 'writer'],
+          notes: [
+            'Demo mode keeps this surface visible even if no live decisioning event is emitted.',
+            'The card reuses the same rendering path as real decisioning events.'
+          ],
+          children: [
+            {
+              kind: 'step',
+              id: 'demo-turn-analyze',
+              title: 'Analyze the task and rank candidate tools',
+              parallelizable: false,
+              estimated_effort: 2,
+              candidate_tools: ['search', 'planner'],
+              notes: ['Shows the tool score panel and selected badges.'],
+              children: []
+            },
+            {
+              kind: 'step',
+              id: 'demo-turn-verify',
+              title: 'Verify the outcome and surface risk',
+              parallelizable: false,
+              estimated_effort: 1,
+              candidate_tools: ['planner', 'writer'],
+              notes: ['Shows the risk meter and the plan tree hierarchy.'],
+              children: []
+            }
+          ]
+        },
+        details: [
+          'Demo mode: the panel stays visible without waiting for a live decisioning turn.',
+          'Use this mode to show tool scores, risk grade, and plan tree on demand.',
+          'The backend decisioning pipeline still emits the same fields when enabled.'
+        ]
+      };
+    }
+
+    function renderDecisioningEventMarkup(event) {
+      const kind = esc(renderDecisioningKindLabel(event.kind));
+      const title = esc(String(event.title || 'Decisioning'));
+      const summary = String(event.summary || '');
+      const riskLevel = normalizeDecisioningRiskLevel(event);
+      const badges = [];
+      if (event.task_id) { badges.push(renderDecisioningSummaryBadge('task ' + String(event.task_id))); }
+      if (typeof event.confidence === 'number') { badges.push(renderDecisioningSummaryBadge('confidence ' + Math.round(event.confidence * 100) + '%')); }
+      if (typeof event.risk_score === 'number') { badges.push(renderDecisioningSummaryBadge('risk ' + Math.round(event.risk_score * 100) + '%', 'risk-' + riskLevel)); }
+      if (typeof event.parallelizable === 'boolean') { badges.push(renderDecisioningSummaryBadge(event.parallelizable ? 'parallel' : 'serial')); }
+      if (event.action) { badges.push(renderDecisioningSummaryBadge(String(event.action), 'action-' + String(event.action).toLowerCase())); }
+      if (Array.isArray(event.selected_tools) && event.selected_tools.length > 0) { badges.push(renderDecisioningSummaryBadge(event.selected_tools.length + ' tool(s)')); }
+      if (typeof event.risk_score === 'number' || event.risk_level || event.action) {
+        badges.push(renderDecisioningSummaryBadge(riskLevel + ' risk', 'risk-' + riskLevel));
+      }
+      const sections = [];
+      const riskHtml = renderDecisioningRiskPanel(event, riskLevel);
+      if (riskHtml) { sections.push(riskHtml); }
+      const toolScoresHtml = renderDecisioningToolScores(event.tool_scores, event.selected_tools);
+      if (toolScoresHtml) { sections.push(toolScoresHtml); }
+      const planTreeHtml = renderDecisioningPlanTree(event.plan_tree, event.selected_tools);
+      if (planTreeHtml) { sections.push(planTreeHtml); }
+      const notesHtml = renderDecisioningNotes(event.details);
+      if (notesHtml) { sections.push(notesHtml); }
+      const body = summary ? '<div class="decisioning-summary">' + esc(summary) + '</div>' : '<div class="decisioning-summary">' + esc(JSON.stringify(event, null, 2)) + '</div>';
+      return '<div class="msg-role">Decisioning · ' + kind + ' · ' + title + '</div><div class="msg-body"><div class="decisioning-card"><div class="decisioning-header">' + body + '<div class="decisioning-badges">' + badges.join('') + '</div></div>' + sections.join('') + '</div></div>';
+    }
+
+    function updateDecisioningDemoToggle() {
+      try {
+        const btn = document.getElementById('btnDemo');
+        if (!btn) { return; }
+        btn.classList.toggle('active', Boolean(state.showDecisioningDemo));
+        btn.style.opacity = state.showDecisioningDemo ? '1' : '0.65';
+        btn.title = state.showDecisioningDemo ? 'Hide forced-visible decisioning demo mode' : 'Show forced-visible decisioning demo mode';
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'updateDecisioningDemoToggle failed: ' + String(e) }); } catch (_) {}
+      }
+    }
+
+    function updateDecisioningDemoSurface() {
+      try {
+        if (!decisioningDemoSurface) { return; }
+        if (!state.showDecisioningDemo) {
+          decisioningDemoSurface.hidden = true;
+          decisioningDemoSurface.innerHTML = '';
+          return;
+        }
+        const demoEvent = getDecisioningDemoEvent();
+        decisioningDemoSurface.hidden = false;
+        decisioningDemoSurface.innerHTML =
+          '<div class="decisioning-demo-header">' +
+            '<div class="decisioning-demo-kicker">' +
+              '<div class="decisioning-demo-title">Forced-visible decisioning demo</div>' +
+              '<div>This surface stays visible so the new decisioning UI is obvious even when the backend does not emit a live event.</div>' +
+            '</div>' +
+            '<div class="decisioning-badges">' +
+              renderDecisioningSummaryBadge('demo mode', 'demo') +
+              renderDecisioningSummaryBadge('persistent surface') +
+            '</div>' +
+          '</div>' +
+          '<div class="msg decisioning-step">' + renderDecisioningEventMarkup(demoEvent) + '</div>';
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'updateDecisioningDemoSurface failed: ' + String(e) }); } catch (_) {}
+      }
+    }
+
+    function renderDecisioningKindLabel(kind) {
+      const raw = String(kind || '').trim();
+      const lookup = {
+        tool_selection: 'Tool selection',
+        task_decomposition: 'Task decomposition',
+        parallelism_decision: 'Parallelism decision',
+        safety_assessment: 'Safety assessment',
+        plan_adjustment: 'Plan adjustment'
+      };
+      if (lookup[raw]) {
+        return lookup[raw];
+      }
+      if (!raw) {
+        return 'Decision event';
+      }
+      return raw
+        .split('_')
+        .map(function(part) {
+          return part ? part.charAt(0).toUpperCase() + part.slice(1) : part;
+        })
+        .join(' ');
+    }
+
+    function renderDecisioningRiskPanel(event, riskLevel) {
+      const riskScore = typeof event.risk_score === 'number' ? Math.max(0, Math.min(1, event.risk_score)) : undefined;
+      const action = String(event && event.action ? event.action : '').toLowerCase();
+      const hasAction = action === 'allow' || action === 'review' || action === 'deny';
+      const hasRisk = typeof riskScore === 'number' || riskLevel !== 'unknown' || hasAction;
+      const reasonList = Array.isArray(event && event.details) ? event.details.filter(Boolean).slice(0, 4) : [];
+      if (!hasRisk && !reasonList.length) { return ''; }
+      const fill = typeof riskScore === 'number'
+        ? Math.round(riskScore * 100)
+        : riskLevel === 'high'
+          ? 88
+          : riskLevel === 'medium'
+            ? 55
+            : riskLevel === 'low'
+              ? 18
+              : 0;
+      const summaryBits = [];
+      if (typeof riskScore === 'number') { summaryBits.push('score ' + riskScore.toFixed(2)); }
+      if (hasAction) { summaryBits.push('action ' + action); }
+      if (reasonList.length) { summaryBits.push(reasonList.length + ' reason(s)'); }
+      const details = reasonList.length ? '<div class="decisioning-risk-details">' + reasonList.map(function(reason) {
+        return '<div>• ' + esc(String(reason || '')) + '</div>';
+      }).join('') + '</div>' : '';
+      return '<section class="decisioning-section decisioning-risk-panel">' +
+        '<div class="decisioning-section-title">Risk Grade</div>' +
+        '<div class="decisioning-risk-summary">' +
+          '<div class="decisioning-risk-label">' + esc(riskLevel.toUpperCase() + ' risk') + '</div>' +
+          '<div class="decisioning-score-value">' + (typeof riskScore === 'number' ? esc(Math.round(riskScore * 100) + '%') : esc(riskLevel)) + '</div>' +
+        '</div>' +
+        '<div class="decisioning-risk-meter"><span style="width:' + fill + '%"></span></div>' +
+        (summaryBits.length ? '<div class="decisioning-section-note">' + esc(summaryBits.join(' · ')) + '</div>' : '') +
+        details +
+      '</section>';
+    }
+
+    function renderDecisioningToolScores(toolScores, selectedTools) {
+      const list = Array.isArray(toolScores) ? toolScores.filter(Boolean) : [];
+      if (!list.length) { return ''; }
+      const selectedSet = new Set(Array.isArray(selectedTools) ? selectedTools.map(function(name) { return String(name || ''); }) : []);
+      const visibleScores = list.slice(0, 6);
+      const baseline = visibleScores[0] && typeof visibleScores[0].score === 'number' ? visibleScores[0].score : 0;
+      const minScore = visibleScores.reduce(function(acc, item) {
+        return Math.min(acc, typeof item.score === 'number' ? item.score : 0);
+      }, baseline);
+      const maxScore = visibleScores.reduce(function(acc, item) {
+        return Math.max(acc, typeof item.score === 'number' ? item.score : 0);
+      }, baseline);
+      const leaderScore = typeof maxScore === 'number' ? maxScore : 0;
+      const span = maxScore - minScore;
+      const items = visibleScores.map(function(item) {
+        const scoreValue = typeof item.score === 'number' ? item.score : 0;
+        const selected = Boolean(item.selected) || selectedSet.has(String(item.name || ''));
+        const fill = span === 0 ? 100 : Math.max(0, Math.min(100, Math.round(((scoreValue - minScore) / span) * 100)));
+        const meta = [];
+        meta.push('#' + (visibleScores.indexOf(item) + 1));
+        if (scoreValue === leaderScore) { meta.push('leader'); }
+        else if (typeof leaderScore === 'number') { meta.push((leaderScore - scoreValue).toFixed(2) + ' behind leader'); }
+        if (typeof item.success_rate === 'number') { meta.push(Math.round(item.success_rate * 100) + '% success'); }
+        if (typeof item.latency_ms === 'number') { meta.push(item.latency_ms + ' ms'); }
+        if (typeof item.cost === 'number') { meta.push('$' + item.cost.toFixed(2)); }
+        meta.push(item.parallelizable ? 'parallel' : 'serial');
+        const capabilities = Array.isArray(item.capabilities) ? item.capabilities.slice(0, 3) : [];
+        const capabilityCount = Array.isArray(item.capabilities) ? item.capabilities.length : 0;
+        return '<div class="decisioning-score-item' + (selected ? ' selected' : '') + '">' +
+          '<div class="decisioning-score-header">' +
+            '<div>' +
+              '<div class="decisioning-score-name">' +
+                esc(String(item.name || 'tool')) +
+                (selected ? '<span class="decisioning-chip selected-tag">selected</span>' : '') +
+              '</div>' +
+              '<div class="decisioning-score-meta">' + esc(meta.join(' · ')) + '</div>' +
+            '</div>' +
+            '<div class="decisioning-score-value">' + esc(scoreValue.toFixed(2)) + '</div>' +
+          '</div>' +
+          '<div class="decisioning-score-bar"><span style="width:' + fill + '%"></span></div>' +
+          (capabilities.length ? '<div class="decisioning-chip-row">' +
+            capabilities.map(function(capability) { return '<span class="decisioning-chip">' + esc(String(capability || '')) + '</span>'; }).join('') +
+            (capabilityCount > capabilities.length ? '<span class="decisioning-chip">+' + (capabilityCount - capabilities.length) + '</span>' : '') +
+          '</div>' : '') +
+        '</div>';
+      }).join('');
+      const footer = list.length > visibleScores.length ? '<div class="decisioning-section-note">Showing top ' + visibleScores.length + ' of ' + list.length + ' scored tools.</div>' : '';
+      return '<section class="decisioning-section">' +
+        '<div class="decisioning-section-title">Tool Scores</div>' +
+        '<div class="decisioning-score-list">' + items + '</div>' +
+        footer +
+      '</section>';
+    }
+
+    function renderDecisioningPlanNode(node, selectedTools, depth) {
+      if (!node) { return ''; }
+      const selectedSet = selectedTools instanceof Set ? selectedTools : new Set(Array.isArray(selectedTools) ? selectedTools.map(function(name) { return String(name || ''); }) : []);
+      const kind = String(node.kind || 'step').toLowerCase();
+      const title = esc(String(node.title || 'Untitled plan node'));
+      const id = String(node.id || '');
+      const tools = Array.isArray(node.candidate_tools) ? node.candidate_tools : [];
+      const notes = Array.isArray(node.notes) ? node.notes : [];
+      const children = Array.isArray(node.children) ? node.children : [];
+      const meta = [];
+      if (typeof node.estimated_effort === 'number') { meta.push('effort ' + node.estimated_effort); }
+      meta.push(node.parallelizable ? 'parallel' : 'serial');
+      if (id) { meta.push(id); }
+      const toolChips = tools.length ? '<div class="decisioning-chip-row">' + tools.map(function(toolName) {
+        const label = String(toolName || '');
+        return '<span class="decisioning-chip' + (selectedSet.has(label) ? ' selected' : '') + '">' + esc(label) + '</span>';
+      }).join('') + '</div>' : '';
+      const noteBlock = notes.length ? '<div class="decisioning-node-notes">' + notes.map(function(note) {
+        return '<div>' + esc(String(note || '')) + '</div>';
+      }).join('') + '</div>' : '';
+      const childBlock = children.length ? '<div class="decisioning-tree-children">' + children.map(function(child) {
+        return renderDecisioningPlanNode(child, selectedSet, depth + 1);
+      }).join('') + '</div>' : '';
+      return '<div class="decisioning-tree-node kind-' + esc(kind) + ' level-' + depth + '">' +
+        '<div class="decisioning-tree-head">' +
+          '<div class="decisioning-tree-title">' +
+            '<span class="decisioning-tree-kind">' + esc(kind) + '</span>' +
+            '<span class="decisioning-tree-text">' + title + '</span>' +
+          '</div>' +
+          (meta.length ? '<div class="decisioning-tree-meta">' + esc(meta.join(' · ')) + '</div>' : '') +
+        '</div>' +
+        toolChips +
+        noteBlock +
+        childBlock +
+      '</div>';
+    }
+
+    function renderDecisioningPlanTree(node, selectedTools) {
+      if (!node) { return ''; }
+      const selectedSet = new Set(Array.isArray(selectedTools) ? selectedTools.map(function(name) { return String(name || ''); }) : []);
+      return '<section class="decisioning-section">' +
+        '<div class="decisioning-section-title">Plan Tree</div>' +
+        '<div class="decisioning-tree">' + renderDecisioningPlanNode(node, selectedSet, 0) + '</div>' +
+      '</section>';
+    }
+
+    function renderDecisioningNotes(details) {
+      const list = Array.isArray(details) ? details.filter(Boolean) : [];
+      if (!list.length) { return ''; }
+      return '<section class="decisioning-section">' +
+        '<div class="decisioning-section-title">Notes</div>' +
+        '<div class="decisioning-node-notes">' + list.map(function(item) {
+          return '<div>' + esc(String(item || '')) + '</div>';
+        }).join('') + '</div>' +
+      '</section>';
+    }
+
+    function addDecisioningEvent(event) {
+      try {
+        if (!event) { return; }
+        if (!thread) { return; }
+        const div = document.createElement('div');
+        div.className = 'msg decisioning-step';
+        div.innerHTML = renderDecisioningEventMarkup(event);
+        thread.appendChild(div);
+        scrollBottom();
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'addDecisioningEvent failed: ' + String(e) }); } catch (_) {}
+      }
+    }
+
     function updateReasoningToggle() {
       try {
         const btn = document.getElementById('btnReasoning');
@@ -1513,7 +2190,10 @@ export class HimalayaChatPanel {
       const text = promptInput.value.trim();
       if (!text || state.streaming) { return; }
       if (!state.isTrusted) {
+        showEmpty(false);
+        addBubble('error', 'Prompt execution is blocked in this workspace. Trust the workspace or enable himalayaCode.allowUntrustedRuns.');
         setStatus('Workspace untrusted — execution blocked.', 'error');
+        scrollBottom();
         return;
       }
       state.messages.push({ role: 'user', text });
@@ -1524,14 +2204,13 @@ export class HimalayaChatPanel {
       attachedFiles = [];
       renderAttachChips();
       state.streaming = true;
-      sendBtn.disabled = true;
+      state.lastRunFailed = false;
+      updateSendButtonState();
       setStatus('Running…', 'running');
       startStream();
       vscode.postMessage({
         type: 'submit',
         prompt: text,
-        model: state.model,
-        modelBackend: state.modelBackend,
         permissionMode: state.permissionMode,
         resumeTarget: state.resumeTarget,
         files: filesToSend
@@ -1604,8 +2283,21 @@ export class HimalayaChatPanel {
         } catch (_) {}
       });
     }
+    const btnDemoEl = document.getElementById('btnDemo');
+    if (btnDemoEl) {
+      btnDemoEl.addEventListener('click', function() {
+        try {
+          state.showDecisioningDemo = !state.showDecisioningDemo;
+          updateDecisioningDemoToggle();
+          updateDecisioningDemoSurface();
+          try { vscode.postMessage({ type: 'toggle-decisioning-demo', enabled: state.showDecisioningDemo }); } catch (_) {}
+        } catch (_) {}
+      });
+    }
     // ensure initial visual state
     try { updateReasoningToggle(); } catch (_) {}
+    try { updateDecisioningDemoToggle(); } catch (_) {}
+    try { updateDecisioningDemoSurface(); } catch (_) {}
 
     const btnRefreshEl = document.getElementById('btnRefresh');
     if (btnRefreshEl) {
@@ -1663,10 +2355,18 @@ export class HimalayaChatPanel {
             if (msg.options.permissionMode) { state.permissionMode = msg.options.permissionMode; }
             if (msg.options.resumeTarget !== undefined) { state.resumeTarget = msg.options.resumeTarget || ''; }
             if (msg.options.showReasoning !== undefined) { state.showReasoning = Boolean(msg.options.showReasoning); }
+            if (msg.options.showDecisioningDemo !== undefined) { state.showDecisioningDemo = Boolean(msg.options.showDecisioningDemo); }
           }
           trustBanner.hidden = state.isTrusted;
+            setStatus(
+              state.isTrusted ? 'Ready' : 'Workspace untrusted — execution blocked.',
+              state.isTrusted ? '' : 'error'
+            );
           updateModelBar();
+          updateSendButtonState();
           try { updateReasoningToggle(); } catch (_) {}
+          try { updateDecisioningDemoToggle(); } catch (_) {}
+          try { updateDecisioningDemoSurface(); } catch (_) {}
           break;
         
         case 'session-reset':
@@ -1683,9 +2383,18 @@ export class HimalayaChatPanel {
           setStatus('Model updated: ' + state.model, 'done');
           break;
         case 'assistantStart':
+          state.lastRunFailed = false;
           if (!streamBubble) { startStream(); }
+          updateSendButtonState();
           setStatus('Running…', 'running');
           break;
+        case 'stderrChunk': {
+          const stderrText = String(msg.text || '').trim();
+          if (stderrText) {
+            addBubble('stderr', stderrText);
+          }
+          break;
+        }
         case 'assistantChunk':
           appendStream(msg.text || '');
           break;
@@ -1701,17 +2410,24 @@ export class HimalayaChatPanel {
           try { addReasoningStep(msg.step); } catch (_) {}
           break;
         }
+        case 'decisioningEvent': {
+          try { addDecisioningEvent(msg.event); } catch (_) {}
+          break;
+        }
         
         case 'assistantDone':
           endStream();
           state.streaming = false;
-          sendBtn.disabled = false;
-          setStatus('Done', 'done');
+          updateSendButtonState();
+          if (!state.lastRunFailed) {
+            setStatus('Done', 'done');
+          }
           break;
         case 'error':
           endStream();
           state.streaming = false;
-          sendBtn.disabled = false;
+          state.lastRunFailed = true;
+          updateSendButtonState();
           addBubble('error', msg.text || 'Unknown error');
           setStatus('Error', 'error');
           break;
@@ -1720,7 +2436,9 @@ export class HimalayaChatPanel {
 
     /* ── init ── */
     trustBanner.hidden = state.isTrusted;
+    setStatus(state.isTrusted ? 'Ready' : 'Workspace untrusted — execution blocked.', state.isTrusted ? '' : 'error');
     updateModelBar();
+    updateSendButtonState();
     renderThread();
     try { updateReasoningToggle(); } catch (_) {}
     try { vscode.postMessage({ type: 'ready' }); } catch (_) {}

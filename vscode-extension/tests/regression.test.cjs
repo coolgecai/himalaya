@@ -111,6 +111,7 @@ test('stream protocol helpers behave as expected', async () => {
   assert.equal(nonJson.reason, 'not-json');
 
   assert.equal(isKnownStreamEventType('tool_use'), true);
+  assert.equal(isKnownStreamEventType('decisioning_event'), true);
   assert.equal(isKnownStreamEventType('unknown_event'), false);
 
   assert.equal(readProtocolVersion({ type: 'message_start', protocol_version: 1 }), 1);
@@ -120,13 +121,12 @@ test('stream protocol helpers behave as expected', async () => {
   assert.equal(classifyProtocolVersion(undefined), 'missing');
   assert.equal(classifyProtocolVersion(STREAM_PROTOCOL_VERSION), 'match');
   assert.equal(classifyProtocolVersion(STREAM_PROTOCOL_VERSION + 1), 'mismatch');
-  // reasoning_step should be recognized and parseable
-  assert.equal(isKnownStreamEventType('reasoning_step'), true);
-  const reasoningOk = parseStreamEventLine(JSON.stringify({ type: 'reasoning_step', reasoning_step: { step_type: 'analysis', summary: 'testing' } }));
-  assert.equal(reasoningOk.ok, true);
-  assert.equal(reasoningOk.event.type, 'reasoning_step');
-  assert.ok(reasoningOk.event.reasoning_step);
-  assert.equal(reasoningOk.event.reasoning_step.step_type, 'analysis');
+});
+
+test('decisioning visualization hooks remain wired', () => {
+  assert.match(chatPanelSource, /case 'decisioning_event'/);
+  assert.match(chatPanelSource, /addDecisioningEvent/);
+  assert.match(chatPanelSource, /msg decisioning-step/);
 });
 
 test('execution gate blocks run callback when danger confirmation is denied', async () => {

@@ -10,12 +10,14 @@ export type KnownStreamEventType =
   | 'command_match'
   | 'tool_match'
   | 'permission_denial'
-  | 'reasoning_step';
+  | 'reasoning_step'
+  | 'decisioning_event';
 
 
 export type StreamEvent = {
   type: string;
   reasoning_step?: ReasoningStep;
+  decisioning_event?: DecisioningEvent;
   text?: string;
   name?: string;
   input?: unknown;
@@ -42,6 +44,55 @@ export type ReasoningStep = {
   reasoning?: string;
 };
 
+export type DecisioningEventKind =
+  | 'tool_selection'
+  | 'task_decomposition'
+  | 'parallelism_decision'
+  | 'safety_assessment'
+  | 'plan_adjustment';
+
+export type DecisioningRiskLevel = 'low' | 'medium' | 'high';
+
+export type DecisioningToolScore = {
+  name: string;
+  score: number;
+  success_rate: number;
+  latency_ms: number;
+  cost: number;
+  parallelizable: boolean;
+  capabilities: string[];
+  selected: boolean;
+};
+
+export type DecisioningPlanNodeKind = 'task' | 'step';
+
+export type DecisioningPlanNode = {
+  kind: DecisioningPlanNodeKind;
+  id: string;
+  title: string;
+  parallelizable: boolean;
+  estimated_effort: number;
+  candidate_tools: string[];
+  notes: string[];
+  children: DecisioningPlanNode[];
+};
+
+export type DecisioningEvent = {
+  kind: DecisioningEventKind;
+  title: string;
+  summary: string;
+  task_id?: string;
+  confidence?: number;
+  risk_score?: number;
+  risk_level?: DecisioningRiskLevel;
+  selected_tools?: string[];
+  parallelizable?: boolean;
+  action?: 'allow' | 'review' | 'deny';
+  tool_scores?: DecisioningToolScore[];
+  plan_tree?: DecisioningPlanNode;
+  details?: string[];
+};
+
 export type ParsedStreamEvent =
   | { ok: true; event: StreamEvent }
   | { ok: false; reason: 'not-json' | 'invalid-shape' };
@@ -57,6 +108,7 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownStreamEventType> = new Set([
   'tool_match',
   'permission_denial',
   'reasoning_step',
+  'decisioning_event',
 ]);
 
 export function parseStreamEventLine(line: string): ParsedStreamEvent {
