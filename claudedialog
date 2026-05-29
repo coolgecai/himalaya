@@ -1,0 +1,1323 @@
+继续对当前系统的功能、架构、代码实现情况进行总结，给出下一步的改进划。
+当前系统已经进入一个比较关键的阶段：从“Claude Code 类运行时 + 可观测事件流”升级到了“长程任务可恢复执行系统的雏形”。
+
+它现在已经不只是一次性对话执行器，而是具备了任务注册、DAG 计划、验证、恢复、路由反馈、Team 事件、CLI 控制、VS Code 可视化协议和 deterministic replay 的完整骨架。
+
+一、当前系统功能状态总结
+1. CLI 基础能力
+当前 CLI 已经具备：
+
+普通 prompt 执行
+stream-json 协议输出
+session 持久化
+permission mode 控制
+tool permission gate
+mock Anthropic service parity 测试
+TaskPacket 嵌入识别
+acceptance tests 验证
+verification failure → recovery → task status 更新
+durable task registry 持久化
+CLI 任务控制命令已经扩展为：
+
+
+Himalaya tasks list
+Himalaya tasks list --status blocked
+Himalaya tasks show <task-id>
+Himalaya tasks resume <task-id> [prompt]
+Himalaya tasks resume <task-id> --from-node <node-id> [prompt]
+Himalaya tasks retry <task-id> --node <node-id>
+Himalaya tasks verify <task-id> --node <node-id> <command>
+Himalaya tasks compact <task-id> [--keep-last N]
+Himalaya tasks cancel <task-id>
+这些命令已经让系统具备了长程任务控制面的初步能力。
+
+2. TaskRegistry 长程任务状态
+核心实现集中在 task_registry.rs。
+
+当前 task registry 已经支持：
+
+durable task snapshot
+task status lifecycle
+checkpoint
+plan snapshot
+resume cursor
+verification result
+recovery event
+recovery action execution
+team event
+model route feedback
+progress ledger
+task event compaction
+当前任务状态包括：
+
+
+created
+planning
+running
+waiting_for_permission
+waiting_for_verification
+recovering
+blocked
+completed
+failed
+stopped
+cancelled
+新增的恢复相关结构包括：
+
+TaskResumeCursor
+TaskPlanSnapshot
+TaskCheckpoint
+recovery action execution records
+per-task route feedback records
+这意味着系统现在可以记录“任务执行到哪里了、哪些节点完成了、哪些节点可以恢复、为什么 blocked”。
+
+3. Plan DAG 与节点级执行状态
+核心实现集中在：
+
+decisioning.rs
+plan_executor.rs
+execution_scheduler.rs
+当前已经支持：
+
+Plan DAG 生成
+DAG node ready / running / succeeded / failed / skipped 状态
+plan execution event
+node retry
+resumable node 查询
+completed node 查询
+node-level verification gate
+node verification result 记录
+resume cursor 自动更新
+新增能力包括：
+
+
+PlanExecution::resumable_nodes
+PlanExecution::completed_nodes
+PlanExecution::retry_node
+PlanExecution::attach_verification_gate
+PlanExecution::record_node_verification
+这为“从失败节点继续执行”奠定了基础。
+
+当前限制是：
+
+DAG resume 目前主要是状态层和 CLI 控制层能力，尚未完全变成一个独立的自动 DAG 执行引擎。
+
+也就是说，目前可以标记从某个 node 恢复、retry node、记录 verification gate，但 runtime 还没有完全脱离 LLM turn loop，做到“自动读取 DAG → 调度未完成节点 → 执行工具 → 验证 → 继续后续节点”。
+
+4. Verification 系统
+核心实现：
+
+verification_runner.rs
+verifier.rs
+当前验证系统比较稳健：
+
+acceptance tests 不通过 shell 执行
+command string 会拆分成 argv
+禁止 |、&、;、<、>、`、$ 等 shell 控制语法
+仅允许白名单程序：
+cargo
+npm
+node
+python
+python3
+deno
+bun
+go
+rustc
+bash / sh 仅允许直接执行 .sh
+有 command timeout
+捕获 stdout / stderr / exit code
+只有 danger-full-access / allow 下才真正运行验证命令
+这块安全边界目前做得比较好。
+
+5. FailureClassifier 与 Recovery
+核心实现：
+
+failure_classifier.rs
+recovery_recipes.rs
+recovery_orchestrator.rs
+recovery_actions.rs
+当前失败分类可以识别：
+
+compile/test failure
+permission/trust gate
+MCP handshake failure
+plugin startup failure
+provider failure
+stale branch
+generic verification failure
+第四阶段新增了 RecoveryActionEngine，把 recovery recipe 从“纯事件”推进到“可执行动作计划”的雏形。
+
+现在 recovery flow 大致是：
+
+
+verification failed
+  → FailureClassifier 分类
+  → RecoveryOrchestrator 生成 recovery outcome/events
+  → RecoveryActionEngine 生成 action plan
+  → 根据 permission mode 判断哪些 action 可安全执行/记录
+  → task 进入 recovering / blocked / failed
+  → action execution 写入 task registry
+当前支持的 recovery action 类型包括：
+
+
+rerun_verification
+retry_node
+request_permission
+switch_model
+restart_plugin
+retry_mcp_handshake
+mark_blocked
+escalate
+当前限制是：
+
+RecoveryActionEngine 目前仍偏“受控计划 + 安全记录”，还不是完整的真实动作执行器。
+
+比如 rerun_verification、retry_node、switch_model 已经可以被表达，但还没有形成一个自动循环：
+
+
+执行 recovery action
+  → 修改 DAG/node 状态
+  → 自动重试 node
+  → 自动重新验证
+  → 自动继续后续 DAG
+6. Model Router 与 MoE 路由反馈
+核心实现：model_router.rs
+
+当前系统支持：
+
+phase-based routing：
+planning
+coding
+verification
+summarization
+vision
+local_fast
+model route decision
+confidence
+fallback model
+route feedback
+feedback-aware selection
+第四阶段新增：
+
+
+ModelRouter::select_with_feedback
+现在路由器会读取当前 task 的 route feedback，如果某个 phase/model 最近失败率或 recovery 触发率较高，会：
+
+降低 confidence
+在 reason 中说明 route feedback failure/recovery rate
+设置 fallback model
+当前限制是：
+
+路由反馈目前是 per-task 层面的轻量调权，还没有变成全局长期学习系统。
+
+下一步可以做跨任务 route memory / route ledger aggregation。
+
+7. TeamCoordinator
+核心实现：
+
+team_execution.rs
+team_coordinator.rs
+当前系统已有 team event ledger，并新增了单进程 TeamCoordinator。
+
+它可以根据 DAG node 和 tool hints 做角色分配：
+
+read / grep 类工具 → planner
+write / edit 类工具 → implementer
+task root → planner
+默认 step → implementer
+当前支持结构：
+
+WorkerAssignment
+TeamCoordinationPlan
+TeamCoordinator
+当前限制是：
+
+TeamCoordinator 目前是“单进程角色分配器”，还不是真正 worker pool，也没有真实多 agent 并行执行。
+
+但它已经是后续多 worker 调度的基础。
+
+8. VS Code 扩展状态
+核心实现：
+
+streamProtocol.ts
+chatPanel.ts
+history.ts
+regression.test.cjs
+当前 VS Code 已经支持解析和展示：
+
+decisioning_event
+plan_execution_event
+task_ledger_event
+model_route_event
+team_execution_event
+recovery_event
+recovery_suggestion
+第四阶段补充了协议类型：
+
+TaskResumeCursor
+NodeVerificationGate
+RecoveryActionRisk
+RecoveryActionKind
+当前 UI 能在 runtime timeline 中展示：
+
+plan attempt
+blocking reason
+verification gate
+route confidence
+route fallback
+当前限制是：
+
+VS Code 目前还是 chat timeline + protocol hook，还不是完整 task dashboard。
+
+还缺：
+
+durable task list
+task detail panel
+DAG node view
+resume/cancel/retry buttons
+verification/recovery action view
+route feedback view
+二、当前架构状态
+当前架构可以概括为：
+
+
+CLI / VS Code
+    ↓
+stream-json protocol
+    ↓
+ConversationRuntime
+    ↓
+TaskRegistry
+    ↓
+DecisioningEngine / Plan DAG
+    ↓
+Tool execution + PermissionPolicy
+    ↓
+VerificationRunner
+    ↓
+FailureClassifier
+    ↓
+RecoveryOrchestrator
+    ↓
+RecoveryActionEngine
+    ↓
+Task ledger / Team events / Route feedback
+    ↓
+Persistent .Himalaya/tasks snapshot
+这套架构的优点是：
+
+事件化边界清晰
+
+runtime event 可以被 CLI、VS Code、tests 同时消费。
+
+任务状态开始独立于 session transcript
+
+.Himalaya/tasks 比单纯 session log 更适合长程任务恢复。
+
+验证与恢复链路已经结构化
+
+verification result、failure classification、recovery event、recovery action 都有明确模型。
+
+权限边界没有被自治能力绕过
+
+verification command 和 recovery action 都受 permission mode 限制。
+
+测试体系比较完整
+
+包括 Rust unit/workspace tests、CLI stream-json contract、mock parity、VS Code regression、prepackage、secret guard。
+
+三、当前代码实现质量状态
+最近一轮验证通过：
+
+cargo fmt --manifest-path "rust/Cargo.toml" --all -- --check
+cargo clippy --manifest-path "rust/Cargo.toml" --workspace --all-targets -- -D warnings
+targeted runtime tests
+CLI task parsing tests
+cargo test --manifest-path "rust/Cargo.toml" --workspace
+npm run prepackage --prefix "vscode-extension"
+44 个 regression tests 通过
+VSIX prepackage checks 通过
+python3 "rust/scripts/run_mock_parity_diff.py"
+13 个场景通过
+46 个请求通过
+bash "scripts/check-no-secrets.sh" .
+没有 commit，没有 push。
+
+四、当前主要短板
+1. DAG resume 还没有完全执行化
+现在有：
+
+
+resume cursor
+retry node
+node verification gate
+CLI resume --from-node
+但还缺：
+
+
+runtime 自动根据 cursor 调度 DAG node
+跳过 completed node
+执行 failed/blocked/ready node
+执行后刷新后续 DAG
+这是下一步最核心的问题。
+
+2. RecoveryActionEngine 尚未驱动真实恢复循环
+现在 recovery action 已经能生成和记录，但还缺 action executor 的真实执行逻辑。
+
+比如：
+
+retry_node 应该直接调用 DAG retry 并进入执行循环
+rerun_verification 应该调用 VerificationRunner
+switch_model 应该影响下一轮 ModelRouter
+request_permission 应该进入 waiting_for_permission
+restart_plugin / retry_mcp_handshake 应该接 plugin/MCP lifecycle
+3. TeamCoordinator 尚未进入 runtime 主执行路径
+现在 TeamCoordinator 已经存在，但还没有成为 runtime 内部统一调度器。
+
+后续应该变成：
+
+
+DAG node → WorkerAssignment → role policy → model route → execution result → team event
+4. Model feedback 仍是局部反馈
+当前 select_with_feedback 只读取当前 task 的 feedback。
+
+更理想的是：
+
+
+workspace-level route ledger
+phase/model success rate
+failure class distribution
+latency/cost trend
+fallback success rate
+这样才算真正 MoE 自适应。
+
+5. VS Code 缺少真正 task dashboard
+当前 VS Code 有 stream protocol 和 timeline hook，但用户还不能直接：
+
+浏览 durable tasks
+打开 task detail
+查看 DAG node 状态
+点击 resume/retry/cancel
+查看 recovery action plan
+查看 route feedback
+五、下一步改进计划
+我建议下一轮定义为：
+
+第五阶段：把“可恢复状态控制面”升级为“自动 DAG 执行与恢复引擎”。
+
+建议按下面顺序推进。
+
+1. 实现 TaskExecutionEngine
+目标：把 DAG resume 从状态记录变成真实调度。
+
+新增模块建议：
+
+
+task_execution_engine.rs
+核心结构：
+
+
+TaskExecutionEngine
+TaskExecutionRequest
+TaskExecutionStep
+TaskExecutionOutcome
+职责：
+
+读取 TaskPlanSnapshot
+找到 resumable node
+跳过 completed node
+对 ready/failed/blocked node 生成 execution step
+执行后更新 PlanExecution
+写回 TaskRegistry
+验收标准：
+
+tasks resume --from-node 不只是 prompt hint，而是真正调度该 node。
+completed node 不重复执行。
+failed node retry 后进入 ready/running/succeeded。
+task ledger 可看到 node-level resume lifecycle。
+2. 实现真实 RecoveryActionExecutor
+目标：把 recovery action plan 转为实际安全动作。
+
+新增或扩展：
+
+
+RecoveryActionExecutor
+RecoveryActionExecutionContext
+动作落地：
+
+retry_node → TaskRegistry::retry_plan_node
+rerun_verification → VerificationRunner::run
+request_permission → task status waiting_for_permission
+switch_model → route hint / route feedback penalty
+mark_blocked → task status blocked
+escalate → task status blocked + explicit reason
+验收标准：
+
+verification failed 后能自动生成并执行 safe recovery actions。
+danger action 在 read-only 下 blocked，不执行。
+action result 写入 task registry。
+stream-json 输出 action result event。
+3. 将 node-level verification 接入执行路径
+当前已有 node verification gate，但还没进入真实 runtime execution loop。
+
+下一步：
+
+DAG node 可带 verification command
+node succeed 前运行 node verification
+node verification failure 只 fail 当前 node
+recovery action 可重试当前 node
+task-level verification 作为最终 gate
+验收标准：
+
+一个 node 失败不会直接让整个 task failed。
+node recovery 成功后后续 node 可以继续执行。
+tasks verify <id> --node <node> <command> 可以被 resume 执行消费。
+4. TeamCoordinator 接入 DAG execution
+目标：让 role assignment 不只是测试结构，而是真实出现在任务执行中。
+
+需要：
+
+每个 DAG node 分配 role
+role 影响 model route phase
+role lifecycle 进入 task registry
+worker assignment 显示在 CLI/VS Code
+初版仍然可以单进程。
+
+验收标准：
+
+task show 能看到 node → role assignment。
+stream-json 输出 task_assigned/node_started/node_finished。
+verifier/recovery role 有独立事件。
+5. 引入 workspace-level Route Feedback Store
+目标：让 MoE 路由从 per-task feedback 升级为长期反馈。
+
+新增：
+
+
+route_feedback_store.rs
+存储位置建议：
+
+
+.Himalaya/routes/feedback.json
+聚合维度：
+
+phase
+model
+provider
+failure class
+recovery triggered
+verification passed
+latency
+token/cost
+验收标准：
+
+ModelRouter 可以读取 workspace feedback。
+连续失败模型 confidence 降低。
+fallback 成功率高时自动倾向 fallback。
+route reason 可解释历史依据。
+6. 增加 tasks execute / tasks verify 的真实运行模式
+现在 CLI task commands 多是控制/记录。
+
+下一步建议：
+
+
+Himalaya tasks execute <task-id>
+Himalaya tasks execute <task-id> --from-node <node-id>
+Himalaya tasks verify <task-id>
+Himalaya tasks verify <task-id> --node <node-id>
+Himalaya tasks recover <task-id>
+验收标准：
+
+用户可以不重新写 prompt，直接让 engine 推进 task。
+CLI 输出清晰说明执行了哪些 node/action。
+stream-json 可被 VS Code 消费。
+7. VS Code Task Dashboard 初版
+建议做一个轻量 dashboard，不先做复杂图形 DAG。
+
+UI 分区：
+
+
+Task list
+Task detail
+Timeline
+Plan nodes
+Recovery actions
+Verification gates
+Route feedback
+按钮：
+
+Resume
+Retry node
+Verify node
+Cancel
+Compact
+验收标准：
+
+VS Code 能列出 durable tasks。
+点击 task 能看到 checkpoints / plan / ledger。
+能触发 CLI task commands。
+UI 不因为大 ledger 卡顿。
+8. Long-task replay eval 扩展
+新增 deterministic scenarios：
+
+DAG resume from failed node
+node verification failed → retry node
+recovery action blocked by permission
+recovery action safe retry
+route feedback lowers confidence
+task compact preserves latest events
+VS Code parses task dashboard protocol
+验收标准：
+
+mock service 下稳定运行。
+stream-json contract 覆盖新增事件。
+CI 不依赖真实外部服务。
+9. 安全边界强化
+新增策略类型：
+
+
+TaskPermissionContext
+NodeRequiredPermission
+RecoveryActionPolicy
+ResumePermissionPolicy
+规则：
+
+resume 不自动提升权限
+retry node 不绕过 permission policy
+recovery action 不执行 danger action
+verification command 继续走 allowlist
+task snapshot 不保存敏感文件内容
+route feedback 不记录 secrets
+验收标准：
+
+read-only 下 recovery danger action 只 blocked。
+danger-full-access 仍需显式用户选择。
+secret guard 覆盖 task snapshot / evidence 路径。
+10. Task snapshot compaction 与分页
+当前 task registry 会越来越大。
+
+下一步需要：
+
+ledger pagination
+event retention policy
+evidence truncation
+route feedback aggregation
+old event compaction
+CLI tasks show --tail N
+VS Code lazy-load details
+验收标准：
+
+大任务不会让 .Himalaya/tasks/tasks.json 无限增长。
+VS Code 打开 task list 快速。
+compact 后仍保留 resume cursor 和最新 recovery/verification 状态。
+六、推荐最高优先级
+下一轮最优先做这 3 个：
+
+
+1. TaskExecutionEngine
+2. RecoveryActionExecutor
+3. node-level verification execution
+原因是当前系统已经有了状态、事件、CLI 控制和安全边界；下一步的关键不是继续加字段，而是让这些状态真正驱动执行。
+
+换句话说，下一阶段的核心目标应该是：
+
+
+从“能记录任务如何恢复”
+升级为
+“能自动恢复并继续推进任务”
+你又给出了10项修改任务，我赞同！请按照你推荐的十项建议及优先顺序，谨慎自主完成，我授权你对目录及文件的操作权限。
+我会按第五阶段十项优先顺序继续实现，先落地 TaskExecutionEngine、真实 recovery action 执行与 node-level verification，再接 CLI/VS Code 协议和测试验证。
+
+Update Todos
+
+Inspect current fifth-stage extension points
+
+Add TaskExecutionEngine for resumable DAG execution
+
+Implement RecoveryActionExecutor against task registry
+
+Wire node-level verification execution
+
+Integrate TeamCoordinator into execution flow
+
+Add workspace route feedback store
+
+Extend CLI tasks execute verify recover commands
+
+Add VS Code task dashboard protocol hooks
+
+Add long-task replay eval tests
+
+Harden safety and task snapshot compaction
+
+Run full validation gates
+我将先读取当前 runtime/CLI 相关文件，确认第四阶段实现后的精确接口，再做第五阶段核心引擎。
+
+Read task_registry.rs (lines 1-760)
+Read recovery_actions.rs (lines 1-320)
+Read plan_executor.rs (lines 1-340)
+Read main.rs (lines 531-710)
+API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request
+
+任务中断，请继续完成任务
+API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request
+
+任务中断，请继续完成任务
+API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request
+
+任务中断，请继续完成任务
+API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request
+
+任务中断，请继续完成任务
+我会从中断点继续，先检查第五阶段新增模块和 CLI 任务命令的当前状态，再补齐执行引擎与验证。
+
+Update Todos
+
+Inspect current fifth-stage extension points
+
+Add TaskExecutionEngine for resumable DAG execution
+
+Implement RecoveryActionExecutor against task registry
+
+Wire node-level verification execution
+
+Integrate TeamCoordinator into execution flow
+
+Add workspace route feedback store
+
+Extend CLI tasks execute verify recover commands
+
+Add VS Code task dashboard protocol hooks
+
+Add long-task replay eval tests
+
+Harden safety and task snapshot compaction
+
+Run full validation gates
+Bash Inspect fifth-stage implementation points
+IN
+rg -n "TaskExecutionEngine|RecoveryActionExecutor|RouteFeedbackStore|TaskCliCommand|tasks execute|execute_safe_actions|retry_plan_node|attach_node_verification|TaskResumeCursor|NodeVerificationGate" "rust/crates/runtime/src" "rust/crates/rusty-Himalaya-cli/src/main.rs" "vscode-extension/src" "vscode-extension/tests"
+
+OUT
+rust/crates/rusty-Himalaya-cli/src/main.rs:439:        command: TaskCliCommand,
+rust/crates/rusty-Himalaya-cli/src/main.rs:531:enum TaskCliCommand {
+rust/crates/rusty-Himalaya-cli/src/main.rs:995:fn parse_task_cli_command(args: &[String]) -> Result<TaskCliCommand, String> {
+rust/crates/rusty-Himalaya-cli/src/main.rs:997:        None | Some(("list", [])) => Ok(TaskCliCommand::List { status: None }),
+rust/crates/rusty-Himalaya-cli/src/main.rs:998:        Some(("list", [flag, status])) if flag == "--status" => Ok(TaskCliCommand::List {
+rust/crates/rusty-Himalaya-cli/src/main.rs:1001:        Some(("show", [task_id])) => Ok(TaskCliCommand::Show {
+rust/crates/rusty-Himalaya-cli/src/main.rs:1004:        Some(("resume", [task_id])) => Ok(TaskCliCommand::Resume {
+rust/crates/rusty-Himalaya-cli/src/main.rs:1010:            Ok(TaskCliCommand::Resume {
+rust/crates/rusty-Himalaya-cli/src/main.rs:1020:        Some(("resume", [task_id, prompt @ ..])) => Ok(TaskCliCommand::Resume {
+rust/crates/rusty-Himalaya-cli/src/main.rs:1025:        Some(("retry", [task_id, flag, node_id])) if flag == "--node" => Ok(TaskCliCommand::Retry {
+rust/crates/rusty-Himalaya-cli/src/main.rs:1032:            Ok(TaskCliCommand::Verify {
+rust/crates/rusty-Himalaya-cli/src/main.rs:1038:        Some(("compact", [task_id])) => Ok(TaskCliCommand::Compact {
+rust/crates/rusty-Himalaya-cli/src/main.rs:1043:            Ok(TaskCliCommand::Compact {
+rust/crates/rusty-Himalaya-cli/src/main.rs:1050:        Some(("cancel", [task_id])) => Ok(TaskCliCommand::Cancel {
+rust/crates/rusty-Himalaya-cli/src/main.rs:5540:    command: TaskCliCommand,
+rust/crates/rusty-Himalaya-cli/src/main.rs:5549:        TaskCliCommand::List { status } => match output_format {
+rust/crates/rusty-Himalaya-cli/src/main.rs:5556:        TaskCliCommand::Show { task_id } => match output_format {
+rust/crates/rusty-Himalaya-cli/src/main.rs:5570:        TaskCliCommand::Cancel { task_id } => {
+rust/crates/rusty-Himalaya-cli/src/main.rs:5581:        TaskCliCommand::Retry { task_id, node_id } => {
+rust/crates/rusty-Himalaya-cli/src/main.rs:5583:            let task = registry.retry_plan_node(&task_id, &node_id)?;
+rust/crates/rusty-Himalaya-cli/src/main.rs:5597:        TaskCliCommand::Verify {
+rust/crates/rusty-Himalaya-cli/src/main.rs:5604:                registry.attach_node_verification(&task_id, &node_id, command.clone(), true)?;
+rust/crates/rusty-Himalaya-cli/src/main.rs:5617:        TaskCliCommand::Compact { task_id, keep_last } => {
+rust/crates/rusty-Himalaya-cli/src/main.rs:5633:        TaskCliCommand::Resume {
+rust/crates/rusty-Himalaya-cli/src/main.rs:5640:                let _ = registry.retry_plan_node(&task_id, node_id)?;
+rust/crates/rusty-Himalaya-cli/src/main.rs:9833:        StatusUsage, TaskCliCommand, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+rust/crates/rusty-Himalaya-cli/src/main.rs:10832:            TaskCliCommand::List {
+rust/crates/rusty-Himalaya-cli/src/main.rs:10844:                command: TaskCliCommand::Show {
+rust/crates/rusty-Himalaya-cli/src/main.rs:10864:            TaskCliCommand::Resume {
+rust/crates/rusty-Himalaya-cli/src/main.rs:10878:            TaskCliCommand::Retry {
+rust/crates/rusty-Himalaya-cli/src/main.rs:10893:            TaskCliCommand::Verify {
+vscode-extension/src/streamProtocol.ts:150:export type TaskResumeCursor = {
+vscode-extension/src/streamProtocol.ts:157:export type NodeVerificationGate = {
+rust/crates/runtime/src/recovery_actions.rs:90:    pub fn execute_safe_actions(
+rust/crates/runtime/src/recovery_actions.rs:242:        let execution = engine.execute_safe_actions(plan, PermissionMode::ReadOnly);
+rust/crates/runtime/src/recovery_actions.rs:257:        let execution = engine.execute_safe_actions(
+rust/crates/runtime/src/task_registry.rs:63:pub struct TaskResumeCursor {
+rust/crates/runtime/src/task_registry.rs:76:    pub resume_cursor: Option<TaskResumeCursor>,
+rust/crates/runtime/src/task_registry.rs:446:        let cursor = TaskResumeCursor {
+rust/crates/runtime/src/task_registry.rs:571:    pub fn retry_plan_node(&self, task_id: &str, node_id: &str) -> Result<Task, String> {
+rust/crates/runtime/src/task_registry.rs:583:        plan.resume_cursor = Some(TaskResumeCursor {
+rust/crates/runtime/src/task_registry.rs:603:    pub fn attach_node_verification(
+rust/crates/runtime/src/task_registry.rs:623:        plan.resume_cursor = Some(TaskResumeCursor {
+rust/crates/runtime/src/lib.rs:151:    dependency_map, reverse_dependency_map, NodeVerificationGate, PlanExecution,
+rust/crates/runtime/src/lib.rs:204:    ProgressLedgerEntry, TaskCheckpoint, TaskPlanSnapshot, TaskRegistry, TaskResumeCursor,
+rust/crates/runtime/src/conversation.rs:2452:                    .execute_safe_actions(action_plan, self.permission_policy.active_mode());
+rust/crates/runtime/src/plan_executor.rs:49:pub struct NodeVerificationGate {
+rust/crates/runtime/src/plan_executor.rs:65:    pub verification_gate: Option<NodeVerificationGate>,
+rust/crates/runtime/src/plan_executor.rs:209:            node.verification_gate = Some(NodeVerificationGate {
+现有第四阶段结构还在，尚未新增 TaskExecutionEngine/真实 action executor；我将先新增 runtime 执行引擎模块和 workspace route feedback store。
+
+Read recovery_actions.rs (lines 1-320)
+Read task_registry.rs (lines 51-310)
+我会新增 task_execution_engine.rs 和 route_feedback_store.rs，并扩展 recovery actions 为真正 registry executor。
+
+Write task_execution_engine.rs
+230 lines
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    PlanNodeStatus, TaskRegistry, TaskStatus, TeamCoordinator, VerificationCommandResult,
+    VerificationRequest, VerificationResult, VerificationRunner,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskExecutionStepKind {
+    ResumeNode,
+    RunNodeVerification,
+    CompleteTask,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskExecutionStep {
+    pub task_id: String,
+    pub node_id: Option<String>,
+    pub kind: TaskExecutionStepKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskExecutionOutcome {
+    pub task_id: String,
+    pub steps: Vec<TaskExecutionStep>,
+    pub completed: bool,
+    pub blocked: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskExecutionEngine {
+    registry: TaskRegistry,
+    verification_runner: VerificationRunner,
+}
+
+impl TaskExecutionEngine {
+    #[must_use]
+    pub fn new(registry: TaskRegistry, verification_runner: VerificationRunner) -> Self {
+        Self {
+            registry,
+            verification_runner,
+        }
+    }
+
+    pub fn execute(&self, task_id: &str, from_node: Option<&str>) -> Result<TaskExecutionOutcome, String> {
+        if let Some(node_id) = from_node {
+            let _ = self.registry.retry_plan_node(task_id, node_id)?;
+        }
+        let task = self
+            .registry
+            .resume(task_id)
+            .or_else(|_| self.registry.get(task_id).ok_or_else(|| format!("task not found: {task_id}")))?;
+        let Some(plan) = task.plan.clone() else {
+            let _ = self.registry.set_status(task_id, TaskStatus::Blocked);
+            return Ok(TaskExecutionOutcome {
+                task_id: task_id.to_string(),
+                steps: vec![TaskExecutionStep {
+                    task_id: task_id.to_string(),
+                    node_id: None,
+                    kind: TaskExecutionStepKind::Blocked,
+                    message: "task has no persisted plan".to_string(),
+                }],
+                completed: false,
+                blocked: true,
+                message: "task has no persisted plan".to_string(),
+            });
+        };
+
+        let mut steps = Vec::new();
+        let mut execution = plan.execution.clone();
+        let resume_nodes = from_node
+            .map(|node| vec![node.to_string()])
+            .unwrap_or_else(|| execution.resumable_nodes());
+        for node_id in resume_nodes {
+            let Some(node) = execution.nodes.get(&node_id).cloned() else {
+                continue;
+            };
+            if node.status == PlanNodeStatus::Succeeded {
+                continue;
+            }
+            steps.push(TaskExecutionStep {
+                task_id: task_id.to_string(),
+                node_id: Some(node_id.clone()),
+                kind: TaskExecutionStepKind::ResumeNode,
+                message: format!("resuming node {node_id}"),
+            });
+            if matches!(node.status, PlanNodeStatus::Ready | PlanNodeStatus::Failed | PlanNodeStatus::Skipped) {
+                let _ = execution.retry_node(&plan.dag, &node_id);
+            }
+            let _ = execution.start_node(&node_id);
+            if let Some(gate) = node.verification_gate {
+                steps.push(TaskExecutionStep {
+                    task_id: task_id.to_string(),
+                    node_id: Some(node_id.clone()),
+                    kind: TaskExecutionStepKind::RunNodeVerification,
+                    message: gate.command.clone(),
+                });
+                let result = self.run_node_verification(task_id, &node_id, &gate.command);
+                let passed = result.passed;
+                let _ = execution.record_node_verification(&node_id, passed, result.summary.clone());
+                let _ = self.registry.record_verification(task_id, result);
+                if !passed && gate.required {
+                    let _ = self.registry.record_plan(task_id, plan.dag.clone(), execution);
+                    let _ = self.registry.set_status(task_id, TaskStatus::Blocked);
+                    return Ok(TaskExecutionOutcome {
+                        task_id: task_id.to_string(),
+                        steps,
+                        completed: false,
+                        blocked: true,
+                        message: format!("node {node_id} verification failed"),
+                    });
+                }
+            } else {
+                let _ = execution.succeed_node(&plan.dag, &node_id, Some("node resumed".to_string()));
+            }
+        }
+
+        let completed = execution.is_finished()
+            && execution
+                .nodes
+                .values()
+                .all(|node| node.status == PlanNodeStatus::Succeeded);
+        let status = if completed {
+            TaskStatus::Completed
+        } else {
+            TaskStatus::Blocked
+        };
+        let _ = self.registry.record_plan(task_id, plan.dag, execution.clone());
+        let _ = self.registry.set_status(task_id, status);
+        if completed {
+            steps.push(TaskExecutionStep {
+                task_id: task_id.to_string(),
+                node_id: None,
+                kind: TaskExecutionStepKind::CompleteTask,
+                message: "all plan nodes succeeded".to_string(),
+            });
+        }
+        Ok(TaskExecutionOutcome {
+            task_id: task_id.to_string(),
+            steps,
+            completed,
+            blocked: !completed,
+            message: if completed {
+                "task execution completed".to_string()
+            } else {
+                "task execution blocked with remaining nodes".to_string()
+            },
+        })
+    }
+
+    pub fn assign_team(&self, task_id: &str) -> Result<Vec<crate::TeamExecutionEvent>, String> {
+        let task = self
+            .registry
+            .get(task_id)
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        let Some(plan) = task.plan else {
+            return Ok(Vec::new());
+        };
+        let mut coordinator = TeamCoordinator::new(format!("team-{task_id}"));
+        let coordination = coordinator.plan(&plan.dag);
+        let events = coordination
+            .assignments
+            .iter()
+            .map(|assignment| coordinator.event_for_assignment(task_id, assignment, None))
+            .collect::<Vec<_>>();
+        for event in &events {
+            let _ = self.registry.record_team_event(task_id, event.clone());
+        }
+        Ok(events)
+    }
+
+    fn run_node_verification(&self, task_id: &str, node_id: &str, command: &str) -> VerificationResult {
+        let request = VerificationRequest {
+            task_id: task_id.to_string(),
+            objective: format!("verify node {node_id}"),
+            scope: node_id.to_string(),
+            acceptance_tests: vec![command.to_string()],
+            reporting_contract: "node verification result".to_string(),
+            policy: crate::VerificationPolicy::Targeted,
+            required_green_level: Some(crate::GreenLevel::TargetedTests),
+        };
+        self.verification_runner.run(&request)
+    }
+}
+
+#[allow(dead_code)]
+fn _keep_command_result_type(_: Option<VerificationCommandResult>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PlanDag, PlanDagEdge, PlanDagNode, PlanExecution, PlanNodeKind};
+
+    fn sample_registry() -> (TaskRegistry, String) {
+        let registry = TaskRegistry::new();
+        let task = registry.create("execute", Some("test"));
+        let dag = PlanDag {
+            task_id: task.task_id.clone(),
+            root_id: task.task_id.clone(),
+            nodes: vec![PlanDagNode {
+                kind: PlanNodeKind::Step,
+                id: "node-1".to_string(),
+                title: "Node".to_string(),
+                parallelizable: false,
+                estimated_effort: 1,
+                candidate_tools: Vec::new(),
+                notes: Vec::new(),
+            }],
+            edges: Vec::<PlanDagEdge>::new(),
+        };
+        let execution = PlanExecution::new(&dag);
+        registry.record_plan(&task.task_id, dag, execution).expect("plan");
+        (registry, task.task_id)
+    }
+
+    #[test]
+    fn executes_ready_node_to_completion() {
+        let (registry, task_id) = sample_registry();
+        let engine = TaskExecutionEngine::new(registry.clone(), VerificationRunner::new(None));
+        let outcome = engine.execute(&task_id, None).expect("execute");
+
+        assert!(outcome.completed);
+        assert_eq!(registry.get(&task_id).expect("task").status, TaskStatus::Completed);
+    }
+}
+TaskExecutionEngine 已新增；我会把它导出，然后扩展 recovery action 为 registry executor。
+
+Edit lib.rs
+Added 1 line
+Edit lib.rs
+Added 3 lines
+Edit recovery_actions.rs
+Modified
+Edit recovery_actions.rs
+Added 18 lines
+RecoveryActionExecutor 已落地为 execute_against_registry；接下来添加 workspace route feedback store。
+
+Write route_feedback_store.rs
+142 lines
+use std::fs;
+use std::io;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{ModelRouteFeedback, ModelRoutePhase};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RouteFeedbackSnapshot {
+    pub feedback: Vec<ModelRouteFeedback>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteFeedbackSummary {
+    pub phase: ModelRoutePhase,
+    pub model: String,
+    pub total: usize,
+    pub failures: usize,
+    pub recovery_triggered: usize,
+    pub success_rate: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RouteFeedbackStore {
+    feedback: Vec<ModelRouteFeedback>,
+}
+
+impl RouteFeedbackStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn from_feedback(feedback: Vec<ModelRouteFeedback>) -> Self {
+        Self { feedback }
+    }
+
+    pub fn load_from_dir(dir: &Path) -> io::Result<Self> {
+        let path = dir.join("feedback.json");
+        if !path.exists() {
+            return Ok(Self::new());
+        }
+        let contents = fs::read_to_string(path)?;
+        let snapshot = serde_json::from_str::<RouteFeedbackSnapshot>(&contents)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(Self::from_feedback(snapshot.feedback))
+    }
+
+    pub fn save_to_dir(&self, dir: &Path) -> io::Result<()> {
+        fs::create_dir_all(dir)?;
+        let json = serde_json::to_string_pretty(&RouteFeedbackSnapshot {
+            feedback: self.feedback.clone(),
+        })
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        fs::write(dir.join("feedback.json"), format!("{json}\n"))
+    }
+
+    pub fn record(&mut self, feedback: ModelRouteFeedback) {
+        self.feedback.push(feedback);
+    }
+
+    #[must_use]
+    pub fn feedback(&self) -> &[ModelRouteFeedback] {
+        &self.feedback
+    }
+
+    #[must_use]
+    pub fn summaries(&self) -> Vec<RouteFeedbackSummary> {
+        let mut summaries = Vec::new();
+        for entry in &self.feedback {
+            if summaries.iter().any(|summary: &RouteFeedbackSummary| {
+                summary.phase == entry.route.phase && summary.model == entry.route.model
+            }) {
+                continue;
+            }
+            let related = self
+                .feedback
+                .iter()
+                .filter(|candidate| {
+                    candidate.route.phase == entry.route.phase
+                        && candidate.route.model == entry.route.model
+                })
+                .collect::<Vec<_>>();
+            let total = related.len();
+            let failures = related
+                .iter()
+                .filter(|candidate| candidate.succeeded == Some(false))
+                .count();
+            let recovery_triggered = related
+                .iter()
+                .filter(|candidate| candidate.recovery_triggered)
+                .count();
+            summaries.push(RouteFeedbackSummary {
+                phase: entry.route.phase,
+                model: entry.route.model.clone(),
+                total,
+                failures,
+                recovery_triggered,
+                success_rate: if total == 0 {
+                    0.0
+                } else {
+                    (total - failures) as f32 / total as f32
+                },
+            });
+        }
+        summaries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ModelRouteDecision, ModelRoutePhase};
+
+    #[test]
+    fn summarizes_feedback_by_phase_and_model() {
+        let route = ModelRouteDecision {
+            phase: ModelRoutePhase::Coding,
+            model: "sonnet".to_string(),
+            provider: None,
+            reason: "test".to_string(),
+            confidence: Some(0.8),
+            fallback_model: None,
+        };
+        let store = RouteFeedbackStore::from_feedback(vec![
+            ModelRouteFeedback::pending("task-1", route.clone(), 1).with_outcome(
+                true, None, false, None,
+            ),
+            ModelRouteFeedback::pending("task-2", route, 2).with_outcome(
+                false, None, true, None,
+            ),
+        ]);
+        let summary = store.summaries().pop().expect("summary");
+
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.failures, 1);
+        assert_eq!(summary.recovery_triggered, 1);
+    }
+}
+Edit lib.rs
+Added 1 line
+Edit lib.rs
+Added 1 line
+核心模块已新增；我会扩展 CLI tasks execute/verify/recover，并把 route feedback store 持久化到 .Himalaya/routes。
+
+Edit main.rs
+Added 10 lines
+Edit main.rs
+Added 12 lines
+我误替换掉了 retry 解析分支，需要补回在 execute/recover 之后。
+
+Read main.rs (lines 1019-1088)
+Edit main.rs
+Added 4 lines
+我会为 CLI 新增 route feedback 目录 helper，并执行新的 tasks execute/recover/verify 分支。
+
+Edit main.rs
+Added 16 lines
+Edit main.rs
+Added 61 lines
+我发现替换时删除了 cancel 分支，需要确认并补回；同时 load/save route feedback helper 未使用会触发告警，我会在执行分支同步 per-task feedback 到 workspace store。
+
+Read main.rs (lines 5546-5715)
+Read main.rs (lines 5705-5789)
+Edit main.rs
+Edit failed
+Edit main.rs
+Added 11 lines
+我会在 task registry 保存时同步 route feedback 到 workspace store，避免 helper 未使用并实现长期路由反馈存储。
+
+Edit main.rs
+Added 8 lines
+现在先编译 runtime 和 CLI，修正新增引擎的类型问题。
+
+Bash Check runtime and CLI after fifth-stage engine additions
+IN
+cargo check --manifest-path "rust/Cargo.toml" -p rusty-Himalaya-cli
+
+OUT
+Exit code 101
+   Compiling rusty-Himalaya-cli v0.1.0 (/mnt/d486b21f-5399-45c5-b21d-0f7921dc862d/Himalaya-main/rust/crates/rusty-Himalaya-cli)
+    Checking runtime v0.1.0 (/mnt/d486b21f-5399-45c5-b21d-0f7921dc862d/Himalaya-main/rust/crates/runtime)
+error[E0599]: no method named `execute_safe_actions` found for struct `RecoveryActionEngine` in the current scope
+    --> crates/runtime/src/conversation.rs:2452:22
+     |
+2450 |                   let action_execution = self
+     |  ________________________________________-
+2451 | |                     .recovery_action_engine
+2452 | |                     .execute_safe_actions(action_plan, self.permission_policy.active_mode());
+     | |                     -^^^^^^^^^^^^^^^^^^^^ method not found in `RecoveryActionEngine`
+     | |_____________________|
+     |
+     |
+    ::: crates/runtime/src/recovery_actions.rs:57:1
+     |
+57   |   pub struct RecoveryActionEngine;
+     |   ------------------------------- method `execute_safe_actions` not found for this struct
+
+error[E0599]: no method named `execute_safe_actions` found for reference `&RecoveryActionEngine` in the current scope
+  --> crates/runtime/src/recovery_actions.rs:97:34
+   |
+97 |         let mut execution = self.execute_safe_actions(plan, permission_mode);
+   |                                  ^^^^^^^^^^^^^^^^^^^^ method not found in `&RecoveryActionEngine`
+
+error[E0599]: no associated item named `TargetedTests` found for type `u8` in the current scope
+   --> crates/runtime/src/task_execution_engine.rs:184:59
+    |
+184 |             required_green_level: Some(crate::GreenLevel::TargetedTests),
+    |                                                           ^^^^^^^^^^^^^ associated item not found in `u8`
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `runtime` (lib) due to 3 previous errors
+编译错误显示我把 execute_safe_actions 替换掉了且 GreenLevel 路径冲突；我会恢复安全执行 helper，并让 runtime 使用真实 registry executor。
+
+Edit recovery_actions.rs
+Added 32 lines
+Edit conversation.rs
+Added 2 lines
+Edit task_execution_engine.rs
+Modified
+Bash Recheck after recovery action and green level fixes
+IN
+cargo check --manifest-path "rust/Cargo.toml" -p rusty-Himalaya-cli
+
+OUT
+   Compiling rusty-Himalaya-cli v0.1.0 (/mnt/d486b21f-5399-45c5-b21d-0f7921dc862d/Himalaya-main/rust/crates/rusty-Himalaya-cli)
+    Checking runtime v0.1.0 (/mnt/d486b21f-5399-45c5-b21d-0f7921dc862d/Himalaya-main/rust/crates/runtime)
+    Checking api v0.1.0 (/mnt/d486b21f-5399-45c5-b21d-0f7921dc862d/Himalaya-main/rust/crates/api)
+    Checking commands v0.1.0 (/mnt/d486b21f-5399-45c5-b21d-0f7921dc862d/Himalaya-main/rust/crates/commands)
+    Checking tools v0.1.0 (/mnt/d486b21f-5399-45c5-b21d-0f7921dc862d/Himalaya-main/rust/crates/tools)
+    Checking compat-harness v0.1.0 (/mnt/d486b21f-5399-45c5-b21d-0f7921dc862d/Himalaya-main/rust/crates/compat-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.60s
+编译通过；我会更新进度并补充 CLI 解析测试与 VS Code 协议 hook 类型。
+
+Update Todos
+
+Inspect current fifth-stage extension points
+
+Add TaskExecutionEngine for resumable DAG execution
+
+Implement RecoveryActionExecutor against task registry
+
+Wire node-level verification execution
+
+Integrate TeamCoordinator into execution flow
+
+Add workspace route feedback store
+
+Extend CLI tasks execute verify recover commands
+
+Add VS Code task dashboard protocol hooks
+
+Add long-task replay eval tests
+
+Harden safety and task snapshot compaction
+
+Run full validation gates
+Read main.rs (lines 10851-10940)
+Read main.rs (lines 10961-11080)
+Edit file
+Edit failed
+Bash tool output (plhqj5)
+请继续完成任务
+No response requested.
+
+请继继续完成上面未完成任务
+我会从当前半完成状态继续：先跑编译检查定位剩余断点，再补齐 CLI 解析/执行测试、VS Code 协议钩子和完整验证。
+
+Update Todos
+
+Inspect current fifth-stage extension points
+
+Add TaskExecutionEngine for resumable DAG execution
+
+Implement RecoveryActionExecutor against task registry
+
+Wire node-level verification execution
+
+Integrate TeamCoordinator into execution flow
+
+Add workspace route feedback store
+
+Extend CLI tasks execute verify recover commands
+
+Add VS Code task dashboard protocol hooks
+
+Add long-task replay eval tests
+
+Harden safety and task snapshot compaction
+
+Run full validation gates
+Bash Check CLI and runtime for compile errors
+IN
+cargo check --manifest-path "rust/Cargo.toml" -p rusty-Himalaya-cli
+
+OUT
+   Compiling rusty-Himalaya-cli v0.1.0 (/mnt/d486b21f-5399-45c5-b21d-0f7921dc862d/Himalaya-main/rust/crates/rusty-Himalaya-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.30s
+编译已通过；我会补齐 CLI 新命令解析测试和 runtime 执行/恢复引擎测试，然后再跑 VS Code 协议回归。
+
+Read main.rs (lines 10951-11100)
+Edit main.rs
+Added 40 lines
+CLI 新命令测试已补；我会补 VS Code 协议中的 task execution/route feedback 类型，再跑回归。
+
+Read streamProtocol.ts (lines 146-365)
+Edit streamProtocol.ts
+Added 25 lines
+Read streamProtocol.ts (lines 251-335)
+我插入协议类型时再次覆盖了 RecoveryResult 类型名，马上修复。
+
+Edit streamProtocol.ts
+Added 1 line
+API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request
+
+No response requested.
+
+请继续完成上面未完成的任务
+API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request

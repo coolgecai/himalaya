@@ -1,0 +1,59 @@
+# Dependency directories
+node_modules/
+vscode-extension/node_modules/
+
+# Build outputs
+target/
+rust/target/
+vscode-extension/out/
+vscode-extension/*.vsix
+vscode-extension/compile_output.txt
+
+# Generated packaged binaries
+bin/
+vscode-extension/bin/
+installer/staging/
+
+# Local runtime state
+.Himalaya/
+**/.Himalaya/
+.Himalayad-todos.json
+**/.Himalayad-todos.json
+.Himalayad-agents/
+**/.Himalayad-agents/
+.clawd-agents/
+**/.clawd-agents/
+.port_sessions/
+.sandbox-home/
+.sandbox-tmp/
+rust/.claw/
+rust/.omc/
+rust/.sandbox-home/
+rust/.Himalayad-agents/
+
+# Local editor and tool config
+.vscode/
+rust/.cargo/
+
+# Logs
+*.log
+vscode-extension/*.log
+
+# Secrets and env files
+.env
+*.env
+**/.env
+**/*.env
+creds.txt
+**/creds.txt
+*.pem
+*.key
+*.p12
+*.pfx
+rust/.env
+
+# Generated local presentation artifacts
+mHC_Presentation.pptx
+mHC_Presentation.wd.docx
+rust/pythagorean.pptx
+thesis_content.txt

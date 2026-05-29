@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Himalaya Code - 推理过程可视化演示</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+
+        .demo-container {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .chat-thread {
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 15px;
+            background: #fafafa;
+            min-height: 400px;
+        }
+
+        .msg {
+            margin-bottom: 15px;
+            padding: 10px;
+            border-radius: 6px;
+        }
+
+        .msg.user {
+            background: #007acc;
+            color: white;
+            margin-left: 20%;
+        }
+
+        .msg.assistant {
+            background: #f8f9fa;
+            border-left: 4px solid #28a745;
+        }
+
+        .msg.reasoning-step {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 14px;
+        }
+
+        .msg-role {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .msg-body {
+            white-space: pre-wrap;
+            line-height: 1.4;
+        }
+
+        .demo-controls {
+            margin-top: 20px;
+            padding: 15px;
+            background: #e9ecef;
+            border-radius: 6px;
+        }
+
+        button {
+            background: #007acc;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+        }
+
+        button:hover {
+            background: #005a9e;
+        }
+
+        .status {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 4px;
+            display: none;
+        }
+
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+    </style>
+</head>
+<body>
+    <div class="demo-container">
+        <h1>🧠 Himalaya Code - 推理过程可视化演示</h1>
+        <p>这个演示展示了AI推理过程的可视化功能，类似于Claude的思维链显示。</p>
+
+        <div class="chat-thread" id="chat-thread">
+            <div class="msg user">
+                <div class="msg-role">👤 用户</div>
+                <div class="msg-body">请分析这个项目的架构并给出改进建议</div>
+            </div>
+        </div>
+
+        <div class="demo-controls">
+            <h3>演示控制</h3>
+            <button onclick="startReasoningDemo()">开始推理演示</button>
+            <button onclick="clearChat()">清空对话</button>
+            <div class="status" id="status"></div>
+        </div>
+    </div>
+
+    <script>
+        let demoStep = 0;
+        const thread = document.getElementById('chat-thread');
+        const status = document.getElementById('status');
+
+        const reasoningSteps = [
+            {
+                step_type: 'analysis',
+                content: '用户要求分析项目架构并提供改进建议。我需要先了解项目的整体结构、技术栈和当前状态。',
+                confidence: 0.88
+            },
+            {
+                step_type: 'planning',
+                plan: '制定分析计划：检查项目结构、依赖关系、代码质量，然后提供具体建议。',
+                steps: [
+                    '分析项目目录结构和文件组织',
+                    '检查技术栈和依赖项',
+                    '评估代码质量和模式',
+                    '识别潜在的改进点',
+                    '制定优先级建议'
+                ]
+            },
+            {
+                step_type: 'reflection',
+                critique: '我的分析应该更注重可操作性和优先级排序。',
+                adjustment: '优先考虑影响大且易实施的改进'
+            },
+            {
+                step_type: 'decision',
+                choice: '采用结构化分析方法',
+                reasoning: '结构化方法能提供更清晰、更可操作的建议'
+            }
+        ];
+
+        function showStatus(message, isError = false) {
+            status.textContent = message;
+            status.className = 'status ' + (isError ? 'error' : 'success');
+            status.style.display = 'block';
+            setTimeout(() => {
+                status.style.display = 'none';
+            }, 3000);
+        }
+
+        function addReasoningStep(step) {
+            if (!step) { return; }
+            const div = document.createElement('div');
+            div.className = 'msg reasoning-step';
+
+            let content = '';
+            let icon = '';
+            let title = '';
+
+            switch (step.step_type) {
+                case 'analysis':
+                    icon = '🔍';
+                    title = '分析 (Analysis)';
+                    content = step.content || '';
+                    if (step.confidence !== undefined) {
+                        content += ' (置信度: ' + (step.confidence * 100).toFixed(0) + '%)';
+                    }
+                    break;
+                case 'planning':
+                    icon = '📋';
+                    title = '规划 (Planning)';
+                    content = step.plan || '';
+                    if (step.steps && step.steps.length > 0) {
+                        content += '\n\n执行步骤:\n';
+                        for (var i = 0; i < step.steps.length; i++) {
+                            content += (i + 1) + '. ' + step.steps[i] + '\n';
+                        }
+                    }
+                    break;
+                case 'reflection':
+                    icon = '🤔';
+                    title = '反思 (Reflection)';
+                    content = step.critique || '';
+                    if (step.adjustment) {
+                        content += '\n\n调整: ' + step.adjustment;
+                    }
+                    break;
+                case 'decision':
+                    icon = '⚖️';
+                    title = '决策 (Decision)';
+                    content = '**' + (step.choice || '') + '**\n\n理由: ' + (step.reasoning || '');
+                    break;
+                default:
+                    icon = '💭';
+                    title = '思考中 (Thinking)';
+                    content = JSON.stringify(step, null, 2);
+            }
+
+            div.innerHTML = '<div class="msg-role">' + icon + ' ' + title + '</div><div class="msg-body">' + content + '</div>';
+            thread.appendChild(div);
+            thread.scrollTop = thread.scrollHeight;
+        }
+
+        function addAssistantMessage(text) {
+            const div = document.createElement('div');
+            div.className = 'msg assistant';
+            div.innerHTML = '<div class="msg-role">🤖 AI助手</div><div class="msg-body">' + text + '</div>';
+            thread.appendChild(div);
+            thread.scrollTop = thread.scrollHeight;
+        }
+
+        function startReasoningDemo() {
+            if (demoStep >= reasoningSteps.length) {
+                showStatus('演示已完成！所有推理步骤都已展示。');
+                return;
+            }
+
+            const step = reasoningSteps[demoStep];
+            addReasoningStep(step);
+            demoStep++;
+
+            if (demoStep < reasoningSteps.length) {
+                setTimeout(startReasoningDemo, 2000); // 2秒后显示下一步
+            } else {
+                setTimeout(() => {
+                    addAssistantMessage('基于以上分析，我建议您优先实施以下改进：\n\n1. **代码重构**：将重复逻辑提取为工具函数\n2. **测试覆盖**：增加单元测试覆盖率\n3. **文档完善**：为主要组件添加API文档\n\n这些改进将显著提升代码的可维护性和可扩展性。');
+                    showStatus('推理演示完成！AI现在可以像Claude一样展示其思维过程。');
+                }, 1000);
+            }
+        }
+
+        function clearChat() {
+            thread.innerHTML = '<div class="msg user"><div class="msg-role">👤 用户</div><div class="msg-body">请分析这个项目的架构并给出改进建议</div></div>';
+            demoStep = 0;
+            showStatus('对话已清空，可以重新开始演示。');
+        }
+
+        // 初始化状态
+        showStatus('推理过程可视化演示已就绪。点击"开始推理演示"查看AI的思维过程！');
+    </script>
+</body>
+</html>

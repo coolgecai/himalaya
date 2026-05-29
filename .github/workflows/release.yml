@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+
+jobs:
+  build-release:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            git \
+            ca-certificates
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0
+          rustup default 1.88.0
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-release-1.88.0-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-1.88.0-
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        working-directory: rust
+        run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          BUILD_DATE=$(date -d "@${SOURCE_DATE_EPOCH}" +%Y-%m-%d)
+          SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} BUILD_DATE=${BUILD_DATE} \
+            cargo build --release --package rusty-Himalaya-cli
+
+      - name: Smoke test release binary
+        run: rust/target/release/Himalaya --version
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --version "^2" --locked
+
+      - name: Build .deb package
+        working-directory: rust
+        run: cargo deb --package rusty-Himalaya-cli --no-build
+
+      - name: Locate .deb artifact
+        id: deb
+        run: |
+          DEB=$(find rust/target/debian -name "*.deb" | head -1)
+          echo "PATH=${DEB}" >> "$GITHUB_OUTPUT"
+          echo "NAME=$(basename "${DEB}")" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Himalaya Code ${{ github.ref_name }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            rust/target/release/Himalaya
+            ${{ steps.deb.outputs.PATH }}
+          body: |
+            ## Installation
+
+            ### Debian/Ubuntu (.deb)
+            ```bash
+            sudo dpkg -i ${{ steps.deb.outputs.NAME }}
+            ```
+
+            ### Direct binary
+            ```bash
+            chmod +x Himalaya
+            sudo mv Himalaya /usr/local/bin/
+            ```
+
+            ### From source
+            ```bash
+            git clone https://github.com/${{ github.repository }}.git
+            cd $(basename ${{ github.repository }})
+            ./install.sh --release
+            ```

@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  RUST_BACKTRACE: 1
+
+jobs:
+  repository-safety:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tracked secrets and generated artifacts
+        run: bash scripts/check-no-secrets.sh .
+
+  rust-build-test:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            git \
+            ca-certificates
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0
+          rustup default 1.88.0
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-1.88.0-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-1.88.0-
+
+      - name: Build workspace
+        working-directory: rust
+        run: BUILD_DATE=$(date +%Y-%m-%d) cargo build --workspace
+
+      - name: Run workspace tests
+        working-directory: rust
+        run: cargo test --workspace
+
+      - name: Smoke test binary
+        run: rust/target/debug/Himalaya --version
+
+  rust-lint:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            git \
+            ca-certificates
+
+      - name: Install Rust + clippy + rustfmt
+        run: |
+          rustup toolchain install 1.88.0
+          rustup default 1.88.0
+          rustup component add clippy rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-lint-1.88.0-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lint-1.88.0-
+
+      - name: Check formatting
+        working-directory: rust
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  mock-parity:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            git \
+            ca-certificates \
+            python3
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0
+          rustup default 1.88.0
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-parity-1.88.0-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-parity-1.88.0-
+
+      - name: Run mock parity diff
+        run: python3 rust/scripts/run_mock_parity_diff.py
+
+  vscode-extension:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+
+      - name: Install extension dependencies
+        working-directory: vscode-extension
+        run: npm ci
+
+      - name: Run extension regression tests
+        working-directory: vscode-extension
+        run: npm run test:regression
+
+      - name: Run extension prepackage checks
+        working-directory: vscode-extension
+        run: npm run prepackage
