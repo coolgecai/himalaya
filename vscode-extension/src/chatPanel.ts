@@ -1,8 +1,8 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { HimalayaCli } from './cli';
-import { ChatHistorySnapshot, HimalayaHistoryStore } from './history';
+import { HimalayaCli, type HimalayaReplHandle } from './cli';
+import { ChatHistoryRecord, ChatHistorySnapshot, HimalayaHistoryStore, RecoveryEvidence } from './history';
 import { readModelRoute, writeModelRoute } from './modelRoute';
 import {
   buildWorkspaceDangerApprovalKey,
@@ -17,6 +17,7 @@ import {
   STREAM_PROTOCOL_VERSION,
 } from './streamProtocol';
 import { executeWithPermissionGate } from './executionGate';
+import { extractPromptAttachmentReferences, extractReferencePathCandidate, prepareAttachmentDescriptors } from './attachmentPaths';
 import { SessionSnapshot } from './sessionTree';
 
 export interface ChatLaunchOptions {
@@ -27,7 +28,7 @@ export interface ChatLaunchOptions {
   resumeTarget?: string;
   cwd?: string;
   prompt?: string;
-  files?: string[];
+  files?: unknown[];
   cloudBaseUrl?: string;
   cloudApiKey?: string;
   cloudModel?: string;
@@ -35,6 +36,12 @@ export interface ChatLaunchOptions {
   showDecisioningDemo?: boolean;
   selectedHistoryId?: string | null;
   selectedCliSessionId?: string | null;
+}
+
+export interface ChatIdentity {
+  userDisplayName?: string;
+  assistantDisplayName?: string;
+  preferredLanguage?: string;
 }
 
 export interface ChatBootstrap {
@@ -45,7 +52,130 @@ export interface ChatBootstrap {
   modelCatalog: { recentModels: string[]; localModels: string[]; [key: string]: unknown };
   sessions: SessionSnapshot;
   selectedCliSessionId?: string | null;
+  identity?: ChatIdentity;
 }
+
+export function readWorkspaceIdentity(): ChatIdentity {
+  const candidates = (vscode.workspace.workspaceFolders ?? []).map((folder) =>
+    path.join(folder.uri.fsPath, '.Himalaya', 'long_term_memory.json')
+  );
+  const home = process.env.HOME;
+  if (home) {
+    candidates.push(path.join(home, '.Himalaya', 'knowledge.json'));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      if (!fs.existsSync(candidate)) {
+        continue;
+      }
+      const parsed = JSON.parse(fs.readFileSync(candidate, 'utf8')) as unknown;
+      if (!Array.isArray(parsed)) {
+        continue;
+      }
+      const identity = identityFromMemoryEntries(parsed);
+      if (identity.userDisplayName || identity.assistantDisplayName || identity.preferredLanguage) {
+        return identity;
+      }
+    } catch {
+      // Ignore malformed or inaccessible memory files; chat can still render default labels.
+    }
+  }
+  return {};
+}
+
+function identityFromMemoryEntries(entries: unknown[]): ChatIdentity {
+  let user: { note: string; confidence: number; ts: number } | undefined;
+  let assistant: { note: string; confidence: number; ts: number } | undefined;
+  let language: { note: string; confidence: number; ts: number } | undefined;
+
+  const prefer = (
+    current: { note: string; confidence: number; ts: number } | undefined,
+    next: { note: string; confidence: number; ts: number }
+  ): { note: string; confidence: number; ts: number } => {
+    if (!current) {
+      return next;
+    }
+    if (next.confidence > current.confidence) {
+      return next;
+    }
+    if (next.confidence === current.confidence && next.ts >= current.ts) {
+      return next;
+    }
+    return current;
+  };
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+    const record = entry as { kind?: unknown; topic?: unknown; note?: unknown; confidence?: unknown; ts_ms?: unknown };
+    const topic = typeof record.topic === 'string' ? record.topic : '';
+    const kind = typeof record.kind === 'string' ? record.kind : '';
+    const note = typeof record.note === 'string' ? record.note.trim() : '';
+    if (!note) {
+      continue;
+    }
+    const next = {
+      note,
+      confidence: typeof record.confidence === 'number' ? record.confidence : 0,
+      ts: typeof record.ts_ms === 'number' ? record.ts_ms : 0,
+    };
+    if (kind === 'user_identity' || topic === 'user_identity') {
+      user = prefer(user, next);
+    } else if (kind === 'assistant_identity' || topic === 'assistant_identity') {
+      assistant = prefer(assistant, next);
+    } else if (kind === 'language_preference' || topic === 'language_preference') {
+      language = prefer(language, next);
+    }
+  }
+
+  return {
+    userDisplayName: user?.note,
+    assistantDisplayName: assistant?.note,
+    preferredLanguage: language?.note,
+  };
+}
+
+
+function detectPreferredResponseLanguage(text: string): string | undefined {
+  const lower = text.toLowerCase();
+  if (
+    ['以后用中文', '请用中文', '用中文回答', '中文交流', '中文回复', 'output language: chinese', 'preferred response language: chinese']
+      .some((marker) => text.includes(marker)) ||
+    ['respond in chinese', 'answer in chinese', 'use chinese', 'speak chinese', 'reply in chinese', 'write in chinese']
+      .some((marker) => lower.includes(marker))
+  ) {
+    return 'Chinese';
+  }
+  if (
+    ['以后用英文', '请用英文', '用英文回答', '英文交流', '英文回复', 'output language: english', 'preferred response language: english']
+      .some((marker) => text.includes(marker)) ||
+    ['respond in english', 'answer in english', 'use english', 'speak english', 'reply in english', 'write in english']
+      .some((marker) => lower.includes(marker))
+  ) {
+    return 'English';
+  }
+  return undefined;
+}
+
+function languagePromptPrefix(language: string): string {
+  if (language === 'Chinese') {
+    return '[Persistent interaction language: respond to the user in Chinese unless they explicitly change language. Keep commands, code, file paths, and quoted source text unchanged; prose headings and explanations must be Chinese.]';
+  }
+  if (language === 'English') {
+    return '[Persistent interaction language: respond to the user in English unless they explicitly change language. Keep commands, code, file paths, and quoted source text unchanged.]';
+  }
+  return `[Persistent interaction language: respond to the user in ${language} unless they explicitly change language. Keep commands, code, file paths, and quoted source text unchanged.]`;
+}
+
+function applyLanguagePreferenceToPrompt(prompt: string, language: string | undefined): string {
+  if (!language) {
+    return prompt;
+  }
+  return `${languagePromptPrefix(language)}\n\n${prompt}`;
+}
+
 
 interface ChatHost {
   webview: vscode.Webview;
@@ -133,9 +263,17 @@ export class HimalayaChatPanel {
   private currentOptions: ChatLaunchOptions = {};
   private selectedHistoryId: string | null = null;
   private selectedCliSessionId: string | null = null;
+  private abortController: AbortController | null = null;
+  private replHandle: HimalayaReplHandle | null = null;
+  private replKey: string | null = null;
+  private replBusy = false;
+  private replCanReuse = true;
+  private replEventHandler: ((event: unknown) => void) | null = null;
+  private replStderrHandler: ((chunk: string) => void) | null = null;
   private readonly dangerApprovalKeyPrefix = 'himalayaCode.dangerApproval.v1';
   private readonly reasoningPrefKey = 'himalayaCode.showReasoning.v1';
   private readonly demoModePrefKey = 'himalayaCode.showDecisioningDemo.v1';
+  private readonly languagePreferenceKey = 'himalayaCode.preferredResponseLanguage.v1';
 
   private summarizePrompt(prompt: string): string {
     const compact = prompt.replace(/\s+/gu, ' ').trim();
@@ -147,7 +285,7 @@ export class HimalayaChatPanel {
       return;
     }
 
-    const typedMessage = message as { type?: string; command?: string; prompt?: string; model?: string; modelBackend?: string; permissionMode?: string; resumeTarget?: string; cwd?: string; historyId?: string; selectedHistoryId?: string | null; selectedCliSessionId?: string | null };
+    const typedMessage = message as { type?: string; command?: string; prompt?: string; model?: string; modelBackend?: string; permissionMode?: string; resumeTarget?: string; cwd?: string; historyId?: string; selectedHistoryId?: string | null; selectedCliSessionId?: string | null; files?: unknown };
 
     switch (typedMessage.type) {
       case 'pick-file':
@@ -171,6 +309,19 @@ export class HimalayaChatPanel {
           selectedHistoryId: this.selectedHistoryId,
           selectedCliSessionId: this.selectedCliSessionId
         });
+        break;
+      case 'cancel':
+        if (this.replHandle && this.replBusy) {
+          this.replHandle.kill();
+          this.replHandle = null;
+          this.replKey = null;
+          this.replCanReuse = false;
+        }
+        if (this.abortController) {
+          this.abortController.abort();
+        }
+        this.isStreamingPrompt = false;
+        this.output.appendLine('[stream] cancelled by user');
         break;
       case 'configureModel':
         // Support webviews that send a direct 'configureModel' message (sidebar-style)
@@ -208,6 +359,7 @@ export class HimalayaChatPanel {
         }
 
         if (typedMessage.command === 'newSession') {
+          this.closeReplWorker();
           this.selectedHistoryId = null;
           this.selectedCliSessionId = null;
           this.currentOptions = {
@@ -233,6 +385,15 @@ export class HimalayaChatPanel {
         }
         if (typedMessage.historyId) {
           this.selectedHistoryId = typedMessage.historyId;
+          const record = this.history.records().find((item) => item.id === typedMessage.historyId);
+          if (record) {
+            void this.history.setActiveRecord(record.id);
+            this.selectedCliSessionId = record.resumeTarget ?? this.selectedCliSessionId;
+            void this.host.webview.postMessage({
+              type: 'historyRecord',
+              record: this.webviewRecord(record),
+            });
+          }
         }
         break;
       case 'session-action':
@@ -248,7 +409,7 @@ export class HimalayaChatPanel {
           permissionMode: typedMessage.permissionMode,
           resumeTarget: typedMessage.resumeTarget,
           cwd: typedMessage.cwd,
-          files: (typedMessage as any).files as string[] | undefined
+          files: Array.isArray(typedMessage.files) ? typedMessage.files : undefined
         });
         break;
       case 'webview-error':
@@ -257,11 +418,184 @@ export class HimalayaChatPanel {
     }
   }
 
+  private webviewRecord(record: ChatHistoryRecord): ChatHistoryRecord {
+    return {
+      ...record,
+      messages: record.messages.map((message) => ({
+        ...message,
+        attachments: message.attachments ? message.attachments.slice() : undefined,
+      })),
+      recoveryEvidence: record.recoveryEvidence ? record.recoveryEvidence.slice() : [],
+    };
+  }
+
+  private createAssistantTailPersistence(recordId: string, readText: () => string, delayMs = 250): { schedule: () => void; flush: () => Promise<void> } {
+    let timer: NodeJS.Timeout | undefined;
+    let chain = Promise.resolve();
+    const enqueue = () => {
+      const text = readText();
+      chain = chain
+        .catch(() => undefined)
+        .then(() => this.history.replaceAssistantTail(recordId, text));
+    };
+
+    return {
+      schedule: () => {
+        if (timer) {
+          return;
+        }
+        timer = setTimeout(() => {
+          timer = undefined;
+          enqueue();
+        }, delayMs);
+      },
+      flush: async () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+        enqueue();
+        await chain;
+      },
+    };
+  }
+
+  private closeReplWorker(): void {
+    if (!this.replHandle) {
+      return;
+    }
+    try {
+      this.replHandle.close();
+    } catch {
+      this.replHandle.kill();
+    }
+    this.replHandle = null;
+    this.replKey = null;
+    this.replBusy = false;
+    this.replEventHandler = null;
+    this.replStderrHandler = null;
+  }
+
+  private createReplKey(model: string, permissionMode: string, cwd: string | undefined, env: NodeJS.ProcessEnv | undefined): string {
+    return JSON.stringify({
+      model,
+      permissionMode,
+      cwd: cwd ?? '',
+      openaiBaseUrl: env?.OPENAI_BASE_URL ?? '',
+      hasOpenAiKey: Boolean(env?.OPENAI_API_KEY),
+    });
+  }
+
+  private async ensureReplWorker(input: {
+    model: string;
+    permissionMode: string;
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    resumeTarget?: string;
+    onEvent: (event: unknown) => void;
+    onStderr: (chunk: string) => void;
+  }): Promise<HimalayaReplHandle> {
+    const key = this.createReplKey(input.model, input.permissionMode, input.cwd, input.env);
+    this.replEventHandler = input.onEvent;
+    this.replStderrHandler = input.onStderr;
+    if (this.replHandle && this.replKey !== key) {
+      this.closeReplWorker();
+      this.replEventHandler = input.onEvent;
+      this.replStderrHandler = input.onStderr;
+    }
+    if (this.replHandle && input.resumeTarget && this.selectedCliSessionId && input.resumeTarget !== this.selectedCliSessionId) {
+      this.closeReplWorker();
+      this.replEventHandler = input.onEvent;
+      this.replStderrHandler = input.onStderr;
+    }
+    if (!this.replHandle) {
+      let handle: HimalayaReplHandle | null = null;
+      const effectiveResumeTarget = input.resumeTarget;
+      const created = await this.cli.startRepl({
+        model: input.model,
+        permissionMode: input.permissionMode,
+        cwd: input.cwd,
+        resumeTarget: effectiveResumeTarget,
+        allowBroadCwd: this.shouldAllowBroadCwd(input.cwd),
+        env: input.env,
+        onEvent: (event) => this.replEventHandler?.(event),
+        onStderr: (chunk) => this.replStderrHandler?.(chunk),
+        onExit: (code, signal) => {
+          if (handle && this.replHandle === handle) {
+            this.replHandle = null;
+            this.replKey = null;
+            this.replBusy = false;
+            this.output.appendLine(`[repl] worker exited code=${String(code)} signal=${String(signal)}`);
+          }
+        },
+      });
+      handle = created;
+      await created.ready;
+      this.replHandle = created;
+      this.replKey = key;
+    }
+    return this.replHandle;
+  }
+
+  private offerDangerFullAccessRetry(prompt: string, toolName: string, reason: string, source: string): void {
+    if (!this.isStreamingPrompt) {
+      return;
+    }
+
+    const capturedPrompt = prompt.trim();
+    if (!capturedPrompt) {
+      return;
+    }
+
+    const capturedOptions = {
+      ...this.currentOptions,
+      prompt: capturedPrompt,
+      files: this.currentOptions.files,
+    };
+    const detail = reason ? ` Reason: ${reason.slice(0, 200)}` : '';
+    vscode.window.showErrorMessage(
+      `Himalaya needs permission to run \`${toolName}\`. Retry with full access?${detail}`,
+      { modal: true },
+      'Allow & Retry'
+    ).then((action) => {
+      if (action === 'Allow & Retry') {
+        this.abortController?.abort();
+        if (this.replHandle && this.replBusy) {
+          this.replHandle.kill();
+          this.replHandle = null;
+          this.replKey = null;
+          this.replCanReuse = false;
+        }
+        this.isStreamingPrompt = false;
+        this.output.appendLine(`[permission] user approved via ${source} — retrying with danger-full-access`);
+        void this.executePromptSubmission({
+          ...capturedOptions,
+          permissionMode: 'danger-full-access',
+        });
+      }
+    });
+  }
+
   private async executePromptSubmission(input: ChatLaunchOptions): Promise<void> {
     const prompt = input.prompt?.trim() || '';
     if (!prompt) {
       return;
     }
+    const detectedLanguage = detectPreferredResponseLanguage(prompt);
+    if (detectedLanguage) {
+      await this.context.workspaceState.update(this.languagePreferenceKey, detectedLanguage);
+      this.currentBootstrap = {
+        ...this.currentBootstrap,
+        identity: {
+          ...(this.currentBootstrap.identity ?? {}),
+          preferredLanguage: detectedLanguage,
+        },
+      };
+    }
+    const preferredLanguage = detectedLanguage
+      ?? this.currentBootstrap.identity?.preferredLanguage
+      ?? this.context.workspaceState.get<string>(this.languagePreferenceKey);
+    const cliPrompt = applyLanguagePreferenceToPrompt(prompt, preferredLanguage);
 
     const route = await readModelRoute(this.context);
     const model = route.model?.trim() || input.model?.trim() || this.currentBootstrap.config.defaultModel;
@@ -289,42 +623,29 @@ export class HimalayaChatPanel {
       return;
     }
 
-    const cwd = input.cwd?.trim() || undefined;
-    const resumeTarget = input.resumeTarget?.trim() || undefined;
-    const files = input.files?.map((file) => file.trim()).filter((file): file is string => Boolean(file)) ?? [];
-    const attachmentPaths: string[] = [];
-    const blockedAttachmentExtensions = new Set(['.pem', '.key', '.p12', '.pfx', '.kdbx']);
-    const blockedAttachmentNameSnippets = ['id_rsa', 'id_ed25519', 'credentials', 'secret', 'token'];
-
-    for (const filePath of files) {
-      const name = path.basename(filePath);
-      const lowerName = name.toLowerCase();
-      const ext = path.extname(filePath).toLowerCase();
-      try {
-        if (blockedAttachmentExtensions.has(ext) || blockedAttachmentNameSnippets.some(snippet => lowerName.includes(snippet))) {
-          this.host.webview.postMessage({ type: 'stderrChunk', text: `Skipped sensitive attachment: ${name}\n` });
-          continue;
-        }
-
-        if (!fs.existsSync(filePath)) {
-          this.host.webview.postMessage({ type: 'stderrChunk', text: `Attachment not found: ${name}\n` });
-          continue;
-        }
-
-        try {
-          fs.accessSync(filePath, fs.constants.R_OK);
-        } catch {
-          this.host.webview.postMessage({ type: 'stderrChunk', text: `Attachment is not readable: ${name}\n` });
-          continue;
-        }
-
-        attachmentPaths.push(filePath);
-      } catch {
-        this.host.webview.postMessage({ type: 'stderrChunk', text: `Attachment could not be prepared: ${name}\n` });
-      }
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const cwd = input.cwd?.trim() || workspaceFolder;
+    const existingRecord = this.selectedHistoryId
+      ? this.history.records().find((item) => item.id === this.selectedHistoryId)
+      : undefined;
+    const resumeTarget = input.resumeTarget?.trim() || existingRecord?.resumeTarget?.trim() || this.selectedCliSessionId || undefined;
+    const explicitFiles = (input.files ?? [])
+      .map((file) => extractReferencePathCandidate(file))
+      .filter((file): file is string => Boolean(file && file.trim()))
+      .map((file) => file.trim());
+    const files = [...explicitFiles, ...extractPromptAttachmentReferences(prompt)];
+    const preparedAttachments = prepareAttachmentDescriptors(files, cwd, 'picker');
+    const attachmentPaths = preparedAttachments.paths;
+    if (attachmentPaths.length > 0) {
+      const names = preparedAttachments.descriptors.map((attachment) => attachment.displayName).join(', ');
+      this.output.appendLine(`[attachments] included ${attachmentPaths.length} file(s): ${attachmentPaths.join(', ')}`);
+      this.host.webview.postMessage({ type: 'stderrChunk', text: `Attachments included in request: ${names}\n` });
+    }
+    for (const rejection of preparedAttachments.rejections) {
+      this.host.webview.postMessage({ type: 'stderrChunk', text: `${rejection.message}\n` });
     }
 
-    const record = await this.history.createDraft({
+    const record = existingRecord ?? await this.history.createDraft({
       title: this.summarizePrompt(prompt),
       model,
       modelBackend,
@@ -332,23 +653,29 @@ export class HimalayaChatPanel {
       resumeTarget,
       cwd
     });
+    if (existingRecord) {
+      await this.history.setActiveRecord(existingRecord.id);
+    }
 
     this.selectedHistoryId = record.id;
-    this.selectedCliSessionId = resumeTarget ?? null;
+    this.selectedCliSessionId = resumeTarget ?? this.selectedCliSessionId;
     this.currentOptions = {
       ...this.currentOptions,
       model,
       modelBackend,
       permissionMode,
       resumeTarget,
-      cwd
+      cwd,
+      files: attachmentPaths
     };
     this.isStreamingPrompt = true;
+    this.abortController = new AbortController();
 
     await this.history.appendMessage(record.id, {
       role: 'user',
       text: prompt,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      attachments: preparedAttachments.descriptors
     });
 
     await this.history.appendMessage(record.id, {
@@ -359,13 +686,23 @@ export class HimalayaChatPanel {
 
     this.host.webview.postMessage({ type: 'assistantStart', historyId: record.id, model });
 
-    const args = this.buildPromptArgs(prompt, model, permissionMode, resumeTarget, attachmentPaths);
+    const args = this.buildPromptArgs(cliPrompt, model, permissionMode, resumeTarget, cwd, attachmentPaths);
     const env = this.buildModelEnv(modelBackend, this.currentBootstrap.config.ollamaBaseUrl, route);
     let assistantText = '';
+    const assistantTailPersistence = this.createAssistantTailPersistence(record.id, () => assistantText);
     let lineBuf = '';
     const seenUnknownEventTypes = new Set<string>();
     let malformedEventCount = 0;
     let protocolMismatchWarned = false;
+    const offeredPermissionRetries = new Set<string>();
+    const offerPermissionRetryOnce = (toolName: string, reason: string, source: string) => {
+      const key = `${toolName}:${reason}`;
+      if (offeredPermissionRetries.has(key)) {
+        return;
+      }
+      offeredPermissionRetries.add(key);
+      this.offerDangerFullAccessRetry(prompt, toolName, reason, source);
+    };
 
     const handleStreamLine = (line: string) => {
       if (!line.trim()) { return; }
@@ -390,19 +727,58 @@ export class HimalayaChatPanel {
       }
 
       switch (event.type) {
+        case 'session_meta': {
+          const sessionId = typeof event.session_id === 'string' ? event.session_id.trim() : '';
+          if (sessionId) {
+            this.selectedCliSessionId = sessionId;
+            this.currentOptions = {
+              ...this.currentOptions,
+              resumeTarget: sessionId,
+              model: typeof event.model === 'string' && event.model.trim() ? event.model : this.currentOptions.model,
+            };
+            const latestRecord = this.history.records().find((item) => item.id === record.id);
+            if (latestRecord && latestRecord.resumeTarget !== sessionId) {
+              void this.history.upsert({
+                ...latestRecord,
+                resumeTarget: sessionId,
+                model: typeof event.model === 'string' && event.model.trim() ? event.model : latestRecord.model,
+              });
+            }
+            this.host.webview.postMessage({
+              type: 'sessionMeta',
+              sessionId,
+              sessionPath: typeof event.session_path === 'string' ? event.session_path : undefined,
+              model: typeof event.model === 'string' ? event.model : undefined,
+            });
+          }
+          break;
+        }
         case 'text_delta':
           if (typeof event.text === 'string' && event.text.length > 0) {
             assistantText += event.text;
             this.host.webview.postMessage({ type: 'assistantChunk', text: event.text });
-            void this.history.replaceAssistantTail(record.id, assistantText);
+            assistantTailPersistence.schedule();
           }
           break;
-        case 'tool_use':
-          this.host.webview.postMessage({ type: 'toolStep', text: `${event.name ?? 'tool'}: ${JSON.stringify(event.input)}` });
+        case 'tool_use': {
+          this.host.webview.postMessage({ type: 'toolStep', step: 'use', name: event.name, input: JSON.stringify(event.input) });
           break;
-        case 'tool_result':
-          this.host.webview.postMessage({ type: 'toolStep', text: `→ ${event.name ?? 'tool'}${event.is_error ? ' [error]' : ''}: ${String(event.output ?? '').slice(0, 200)}` });
+        }
+        case 'tool_result': {
+          const toolName = event.name ?? 'tool';
+          const output = String(event.output ?? '');
+          const isError = Boolean(event.is_error);
+          this.host.webview.postMessage({ type: 'toolStep', step: 'result', name: toolName, output, isError });
+
+          const permissionDenied =
+            isError &&
+            /\bpermission\b.*\bdenied\b|\bdenied\b.*\bpermission\b|requires.*(?:permission|elevation|sudo|root|approval|allow)|not\s+allowed/i.test(output);
+
+          if (permissionDenied) {
+            offerPermissionRetryOnce(toolName, output, 'tool_result');
+          }
           break;
+        }
         
         case 'reasoning_step':
           try {
@@ -427,6 +803,96 @@ export class HimalayaChatPanel {
             this.output.appendLine('[decisioning] failed to forward decisioning_event: ' + String(e));
           }
           break;
+        case 'plan_execution_event':
+          this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.plan_execution_event ?? event });
+          break;
+        case 'task_ledger_event':
+          this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.task_ledger_event ?? event });
+          break;
+        case 'model_route_event':
+          this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.model_route_event ?? event });
+          break;
+        case 'team_execution_event':
+          this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.team_execution_event ?? event });
+          break;
+        case 'recovery_event':
+          this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.recovery_event ?? event });
+          break;
+        case 'recovery_action_event':
+          this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.recovery_action_event ?? event });
+          break;
+        case 'task_execution_event':
+          this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.task_execution_event ?? event });
+          break;
+        case 'task_list':
+        case 'task_show':
+        case 'task_packet_create':
+        case 'task_packet_run':
+        case 'task_packet_status':
+        case 'task_scheduler_tick':
+        case 'task_scheduler_queue':
+        case 'task_execution':
+        case 'task_recovery':
+        case 'task_verification':
+        case 'task_node_retry':
+        case 'task_node_verification':
+        case 'task_compacted':
+        case 'task_cancelled':
+          this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event });
+          break;
+        case 'recovery_suggestion': {
+          const recoveryEvidence: RecoveryEvidence = {
+            tool: typeof event.tool === 'string' ? event.tool : undefined,
+            reason: typeof event.reason === 'string' ? event.reason : undefined,
+            action: typeof event.action === 'string' ? event.action : undefined,
+            suggestion: typeof event.suggestion === 'string' ? event.suggestion : undefined,
+            sourceEvent: typeof event.source_event === 'string' ? event.source_event : undefined,
+            failureClass: typeof event.failure_class === 'string' ? event.failure_class : undefined,
+            createdAt: Date.now(),
+          };
+          void this.history.appendRecoveryEvidence(record.id, recoveryEvidence);
+          this.host.webview.postMessage({
+            type: 'recoverySuggestion',
+            tool: recoveryEvidence.tool,
+            reason: recoveryEvidence.reason,
+            action: recoveryEvidence.action,
+            suggestion: recoveryEvidence.suggestion,
+            sourceEvent: recoveryEvidence.sourceEvent,
+            failureClass: recoveryEvidence.failureClass,
+          });
+          break;
+        }
+        case 'permission_request': {
+          const requestedTool = typeof event.tool === 'string' ? event.tool : 'unknown';
+          const requestReason = typeof event.reason === 'string' ? event.reason : '';
+          this.host.webview.postMessage({
+            type: 'permissionRequest',
+            tool: requestedTool,
+            reason: requestReason,
+            currentMode: typeof event.current_mode === 'string' ? event.current_mode : undefined,
+            requiredMode: typeof event.required_mode === 'string' ? event.required_mode : undefined,
+            input: typeof event.input === 'string' ? event.input : JSON.stringify(event.input ?? ''),
+          });
+          offerPermissionRetryOnce(requestedTool, requestReason, event.type);
+          break;
+        }
+        case 'permission_denial': {
+          const deniedTool = typeof event.tool === 'string' ? event.tool : 'unknown';
+          const denialReason = typeof event.reason === 'string' ? event.reason : '';
+          this.host.webview.postMessage({
+            type: 'permissionDenial',
+            tool: deniedTool,
+            reason: denialReason,
+          });
+          offerPermissionRetryOnce(deniedTool, denialReason, event.type);
+          break;
+        }
+        case 'error': {
+          const message = typeof event.error === 'string' ? event.error : 'Himalaya reported an unknown stream error.';
+          assistantText += `\n\n${message}`;
+          this.host.webview.postMessage({ type: 'error', text: message });
+          break;
+        }
         case 'done':
         case 'message_start':
         case 'message_stop':
@@ -443,27 +909,91 @@ export class HimalayaChatPanel {
     };
 
     try {
-      const result = await this.cli.run(args, {
-        cwd,
-        env,
-        silent: true,
-        onStdout: (chunk) => {
-          const parts = chunk.split('\n');
-          lineBuf += parts[0];
-          for (let i = 1; i < parts.length; i++) {
-            handleStreamLine(lineBuf);
-            lineBuf = parts[i];
+      const runOnce = async () => {
+        const result = await this.cli.run(args, {
+          cwd,
+          env,
+          silent: true,
+          signal: this.abortController?.signal,
+          onStdout: (chunk) => {
+            const parts = chunk.split('\n');
+            lineBuf += parts[0];
+            for (let i = 1; i < parts.length; i++) {
+              handleStreamLine(lineBuf);
+              lineBuf = parts[i];
+            }
+          },
+          onStderr: (chunk) => {
+            const clean = chunk.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b[()][AB012]/g, '');
+            this.host.webview.postMessage({ type: 'stderrChunk', text: clean });
           }
-        },
-        onStderr: (chunk) => {
-          const clean = chunk.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b[()][AB012]/g, '');
-          this.host.webview.postMessage({ type: 'stderrChunk', text: clean });
+        });
+        if (lineBuf.trim()) { handleStreamLine(lineBuf); lineBuf = ''; }
+        return result;
+      };
+
+      let result: { exitCode: number; stderr: string } | null = null;
+      if (this.replCanReuse) {
+        try {
+          let completed = false;
+          const handle = await this.ensureReplWorker({
+            model,
+            permissionMode,
+            cwd,
+            env,
+            resumeTarget: this.selectedCliSessionId ?? resumeTarget,
+            onEvent: (event) => {
+              handleStreamLine(JSON.stringify(event));
+              if (event && typeof event === 'object' && (event as { type?: unknown }).type === 'done') {
+                completed = true;
+              }
+            },
+            onStderr: (chunk) => {
+              const clean = chunk.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b[()][AB012]/g, '');
+              this.host.webview.postMessage({ type: 'stderrChunk', text: clean });
+            }
+          });
+          this.replBusy = true;
+          handle.send(JSON.stringify({ type: 'prompt', text: cliPrompt, files: attachmentPaths }));
+          await new Promise<void>((resolve, reject) => {
+            const started = Date.now();
+            const timer = setInterval(() => {
+              if (completed) {
+                clearInterval(timer);
+                resolve();
+                return;
+              }
+              if (!this.replHandle || !this.replBusy || this.abortController?.signal.aborted) {
+                clearInterval(timer);
+                reject(new Error(this.abortController?.signal.aborted ? 'Operation cancelled.' : 'Himalaya REPL worker stopped.'));
+                return;
+              }
+              if (Date.now() - started > 30 * 60 * 1000) {
+                clearInterval(timer);
+                reject(new Error('Himalaya REPL request timed out.'));
+              }
+            }, 100);
+          });
+        } catch (error) {
+          this.replBusy = false;
+          this.closeReplWorker();
+          if (this.abortController?.signal.aborted) {
+            throw error;
+          }
+          const text = error instanceof Error ? error.message : String(error);
+          this.host.webview.postMessage({ type: 'stderrChunk', text: `REPL worker unavailable; falling back to one-shot execution. ${text}\n` });
+          result = await runOnce();
+        } finally {
+          this.replBusy = false;
+          this.replEventHandler = null;
+          this.replStderrHandler = null;
         }
-      });
+      } else {
+        result = await runOnce();
+        this.replCanReuse = true;
+      }
 
-      if (lineBuf.trim()) { handleStreamLine(lineBuf); lineBuf = ''; }
-
-      if (result.exitCode !== 0) {
+      if (result && result.exitCode !== 0) {
         const stderr = result.stderr
           .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
           .replace(/\x1b[()][AB012]/g, '')
@@ -473,11 +1003,12 @@ export class HimalayaChatPanel {
         this.host.webview.postMessage({ type: 'error', text: failure });
       }
 
-      await this.history.replaceAssistantTail(record.id, assistantText);
+      await assistantTailPersistence.flush();
       this.isStreamingPrompt = false;
       this.host.webview.postMessage({ type: 'assistantDone' });
       await this.onRefresh?.();
     } catch (error) {
+      await assistantTailPersistence.flush();
       const text = error instanceof Error ? error.message : String(error);
       this.host.webview.postMessage({ type: 'error', text });
       await this.history.appendMessage(record.id, {
@@ -495,9 +1026,14 @@ export class HimalayaChatPanel {
     model: string,
     permissionMode: string,
     resumeTarget?: string,
+    cwd?: string,
     attachmentPaths: string[] = []
   ): string[] {
-    const args: string[] = ['--output-format', 'stream-json', '--allow-broad-cwd'];
+    const args: string[] = ['--output-format', 'stream-json'];
+
+    if (this.shouldAllowBroadCwd(cwd)) {
+      args.push('--allow-broad-cwd');
+    }
 
     if (permissionMode) {
       args.push('--permission-mode', permissionMode);
@@ -519,6 +1055,16 @@ export class HimalayaChatPanel {
     return args;
   }
 
+  private shouldAllowBroadCwd(cwd?: string): boolean {
+    const workspaceRoots = (vscode.workspace.workspaceFolders ?? [])
+      .map((folder) => path.resolve(folder.uri.fsPath));
+    if (workspaceRoots.length <= 1) {
+      return false;
+    }
+
+    const resolvedCwd = cwd ? path.resolve(cwd) : workspaceRoots[0];
+    return workspaceRoots.every((root) => root === resolvedCwd || root.startsWith(resolvedCwd + path.sep));
+  }
   private async confirmPermissionForRun(permissionMode: string, prompt: string): Promise<boolean> {
     if (permissionMode !== 'danger-full-access') {
       return true;
@@ -610,6 +1156,7 @@ export class HimalayaChatPanel {
     });
 
     let assistantText = '';
+    const assistantTailPersistence = this.createAssistantTailPersistence(record.id, () => assistantText);
     this.isStreamingPrompt = true;
     this.host.webview.postMessage({ type: 'assistantStart', historyId: record.id, model });
 
@@ -621,7 +1168,7 @@ export class HimalayaChatPanel {
         onStdout: (chunk) => {
           assistantText += chunk;
           this.host.webview.postMessage({ type: 'assistantChunk', text: chunk });
-          void this.history.replaceAssistantTail(record.id, assistantText);
+          assistantTailPersistence.schedule();
         },
         onStderr: (chunk) => {
           const clean = chunk.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b[()][AB012]/g, '');
@@ -639,9 +1186,10 @@ export class HimalayaChatPanel {
         this.host.webview.postMessage({ type: 'error', text: failure });
       }
 
-      await this.history.replaceAssistantTail(record.id, assistantText);
+      await assistantTailPersistence.flush();
       await this.onRefresh?.();
     } catch (error) {
+      await assistantTailPersistence.flush();
       const text = error instanceof Error ? error.message : String(error);
       this.host.webview.postMessage({ type: 'error', text });
       await this.history.appendMessage(record.id, {
@@ -835,7 +1383,7 @@ export class HimalayaChatPanel {
     const defaultModel: string = bootstrap.config?.defaultModel ?? 'sonnet';
     const currentModel: string = (options.model ?? defaultModel).trim() || defaultModel;
     const currentBackend: string = options.modelBackend ?? bootstrap.config?.defaultModelBackend ?? 'auto';
-    const currentPermission: string = options.permissionMode ?? bootstrap.config?.defaultPermissionMode ?? 'workspace-write';
+    const currentPermission: string = options.permissionMode ?? bootstrap.config?.defaultPermissionMode ?? 'read-only';
     const resumeTarget: string = options.resumeTarget ?? '';
     const isTrusted: boolean = Boolean(bootstrap.trust);
     const historyJson = JSON.stringify(historyRecords).replace(/</g, '\\u003c');
@@ -848,7 +1396,8 @@ export class HimalayaChatPanel {
       isTrusted,
       activeRecordId,
       showReasoning: Boolean(options.showReasoning),
-      showDecisioningDemo: Boolean(options.showDecisioningDemo)
+      showDecisioningDemo: Boolean(options.showDecisioningDemo),
+      identity: bootstrap.identity ?? {}
     }).replace(/</g, '\\u003c');
 
     const _head = `<!DOCTYPE html>
@@ -1001,6 +1550,9 @@ export class HimalayaChatPanel {
     .msg.decisioning-step { background: rgba(255,167,38,0.05); border-left: 2px solid #ffa726; padding: 6px 8px; align-self: flex-start; max-width: 100%; }
     .msg.decisioning-step .msg-role { color: #ffa726; }
     .msg.decisioning-step .msg-body { font-size: 12px; color: var(--text-dim); font-family: inherit; }
+    .msg.recovery-suggestion { background: rgba(181,126,220,0.06); border-left: 2px solid #b57edc; padding: 6px 8px; align-self: flex-start; max-width: 100%; }
+    .msg.recovery-suggestion .msg-role { color: #d6a8ff; }
+    .msg.recovery-suggestion .msg-body { font-size: 12px; color: var(--text-dim); font-family: inherit; }
     .decisioning-card {
       display: flex;
       flex-direction: column;
@@ -1045,6 +1597,34 @@ export class HimalayaChatPanel {
     .decisioning-badge.action-allow { border-color: rgba(102,187,106,0.35); }
     .decisioning-badge.action-review { border-color: rgba(255,167,38,0.35); }
     .decisioning-badge.action-deny { border-color: rgba(244,71,71,0.35); }
+    .decisioning-overview {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+      gap: 8px;
+    }
+    .decisioning-metric-card {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(0,0,0,0.1);
+    }
+    .decisioning-metric-label {
+      color: var(--text-dim);
+      font-size: 10px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .decisioning-metric-value {
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .decisioning-metric-card.risk-low .decisioning-metric-value { color: #9be28d; }
+    .decisioning-metric-card.risk-medium .decisioning-metric-value { color: #ffcb7a; }
+    .decisioning-metric-card.risk-high .decisioning-metric-value { color: #ff9a9a; }
     .decisioning-section {
       display: flex;
       flex-direction: column;
@@ -1200,6 +1780,37 @@ export class HimalayaChatPanel {
     .decisioning-tree-node.level-0 { margin-left: 0; }
     .decisioning-tree-node.level-1 { margin-left: 12px; }
     .decisioning-tree-node.level-2 { margin-left: 24px; }
+    .decisioning-tree-node.level-3 { margin-left: 36px; }
+    .decisioning-tree-node.level-deep { margin-left: 48px; }
+    .decisioning-node-overflow {
+      color: var(--text-dim);
+      font-size: 11px;
+      padding: 4px 0 0 10px;
+      border-left: 1px dashed rgba(255,255,255,0.12);
+    }
+    .decisioning-detail-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--text-dim);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+    .decisioning-detail-item {
+      padding: 6px 8px;
+      border-radius: 8px;
+      background: rgba(0,0,0,0.1);
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+    .decisioning-detail-label {
+      color: var(--text);
+      font-weight: 700;
+    }
+    .decisioning-detail-json {
+      margin-top: 4px;
+      font-family: monospace;
+      white-space: pre-wrap;
+    }
     .decisioning-tree-title {
       display: flex;
       flex-direction: column;
@@ -1227,8 +1838,8 @@ export class HimalayaChatPanel {
       letter-spacing: .08em;
       color: var(--text-dim);
     }
-    .msg.user .msg-role { color: var(--accent-text); }
-    .msg.assistant .msg-role { color: var(--success); }
+    .msg.user .msg-role { color: var(--accent-text); text-transform: none; }
+    .msg.assistant .msg-role { color: var(--success); text-transform: none; }
     .msg-body { font-size: 13px; }
     .empty-state {
       flex: 1;
@@ -1469,6 +2080,105 @@ export class HimalayaChatPanel {
       background: rgba(76,132,255,0.12);
       color: #a8c7ff;
     }
+    .task-board-surface {
+      flex: 0 0 auto;
+      margin: 8px 10px 0;
+      padding: 10px;
+      border-radius: 12px;
+      border: 1px solid rgba(78,201,176,0.25);
+      background: linear-gradient(180deg, rgba(78,201,176,0.08), rgba(255,255,255,0.02));
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
+    }
+    .task-board-surface[hidden] { display: none; }
+    .task-board-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .task-board-title {
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .03em;
+    }
+    .task-board-subtitle {
+      color: var(--text-dim);
+      font-size: 11px;
+      line-height: 1.45;
+      margin-top: 2px;
+    }
+    .task-board-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+      gap: 8px;
+    }
+    .task-board-panel {
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px;
+      background: rgba(0,0,0,0.10);
+      padding: 8px;
+      min-width: 0;
+    }
+    .task-board-panel-title {
+      color: var(--text);
+      font-size: 11px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .task-board-list,
+    .task-board-recovery-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .task-board-task,
+    .task-board-node,
+    .task-board-recovery-item {
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.03);
+      padding: 7px 8px;
+    }
+    .task-board-task-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 3px;
+    }
+    .task-board-task-title {
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 600;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .task-board-meta,
+    .task-board-empty {
+      color: var(--text-dim);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .task-board-status {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 7px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.12);
+      color: var(--text-dim);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+    .task-board-status.status-running { border-color: rgba(255,167,38,0.45); color: #ffcb7a; }
+    .task-board-status.status-completed { border-color: rgba(102,187,106,0.45); color: #9be28d; }
+    .task-board-status.status-blocked,
+    .task-board-status.status-failed,
+    .task-board-status.status-cancelled { border-color: rgba(244,71,71,0.45); color: #ff9a9a; }
+    .task-board-status.status-created,
+    .task-board-status.status-pending { border-color: rgba(76,132,255,0.35); color: #a8c7ff; }
   </style>
 `;
     const _body = `</head>
@@ -1496,7 +2206,7 @@ export class HimalayaChatPanel {
       <span>&#9660;</span>
     </button>
     <button class="perm-pill" id="btnPerm" title="Change permission mode">
-      <span id="permLabel">workspace-write</span>
+      <span id="permLabel">read-only</span>
     </button>
     <span class="spacer"></span>
     <button class="icon-btn" id="btnDoctor" title="Doctor">&#10003;</button>
@@ -1504,6 +2214,7 @@ export class HimalayaChatPanel {
   </div>
 
   <div class="decisioning-demo-surface" id="decisioningDemoSurface" hidden></div>
+  <div class="task-board-surface" id="taskBoardSurface" hidden></div>
 
   <!-- history drawer (collapsed by default) -->
   <div class="history-drawer" id="historyDrawer">
@@ -1554,32 +2265,51 @@ export class HimalayaChatPanel {
     const _script = `  <script nonce="${nonce}">
   window.onerror = function(msg, src, line, col, err) {
     try {
-      var api = acquireVsCodeApi();
-      api.postMessage({ type: 'webview-error', message: msg, line: line, col: col });
+      if (window.__himalayaPostError) {
+        window.__himalayaPostError(msg, line, col);
+      }
     } catch(e) {}
   };
   (function() {
     'use strict';
     const vscode = acquireVsCodeApi();
+    window.__himalayaPostError = function(msg, line, col) {
+      try { vscode.postMessage({ type: 'webview-error', message: String(msg), line: line, col: col }); } catch (_) {}
+    };
 
     /* ── initial state ── */
     const INIT = ${stateJson};
     const HISTORY = ${historyJson};
     const LOCAL_MODELS = ${localModelsJson};
+    const ACTIVE_RECORD = ((HISTORY || []).find(function(rec) { return rec.id === INIT.activeRecordId; }) || {});
 
     const state = {
       model: INIT.model,
       modelBackend: INIT.modelBackend,
       permissionMode: INIT.permissionMode,
-      resumeTarget: INIT.resumeTarget || '',
+      resumeTarget: INIT.resumeTarget || ACTIVE_RECORD.resumeTarget || '',
       isTrusted: INIT.isTrusted,
       activeRecordId: INIT.activeRecordId,
       showReasoning: INIT.showReasoning || false,
       showDecisioningDemo: INIT.showDecisioningDemo || false,
+      identity: INIT.identity || {},
       historyOpen: false,
       streaming: false,
       lastRunFailed: false,
-      messages: [],   /* {role, text} */
+      messages: (ACTIVE_RECORD.messages || []).map(function(m) {
+        return {
+          role: m.role,
+          text: m.text,
+          attachments: Array.isArray(m.attachments) ? m.attachments.slice() : []
+        };
+      }),
+      recoveryEvidence: (ACTIVE_RECORD.recoveryEvidence || []).slice(),
+      taskBoard: {
+        tasks: {},
+        taskOrder: [],
+        currentNode: null,
+        recoveryEvents: []
+      },
       historyRecords: HISTORY
     };
 
@@ -1599,6 +2329,7 @@ export class HimalayaChatPanel {
     const historyList  = document.getElementById('historyList');
     const trustBanner  = document.getElementById('trustBanner');
     const decisioningDemoSurface = document.getElementById('decisioningDemoSurface');
+    const taskBoardSurface = document.getElementById('taskBoardSurface');
 
     /* ── attachment state ── */
     let attachedFiles = [];
@@ -1665,7 +2396,7 @@ export class HimalayaChatPanel {
         const dotClass = b === 'cloud' ? 'cloud' : b === 'ollama' ? 'local' : 'unknown';
         modelDot.className = 'dot ' + dotClass;
         modelLabel.textContent = state.model || 'No model';
-        permLabel.textContent = state.permissionMode || 'workspace-write';
+        permLabel.textContent = state.permissionMode || 'read-only';
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'updateModelBar failed: ' + String(e) }); } catch (_) {}
       }
@@ -1681,10 +2412,58 @@ export class HimalayaChatPanel {
     }
 
     function showEmpty(show) {
-      emptyState.style.display = show ? 'flex' : 'none';
+      if (emptyState) { emptyState.style.display = show ? 'flex' : 'none'; }
     }
 
-    /* ── message rendering ── */
+    function cleanMemoryValue(value) {
+      return String(value || '').replace(/^[\\s,.;:!?，。；：！？"'“”‘’]+|[\\s,.;:!?，。；：！？"'“”‘’]+$/g, '').trim();
+    }
+
+    function takeMemoryValue(value) {
+      const raw = String(value || '');
+      const lower = raw.toLowerCase();
+      let end = raw.length;
+      [' and ', ' but ', ' from now on', ' going forward', '以后', '以后用', '以后请'].forEach(function(delimiter) {
+        const index = lower.indexOf(delimiter);
+        if (index >= 0) { end = Math.min(end, index); }
+      });
+      const delimiterMatch = raw.match(/[,.;!?，。；！？\\n\\r]/);
+      if (delimiterMatch && delimiterMatch.index !== undefined) {
+        end = Math.min(end, delimiterMatch.index);
+      }
+      return cleanMemoryValue(raw.slice(0, end));
+    }
+
+    function extractAfterAny(text, lower, markers) {
+      for (let i = 0; i < markers.length; i += 1) {
+        const marker = markers[i];
+        const index = lower.indexOf(marker);
+        if (index >= 0) {
+          const value = takeMemoryValue(text.slice(index + marker.length));
+          if (value && Array.from(value).length <= 64) { return value; }
+        }
+      }
+      return '';
+    }
+
+    function updateIdentityFromPrompt(text) {
+      const lower = String(text || '').toLowerCase();
+      const next = Object.assign({}, state.identity || {});
+      const userName = extractAfterAny(text, lower, ['我叫', '我的名字是', '叫我', 'my name is ', 'call me ']);
+      const assistantName = extractAfterAny(text, lower, ['以后你叫', '你叫', '你的名字是', 'your name is ', 'i will call you ', "i'll call you "]);
+      if (userName) { next.userDisplayName = userName; }
+      if (assistantName) { next.assistantDisplayName = assistantName; }
+      state.identity = next;
+    }
+
+    function labelForRole(role) {
+      if (role === 'user') { return (state.identity && state.identity.userDisplayName) || 'You'; }
+      if (role === 'assistant') { return (state.identity && state.identity.assistantDisplayName) || 'Himalaya'; }
+      if (role === 'tool-step') { return 'Tool'; }
+      return (String(role || '')[0] || '').toUpperCase() + String(role || '').slice(1);
+    }
+
+
     let streamBubble = null;
     let streamCursor = null;
 
@@ -1696,7 +2475,7 @@ export class HimalayaChatPanel {
         showEmpty(false);
         streamBubble = document.createElement('div');
         streamBubble.className = 'msg assistant';
-        streamBubble.innerHTML = '<div class="msg-role">Himalaya</div><div class="msg-body"></div>';
+        streamBubble.innerHTML = '<div class="msg-role">' + esc(labelForRole('assistant')) + '</div><div class="msg-body"></div>';
         thread.appendChild(streamBubble);
         streamCursor = document.createElement('span');
         streamCursor.className = 'cursor';
@@ -1736,6 +2515,28 @@ export class HimalayaChatPanel {
     }
 
     /* ── history drawer ── */
+    function applyHistoryRecord(rec) {
+      if (!rec) { return; }
+      state.activeRecordId = rec.id;
+      state.resumeTarget = rec.resumeTarget || '';
+      state.messages = (rec.messages || []).map(function(m) {
+        return {
+          role: m.role,
+          text: m.text,
+          attachments: Array.isArray(m.attachments) ? m.attachments.slice() : []
+        };
+      });
+      state.recoveryEvidence = (rec.recoveryEvidence || []).slice();
+      state.taskBoard = taskBoardInitialState();
+      const existingIndex = state.historyRecords.findIndex(function(item) { return item.id === rec.id; });
+      if (existingIndex >= 0) {
+        state.historyRecords[existingIndex] = rec;
+      } else {
+        state.historyRecords.unshift(rec);
+      }
+      renderThread();
+    }
+
     function renderHistory() {
       historyList.innerHTML = '';
       if (state.historyRecords.length === 0) {
@@ -1751,10 +2552,16 @@ export class HimalayaChatPanel {
           '<span class="hi-meta">' + esc(date) + '</span>';
         item.addEventListener('click', function() {
           state.activeRecordId = rec.id;
+          state.resumeTarget = rec.resumeTarget || '';
           vscode.postMessage({ type: 'history-action', historyId: rec.id, selectedHistoryId: rec.id });
-          /* load messages from record */
-          state.messages = (rec.messages || []).map(function(m) { return { role: m.role, text: m.text }; });
-          renderThread();
+          if ((rec.messages || []).length > 0 || (rec.recoveryEvidence || []).length > 0) {
+            applyHistoryRecord(rec);
+          } else {
+            state.messages = [];
+            state.recoveryEvidence = [];
+            state.taskBoard = taskBoardInitialState();
+            renderThread();
+          }
           renderHistory();
           toggleHistory(false);
         });
@@ -1767,18 +2574,59 @@ export class HimalayaChatPanel {
       historyDrawer.classList.toggle('open', state.historyOpen);
     }
 
-    function addBubble(role, text) {
+    function addBubble(role, text, attachments) {
       try {
         if (!thread) { return; }
         const div = document.createElement('div');
         const cls = role === 'user' ? 'msg user' : role === 'assistant' ? 'msg assistant' : role === 'error' ? 'msg error' : role === 'stderr' ? 'msg stderr' : role === 'tool-step' ? 'msg tool-step' : 'msg';
         div.className = cls;
-        const label = role === 'user' ? 'You' : role === 'assistant' ? 'Himalaya' : role === 'tool-step' ? 'Tool' : (String(role || '')[0] || '').toUpperCase() + String(role || '').slice(1);
-        div.innerHTML = '<div class="msg-role">' + esc(label) + '</div><div class="msg-body">' + esc(text || '') + '</div>';
+        const label = labelForRole(role);
+        let body = esc(text || '');
+        if (Array.isArray(attachments) && attachments.length > 0) {
+          const chips = attachments.map(function(attachment) {
+            const name = attachment && attachment.displayName ? attachment.displayName : attachment && attachment.path ? String(attachment.path).split(/[\\/]/).pop() : 'attachment';
+            const kind = attachment && attachment.mediaKind ? attachment.mediaKind : 'file';
+            return '<span class="attach-chip" title="' + esc((attachment && attachment.path) || name) + '">' + esc(kind + ': ' + name) + '</span>';
+          }).join('');
+          body += '<div class="attach-history">' + chips + '</div>';
+        }
+        div.innerHTML = '<div class="msg-role">' + esc(label) + '</div><div class="msg-body">' + body + '</div>';
         thread.appendChild(div);
         scrollBottom();
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'addBubble failed: ' + String(e) }); } catch (_) {}
+      }
+    }
+
+    function addRecoverySuggestion(msg) {
+      try {
+        if (!thread) { return; }
+        const div = document.createElement('div');
+        const tool = msg && msg.tool ? String(msg.tool) : 'tool';
+        const suggestion = msg && msg.suggestion ? String(msg.suggestion) : 'Review the failure and retry when the cause is resolved.';
+        const action = msg && msg.action ? String(msg.action).replace(/_/g, ' ') : '';
+        const failureClass = msg && msg.failureClass ? String(msg.failureClass).replace(/_/g, ' ') : '';
+        const reason = msg && msg.reason ? String(msg.reason) : '';
+        let body = 'Suggested recovery for ' + tool + ': ' + suggestion;
+        if (failureClass) { body += '\\nFailure class: ' + failureClass; }
+        if (action) { body += '\\nAction: ' + action; }
+        if (reason) { body += '\\nReason: ' + reason.slice(0, 240); }
+        div.className = 'msg recovery-suggestion';
+        div.innerHTML = '<div class="msg-role">Recovery</div><div class="msg-body">' + esc(body) + '</div>';
+        thread.appendChild(div);
+        scrollBottom();
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'addRecoverySuggestion failed: ' + String(e) }); } catch (_) {}
+      }
+    }
+
+    function replayRecoveryEvidence() {
+      try {
+        (state.recoveryEvidence || []).forEach(function(evidence) {
+          addRecoverySuggestion(evidence);
+        });
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'replayRecoveryEvidence failed: ' + String(e) }); } catch (_) {}
       }
     }
 
@@ -1818,8 +2666,48 @@ export class HimalayaChatPanel {
       return 'unknown';
     }
 
+    function sanitizeDecisioningClassToken(value) {
+      return String(value || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, '-')
+        .replace(/^-+|-+$/g, '') || 'unknown';
+    }
+
+    function sanitizeDecisioningClassList(className) {
+      return String(className || '')
+        .split(/\s+/)
+        .map(sanitizeDecisioningClassToken)
+        .filter(Boolean)
+        .join(' ');
+    }
+
     function renderDecisioningSummaryBadge(label, className) {
-      return '<span class="decisioning-badge' + (className ? ' ' + className : '') + '">' + esc(label) + '</span>';
+      const safeClass = sanitizeDecisioningClassList(className);
+      return '<span class="decisioning-badge' + (safeClass ? ' ' + safeClass : '') + '">' + esc(label) + '</span>';
+    }
+
+    function renderDecisioningMetric(label, value, className) {
+      const safeClass = sanitizeDecisioningClassList(className);
+      return '<div class="decisioning-metric-card' + (safeClass ? ' ' + safeClass : '') + '">' +
+        '<div class="decisioning-metric-label">' + esc(label) + '</div>' +
+        '<div class="decisioning-metric-value">' + esc(value) + '</div>' +
+      '</div>';
+    }
+
+    function renderDecisioningOverview(event, riskLevel) {
+      const metrics = [];
+      if (event.task_id) { metrics.push(renderDecisioningMetric('Task', String(event.task_id))); }
+      if (typeof event.confidence === 'number') { metrics.push(renderDecisioningMetric('Confidence', Math.round(event.confidence * 100) + '%')); }
+      if (typeof event.risk_score === 'number' || event.risk_level || event.action) {
+        const riskText = typeof event.risk_score === 'number' ? Math.round(Math.max(0, Math.min(1, event.risk_score)) * 100) + '% · ' + riskLevel : riskLevel;
+        metrics.push(renderDecisioningMetric('Risk', riskText, 'risk-' + riskLevel));
+      }
+      if (event.action) { metrics.push(renderDecisioningMetric('Action', String(event.action))); }
+      if (typeof event.parallelizable === 'boolean') { metrics.push(renderDecisioningMetric('Parallelism', event.parallelizable ? 'Parallel' : 'Serial')); }
+      if (Array.isArray(event.selected_tools)) { metrics.push(renderDecisioningMetric('Selected tools', String(event.selected_tools.length))); }
+      if (Array.isArray(event.tool_scores)) { metrics.push(renderDecisioningMetric('Scored tools', String(event.tool_scores.length))); }
+      if (!metrics.length) { return ''; }
+      return '<section class="decisioning-section"><div class="decisioning-section-title">Workbench Overview</div><div class="decisioning-overview">' + metrics.join('') + '</div></section>';
     }
 
     function getDecisioningDemoEvent() {
@@ -1924,6 +2812,8 @@ export class HimalayaChatPanel {
         badges.push(renderDecisioningSummaryBadge(riskLevel + ' risk', 'risk-' + riskLevel));
       }
       const sections = [];
+      const overviewHtml = renderDecisioningOverview(event, riskLevel);
+      if (overviewHtml) { sections.push(overviewHtml); }
       const riskHtml = renderDecisioningRiskPanel(event, riskLevel);
       if (riskHtml) { sections.push(riskHtml); }
       const toolScoresHtml = renderDecisioningToolScores(event.tool_scores, event.selected_tools);
@@ -2037,7 +2927,12 @@ export class HimalayaChatPanel {
       const list = Array.isArray(toolScores) ? toolScores.filter(Boolean) : [];
       if (!list.length) { return ''; }
       const selectedSet = new Set(Array.isArray(selectedTools) ? selectedTools.map(function(name) { return String(name || ''); }) : []);
-      const visibleScores = list.slice(0, 6);
+      const visibleScores = list.slice().sort(function(left, right) {
+        const leftScore = typeof left.score === 'number' ? left.score : -Infinity;
+        const rightScore = typeof right.score === 'number' ? right.score : -Infinity;
+        if (rightScore !== leftScore) { return rightScore - leftScore; }
+        return String(left.name || '').localeCompare(String(right.name || ''));
+      }).slice(0, 6);
       const baseline = visibleScores[0] && typeof visibleScores[0].score === 'number' ? visibleScores[0].score : 0;
       const minScore = visibleScores.reduce(function(acc, item) {
         return Math.min(acc, typeof item.score === 'number' ? item.score : 0);
@@ -2107,10 +3002,14 @@ export class HimalayaChatPanel {
       const noteBlock = notes.length ? '<div class="decisioning-node-notes">' + notes.map(function(note) {
         return '<div>' + esc(String(note || '')) + '</div>';
       }).join('') + '</div>' : '';
-      const childBlock = children.length ? '<div class="decisioning-tree-children">' + children.map(function(child) {
+      const visibleChildren = children.slice(0, 8);
+      const hiddenChildren = children.length - visibleChildren.length;
+      const childBlock = visibleChildren.length ? '<div class="decisioning-tree-children">' + visibleChildren.map(function(child) {
         return renderDecisioningPlanNode(child, selectedSet, depth + 1);
-      }).join('') + '</div>' : '';
-      return '<div class="decisioning-tree-node kind-' + esc(kind) + ' level-' + depth + '">' +
+      }).join('') + (hiddenChildren > 0 ? '<div class="decisioning-node-overflow">+' + hiddenChildren + ' more nested step(s)</div>' : '') + '</div>' : '';
+      const safeKindClass = sanitizeDecisioningClassToken(kind);
+      const safeLevelClass = depth >= 4 ? 'level-deep' : 'level-' + depth;
+      return '<div class="decisioning-tree-node kind-' + safeKindClass + ' ' + safeLevelClass + '">' +
         '<div class="decisioning-tree-head">' +
           '<div class="decisioning-tree-title">' +
             '<span class="decisioning-tree-kind">' + esc(kind) + '</span>' +
@@ -2133,15 +3032,328 @@ export class HimalayaChatPanel {
       '</section>';
     }
 
+    function renderDecisioningDetailItem(item, index) {
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
+        const label = item.label || item.title || item.kind || item.name || ('detail ' + (index + 1));
+        const text = item.text || item.summary || item.reason || item.value;
+        const json = text === undefined ? JSON.stringify(item, null, 2) : String(text);
+        return '<div class="decisioning-detail-item"><div class="decisioning-detail-label">' + esc(String(label)) + '</div><div class="decisioning-detail-json">' + esc(json) + '</div></div>';
+      }
+      return '<div class="decisioning-detail-item">' + esc(String(item || '')) + '</div>';
+    }
+
     function renderDecisioningNotes(details) {
       const list = Array.isArray(details) ? details.filter(Boolean) : [];
       if (!list.length) { return ''; }
       return '<section class="decisioning-section">' +
-        '<div class="decisioning-section-title">Notes</div>' +
-        '<div class="decisioning-node-notes">' + list.map(function(item) {
-          return '<div>' + esc(String(item || '')) + '</div>';
-        }).join('') + '</div>' +
+        '<div class="decisioning-section-title">Details</div>' +
+        '<div class="decisioning-detail-list">' + list.slice(0, 8).map(renderDecisioningDetailItem).join('') + '</div>' +
+        (list.length > 8 ? '<div class="decisioning-section-note">Showing first 8 of ' + list.length + ' detail item(s).</div>' : '') +
       '</section>';
+    }
+
+    function recoveryEventSummary(value) {
+      if (typeof value === 'string') {
+        if (value === 'recovery_succeeded') { return 'Recovery succeeded'; }
+        if (value === 'recovery_failed') { return 'Recovery failed'; }
+        if (value === 'escalated') { return 'Recovery escalated'; }
+        return value.replace(/_/g, ' ');
+      }
+      if (!value || typeof value !== 'object') { return 'Recovery event'; }
+      if (value.recovery_attempted && typeof value.recovery_attempted === 'object') {
+        const attempted = value.recovery_attempted;
+        const result = attempted.result && typeof attempted.result === 'object' ? attempted.result : {};
+        let outcome = 'attempted';
+        if (result.recovered) { outcome = 'recovered'; }
+        else if (result.partial_recovery) { outcome = 'partial recovery'; }
+        else if (result.escalation_required) { outcome = 'escalation required'; }
+        return ['Recovery', attempted.scenario, outcome].filter(Boolean).join(' · ');
+      }
+      if (Object.prototype.hasOwnProperty.call(value, 'recovery_succeeded')) { return 'Recovery succeeded'; }
+      if (Object.prototype.hasOwnProperty.call(value, 'recovery_failed')) { return 'Recovery failed'; }
+      if (Object.prototype.hasOwnProperty.call(value, 'escalated')) { return 'Recovery escalated'; }
+      return 'Recovery event';
+    }
+
+    function runtimeEventSummary(kind, event) {
+      const value = event && typeof event === 'object' ? event : {};
+      if (kind === 'plan_execution_event') {
+        const label = String(value.kind || '').replace(/_/g, ' ');
+        const attempt = value.attempt ? 'attempt ' + value.attempt : undefined;
+        const blocked = value.blocking_reason ? 'blocked: ' + value.blocking_reason : undefined;
+        const gate = value.verification_gate ? 'gate: ' + value.verification_gate : undefined;
+        return ['Plan', label, value.node_id, value.status, attempt, blocked, gate].filter(Boolean).join(' · ') || 'Plan updated';
+      }
+      if (kind === 'task_ledger_event') {
+        const label = String(value.event || '').replace(/_/g, ' ');
+        return ['Task', value.task_id, label, value.status].filter(Boolean).join(' · ') || 'Task ledger updated';
+      }
+      if (kind === 'model_route_event') {
+        const confidence = typeof value.confidence === 'number' ? 'confidence ' + Math.round(value.confidence * 100) + '%' : undefined;
+        const fallback = value.fallback_model ? 'fallback ' + value.fallback_model : undefined;
+        return ['Route', value.phase, value.model, confidence, fallback, value.reason].filter(Boolean).join(' · ') || 'Model route selected';
+      }
+      if (kind === 'team_execution_event') {
+        const label = String(value.kind || '').replace(/_/g, ' ');
+        return ['Team', value.role, label, value.message].filter(Boolean).join(' · ') || 'Team event';
+      }
+      if (kind === 'recovery_event') {
+        return recoveryEventSummary(value);
+      }
+      if (kind === 'recovery_action_event' || kind === 'task_recovery') {
+        const execution = value.execution && typeof value.execution === 'object' ? value.execution : value;
+        const results = Array.isArray(execution.results) ? execution.results.length + ' action(s)' : undefined;
+        const label = kind === 'recovery_action_event' ? 'Recovery action' : 'Task recovery';
+        return [label, execution.task_id, results].filter(Boolean).join(' · ') || label + ' updated';
+      }
+      if (kind === 'task_execution_event' || kind === 'task_execution') {
+        const outcome = value.outcome && typeof value.outcome === 'object' ? value.outcome : value;
+        const stepCount = Array.isArray(outcome.steps) ? outcome.steps.length + ' step(s)' : undefined;
+        const status = outcome.completed ? 'completed' : (outcome.blocked ? 'blocked' : undefined);
+        const label = kind === 'task_execution_event' ? 'Task execution event' : 'Task execution';
+        return [label, outcome.task_id, status, stepCount, outcome.message].filter(Boolean).join(' · ') || label + ' updated';
+      }
+      if (kind === 'task_verification') {
+        const result = value.result && typeof value.result === 'object' ? value.result : value;
+        const status = result.passed === true ? 'passed' : (result.passed === false ? 'failed' : undefined);
+        return ['Task verification', result.task_id, status, result.summary].filter(Boolean).join(' · ') || 'Task verification updated';
+      }
+      if (kind === 'task_list') {
+        const count = Array.isArray(value.tasks) ? value.tasks.length + ' task(s)' : undefined;
+        return ['Task list', count].filter(Boolean).join(' · ') || 'Task list updated';
+      }
+      if (kind === 'task_show') {
+        const task = value.task && typeof value.task === 'object' ? value.task : {};
+        return ['Task detail', task.task_id, task.status].filter(Boolean).join(' · ') || 'Task detail updated';
+      }
+      if (kind === 'task_node_retry') {
+        return ['Task node retry', value.node_id].filter(Boolean).join(' · ') || 'Task node retry scheduled';
+      }
+      if (kind === 'task_node_verification') {
+        return ['Task node verification', value.node_id, value.command].filter(Boolean).join(' · ') || 'Task node verification updated';
+      }
+      if (kind === 'task_compacted') {
+        return ['Task compacted', value.keep_last ? 'keep ' + value.keep_last : undefined].filter(Boolean).join(' · ') || 'Task compacted';
+      }
+      if (kind === 'task_cancelled') {
+        const task = value.task && typeof value.task === 'object' ? value.task : {};
+        return ['Task cancelled', task.task_id].filter(Boolean).join(' · ') || 'Task cancelled';
+      }
+      return event && typeof event === 'object' ? JSON.stringify(event) : String(event || '');
+    }
+    function taskBoardInitialState() {
+      return {
+        tasks: {},
+        taskOrder: [],
+        currentNode: null,
+        recoveryEvents: []
+      };
+    }
+
+    function taskBoardTaskId(task) {
+      if (!task || typeof task !== 'object') { return ''; }
+      return String(task.task_id || task.id || '').trim();
+    }
+
+    function rememberTaskBoardTask(task) {
+      const taskId = taskBoardTaskId(task);
+      if (!taskId) { return; }
+      const previous = state.taskBoard.tasks[taskId] || {};
+      const patch = {};
+      Object.keys(task).forEach(function(key) {
+        if (task[key] !== undefined && task[key] !== null && task[key] !== '') {
+          patch[key] = task[key];
+        }
+      });
+      state.taskBoard.tasks[taskId] = Object.assign({}, previous, patch, { task_id: taskId });
+      if (state.taskBoard.taskOrder.indexOf(taskId) < 0) {
+        state.taskBoard.taskOrder.unshift(taskId);
+      }
+    }
+
+    function rememberTaskBoardRecovery(kind, event) {
+      const summary = kind === 'recoverySuggestion'
+        ? ['Suggestion', event.tool, event.action, event.reason].filter(Boolean).join(' · ')
+        : runtimeEventSummary(kind, event);
+      state.taskBoard.recoveryEvents.unshift({
+        kind: kind,
+        summary: summary || 'Recovery updated',
+        event: event,
+        createdAt: Date.now()
+      });
+      state.taskBoard.recoveryEvents = state.taskBoard.recoveryEvents.slice(0, 6);
+    }
+
+    function updateTaskBoardFromRuntimeEvent(kind, event) {
+      try {
+        const value = event && typeof event === 'object' ? event : {};
+        if (kind === 'task_list' && Array.isArray(value.tasks)) {
+          value.tasks.forEach(function(task) { rememberTaskBoardTask(task); });
+        } else if (kind === 'task_show' || kind === 'task_packet_create' || kind === 'task_packet_run' || kind === 'task_packet_status') {
+          if (value.task && typeof value.task === 'object') { rememberTaskBoardTask(value.task); }
+        } else if (kind === 'task_scheduler_queue' && Array.isArray(value.queue)) {
+          value.queue.forEach(function(item) {
+            if (item && item.task_id) {
+              rememberTaskBoardTask({
+                task_id: item.task_id,
+                status: item.task_status || item.status,
+                last_event: 'scheduler ' + String(item.status || 'queued')
+              });
+            }
+          });
+        } else if (kind === 'task_scheduler_tick') {
+          const tick = value.tick && typeof value.tick === 'object' ? value.tick : value;
+          if (tick.task && typeof tick.task === 'object') { rememberTaskBoardTask(tick.task); }
+          if (Array.isArray(tick.queue)) {
+            tick.queue.forEach(function(item) {
+              if (item && item.task_id) {
+                rememberTaskBoardTask({
+                  task_id: item.task_id,
+                  status: item.task_status || item.status,
+                  last_event: 'scheduler ' + String(item.status || 'tick')
+                });
+              }
+            });
+          }
+        } else if (kind === 'task_ledger_event') {
+          if (value.task_id) {
+            rememberTaskBoardTask({
+              task_id: value.task_id,
+              status: value.status,
+              last_event: value.event,
+              updated_at: value.timestamp
+            });
+          }
+        } else if (kind === 'plan_execution_event') {
+          state.taskBoard.currentNode = {
+            taskId: value.task_id,
+            nodeId: value.node_id,
+            status: value.status,
+            kind: value.kind,
+            attempt: value.attempt,
+            blockingReason: value.blocking_reason,
+            verificationGate: value.verification_gate
+          };
+          if (value.task_id) { rememberTaskBoardTask({ task_id: value.task_id, last_event: value.kind || 'plan_execution_event' }); }
+        } else if (kind === 'task_node_retry' || kind === 'task_node_verification') {
+          state.taskBoard.currentNode = {
+            taskId: value.task_id,
+            nodeId: value.node_id,
+            status: kind === 'task_node_retry' ? 'retrying' : 'verifying',
+            kind: kind,
+            attempt: value.attempt,
+            blockingReason: value.command
+          };
+        } else if (kind === 'task_execution' || kind === 'task_execution_event') {
+          const outcome = value.outcome && typeof value.outcome === 'object' ? value.outcome : value;
+          if (outcome.task_id) {
+            const status = outcome.completed ? 'completed' : (outcome.blocked ? 'blocked' : outcome.status);
+            rememberTaskBoardTask({ task_id: outcome.task_id, status: status, last_event: outcome.message });
+          }
+        } else if (kind === 'task_verification') {
+          const result = value.result && typeof value.result === 'object' ? value.result : value;
+          if (result.task_id) {
+            rememberTaskBoardTask({
+              task_id: result.task_id,
+              verification: result.passed === true ? 'passed' : (result.passed === false ? 'failed' : 'unknown')
+            });
+          }
+        } else if (kind === 'task_cancelled') {
+          const task = value.task && typeof value.task === 'object' ? value.task : value;
+          if (task.task_id) { rememberTaskBoardTask(Object.assign({}, task, { status: 'cancelled' })); }
+        }
+        if (kind === 'recovery_event' || kind === 'recovery_action_event' || kind === 'task_recovery') {
+          rememberTaskBoardRecovery(kind, value);
+        }
+        updateTaskBoardSurface();
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'updateTaskBoardFromRuntimeEvent failed: ' + String(e) }); } catch (_) {}
+      }
+    }
+
+    function renderTaskBoardTask(task) {
+      const taskId = String(task.task_id || 'task');
+      const title = String(task.prompt || task.description || taskId);
+      const status = String(task.status || 'unknown');
+      const meta = [taskId, task.last_event, task.verification ? 'verification ' + task.verification : undefined].filter(Boolean).join(' · ');
+      const safeStatus = sanitizeDecisioningClassToken(status);
+      return '<div class="task-board-task" data-task-id="' + esc(taskId) + '">' +
+        '<div class="task-board-task-head"><div class="task-board-task-title" title="' + esc(title) + '">' + esc(title) + '</div>' +
+        '<span class="task-board-status status-' + esc(safeStatus) + '">' + esc(status) + '</span></div>' +
+        '<div class="task-board-meta">' + esc(meta || taskId) + '</div>' +
+      '</div>';
+    }
+
+    function renderTaskBoardNode(node) {
+      if (!node) {
+        return '<div class="task-board-empty">No active node yet.</div>';
+      }
+      const status = String(node.status || 'unknown');
+      const meta = [node.taskId, node.nodeId, node.kind, node.attempt ? 'attempt ' + node.attempt : undefined].filter(Boolean).join(' · ');
+      const details = [node.blockingReason ? 'Blocked: ' + node.blockingReason : undefined, node.verificationGate ? 'Gate: ' + node.verificationGate : undefined].filter(Boolean).join(' · ');
+      return '<div class="task-board-node">' +
+        '<div class="task-board-task-head"><div class="task-board-task-title">Current node</div>' +
+        '<span class="task-board-status status-' + esc(sanitizeDecisioningClassToken(status)) + '">' + esc(status) + '</span></div>' +
+        '<div class="task-board-meta">' + esc(meta || 'Plan node updated') + '</div>' +
+        (details ? '<div class="task-board-meta">' + esc(details) + '</div>' : '') +
+      '</div>';
+    }
+
+    function renderTaskBoardRecovery() {
+      const events = state.taskBoard.recoveryEvents || [];
+      if (!events.length) {
+        return '<div class="task-board-empty">No recovery events.</div>';
+      }
+      return '<div class="task-board-recovery-list">' + events.map(function(item) {
+        return '<div class="task-board-recovery-item"><div class="task-board-task-title">' + esc(String(item.kind || 'recovery')) + '</div><div class="task-board-meta">' + esc(item.summary || 'Recovery updated') + '</div></div>';
+      }).join('') + '</div>';
+    }
+
+    function updateTaskBoardSurface() {
+      try {
+        if (!taskBoardSurface) { return; }
+        const tasks = state.taskBoard.taskOrder
+          .map(function(taskId) { return state.taskBoard.tasks[taskId]; })
+          .filter(Boolean)
+          .slice(0, 5);
+        const hasBoardState = tasks.length > 0 || state.taskBoard.currentNode || state.taskBoard.recoveryEvents.length > 0;
+        if (!hasBoardState) {
+          taskBoardSurface.hidden = true;
+          taskBoardSurface.innerHTML = '';
+          return;
+        }
+        taskBoardSurface.hidden = false;
+        taskBoardSurface.innerHTML = '<div class="task-board-header">' +
+          '<div><div class="task-board-title">Task Board</div><div class="task-board-subtitle">Live task status, active node, and recovery timeline from stream events.</div></div>' +
+          '<div class="decisioning-badges">' + renderDecisioningSummaryBadge(tasks.length + ' task(s)', 'demo') + '</div>' +
+        '</div>' +
+        '<div class="task-board-grid">' +
+          '<div class="task-board-panel"><div class="task-board-panel-title">Tasks</div><div class="task-board-list">' +
+            (tasks.length ? tasks.map(renderTaskBoardTask).join('') : '<div class="task-board-empty">No tasks yet.</div>') +
+          '</div></div>' +
+          '<div class="task-board-panel"><div class="task-board-panel-title">Current Node</div>' + renderTaskBoardNode(state.taskBoard.currentNode) + '<div class="task-board-panel-title" style="margin-top:8px;">Recovery</div>' + renderTaskBoardRecovery() + '</div>' +
+        '</div>';
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'updateTaskBoardSurface failed: ' + String(e) }); } catch (_) {}
+      }
+    }
+
+    function addRuntimeEvent(kind, event) {
+      try { updateTaskBoardFromRuntimeEvent(kind, event); } catch (_) {}
+      try {
+        if (!thread) { return; }
+        const div = document.createElement('div');
+        const normalizedKind = String(kind || 'runtime_event').replace(/_/g, ' ');
+        const summary = runtimeEventSummary(kind, event);
+        const body = event && typeof event === 'object' ? JSON.stringify(event, null, 2) : String(event || '');
+        div.className = 'msg decisioning-step runtime-event';
+        div.innerHTML = '<div class="msg-role">Runtime · ' + esc(normalizedKind) + '</div>' +
+          '<div class="msg-body"><strong>' + esc(summary) + '</strong><details><summary>Raw event</summary><pre>' + esc(body) + '</pre></details></div>';
+        thread.appendChild(div);
+        scrollBottom();
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'addRuntimeEvent failed: ' + String(e) }); } catch (_) {}
+      }
     }
 
     function addDecisioningEvent(event) {
@@ -2176,13 +3388,16 @@ export class HimalayaChatPanel {
       thread.innerHTML = '';
       streamBubble = null;
       streamCursor = null;
-      if (state.messages.length === 0) {
+      if (state.messages.length === 0 && state.recoveryEvidence.length === 0) {
         thread.appendChild(emptyState);
         showEmpty(true);
+        updateTaskBoardSurface();
         return;
       }
       showEmpty(false);
-      state.messages.forEach(function(m) { addBubble(m.role, m.text); });
+      state.messages.forEach(function(m) { addBubble(m.role, m.text, m.attachments); });
+      replayRecoveryEvidence();
+      updateTaskBoardSurface();
     }
 
     /* ── submit ── */
@@ -2196,8 +3411,12 @@ export class HimalayaChatPanel {
         scrollBottom();
         return;
       }
-      state.messages.push({ role: 'user', text });
-      addBubble('user', text);
+      updateIdentityFromPrompt(text);
+      state.messages.push({ role: 'user', text, attachments: attachedFiles.map(function(file) {
+        const name = String(file).split(/[\\/]/).pop() || String(file);
+        return { path: String(file), displayName: name, mediaKind: 'file' };
+      }) });
+      addBubble('user', text, state.messages[state.messages.length - 1].attachments);
       promptInput.value = '';
       promptInput.style.height = 'auto';
       const filesToSend = attachedFiles.slice();
@@ -2264,8 +3483,10 @@ export class HimalayaChatPanel {
       btnNewEl.addEventListener('click', function() {
         try {
           state.messages = [];
+          state.recoveryEvidence = [];
           state.activeRecordId = null;
           state.resumeTarget = '';
+          state.taskBoard = taskBoardInitialState();
           renderThread();
           setStatus('New session.', '');
           vscode.postMessage({ type: 'command', command: 'newSession' });
@@ -2298,6 +3519,7 @@ export class HimalayaChatPanel {
     try { updateReasoningToggle(); } catch (_) {}
     try { updateDecisioningDemoToggle(); } catch (_) {}
     try { updateDecisioningDemoSurface(); } catch (_) {}
+    try { updateTaskBoardSurface(); } catch (_) {}
 
     const btnRefreshEl = document.getElementById('btnRefresh');
     if (btnRefreshEl) {
@@ -2344,9 +3566,24 @@ export class HimalayaChatPanel {
         case 'bootstrap':
           if (msg.bootstrap) {
             state.isTrusted = Boolean(msg.bootstrap.trust);
+            if (msg.bootstrap.identity) {
+              state.identity = msg.bootstrap.identity;
+            }
             if (msg.bootstrap.history) {
               state.historyRecords = msg.bootstrap.history.records || [];
               state.activeRecordId = msg.bootstrap.history.activeRecordId || null;
+              const activeRecord = state.historyRecords.find(function(rec) { return rec.id === state.activeRecordId; });
+              state.resumeTarget = activeRecord && activeRecord.resumeTarget ? activeRecord.resumeTarget : state.resumeTarget;
+              if (activeRecord && ((activeRecord.messages || []).length > 0 || (activeRecord.recoveryEvidence || []).length > 0)) {
+                state.messages = (activeRecord.messages || []).map(function(m) {
+                  return {
+                    role: m.role,
+                    text: m.text,
+                    attachments: Array.isArray(m.attachments) ? m.attachments.slice() : []
+                  };
+                });
+                state.recoveryEvidence = (activeRecord.recoveryEvidence || []).slice();
+              }
             }
           }
           if (msg.options) {
@@ -2367,12 +3604,21 @@ export class HimalayaChatPanel {
           try { updateReasoningToggle(); } catch (_) {}
           try { updateDecisioningDemoToggle(); } catch (_) {}
           try { updateDecisioningDemoSurface(); } catch (_) {}
+          try { updateTaskBoardSurface(); } catch (_) {}
           break;
         
+        case 'historyRecord':
+          if (msg.record) {
+            applyHistoryRecord(msg.record);
+            renderHistory();
+          }
+          break;
         case 'session-reset':
           state.messages = [];
+          state.recoveryEvidence = [];
           state.activeRecordId = null;
           state.resumeTarget = '';
+          state.taskBoard = taskBoardInitialState();
           renderThread();
           setStatus('Ready', '');
           break;
@@ -2382,6 +3628,15 @@ export class HimalayaChatPanel {
           updateModelBar();
           setStatus('Model updated: ' + state.model, 'done');
           break;
+        case 'sessionMeta': {
+          const sessionId = msg.sessionId ? String(msg.sessionId) : '';
+          if (sessionId) {
+            state.resumeTarget = sessionId;
+            if (msg.model) { state.model = String(msg.model); }
+            setStatus('Session ' + sessionId.slice(0, 12), 'done');
+          }
+          break;
+        }
         case 'assistantStart':
           state.lastRunFailed = false;
           if (!streamBubble) { startStream(); }
@@ -2400,10 +3655,43 @@ export class HimalayaChatPanel {
           break;
         case 'toolStep': {
           const div = document.createElement('div');
+          const name = msg.name ? String(msg.name) : 'tool';
+          let bodyText = msg.text;
+          if (!bodyText && msg.step === 'use') {
+            bodyText = name + (msg.input ? ' input: ' + String(msg.input) : '');
+          } else if (!bodyText && msg.step === 'result') {
+            const output = String(msg.output || '');
+            bodyText = name + (msg.isError ? ' error: ' : ' output: ') + output.slice(0, 200);
+          }
           div.className = 'msg tool-step';
-          div.innerHTML = '<div class="msg-role">Tool</div><div class="msg-body">' + esc(msg.text || '') + '</div>';
+          div.innerHTML = '<div class="msg-role">Tool</div><div class="msg-body">' + esc(bodyText || '') + '</div>';
           thread.appendChild(div);
           scrollBottom();
+          break;
+        }
+        case 'permissionRequest': {
+          const tool = msg.tool ? String(msg.tool) : 'unknown';
+          const reason = msg.reason ? String(msg.reason) : '';
+          const currentMode = msg.currentMode ? String(msg.currentMode) : '';
+          const requiredMode = msg.requiredMode ? String(msg.requiredMode) : '';
+          const input = msg.input ? String(msg.input) : '';
+          let body = 'Permission requested for ' + tool;
+          if (currentMode || requiredMode) {
+            body += ' (' + (currentMode || 'unknown') + ' → ' + (requiredMode || 'unknown') + ')';
+          }
+          if (reason) {
+            body += ': ' + reason;
+          }
+          if (input) {
+            body += '\\nInput: ' + input.slice(0, 240);
+          }
+          addBubble('tool-step', body);
+          break;
+        }
+        case 'permissionDenial': {
+          const tool = msg.tool ? String(msg.tool) : 'unknown';
+          const reason = msg.reason ? String(msg.reason) : '';
+          addBubble('tool-step', 'Permission denied for ' + tool + (reason ? ': ' + reason : ''));
           break;
         }
         case 'reasoningStep': {
@@ -2414,7 +3702,28 @@ export class HimalayaChatPanel {
           try { addDecisioningEvent(msg.event); } catch (_) {}
           break;
         }
-        
+        case 'runtimeEvent': {
+          try { addRuntimeEvent(msg.kind, msg.event); } catch (_) {}
+          break;
+        }
+        case 'recoverySuggestion': {
+          try {
+            state.recoveryEvidence.push({
+              tool: msg.tool,
+              reason: msg.reason,
+              action: msg.action,
+              suggestion: msg.suggestion,
+              sourceEvent: msg.sourceEvent,
+              failureClass: msg.failureClass,
+              createdAt: Date.now()
+            });
+            rememberTaskBoardRecovery('recoverySuggestion', msg);
+            updateTaskBoardSurface();
+            addRecoverySuggestion(msg);
+          } catch (_) {}
+          break;
+        }
+
         case 'assistantDone':
           endStream();
           state.streaming = false;
@@ -2472,6 +3781,7 @@ export class HimalayaChatPanel {
     if (HimalayaChatPanel.currentPanel === this) {
       HimalayaChatPanel.currentPanel = undefined;
     }
+    this.closeReplWorker();
     while (this.disposables.length > 0) {
       const disposable = this.disposables.pop();
       disposable?.dispose();
@@ -2836,7 +4146,7 @@ function createFallbackBootstrap(): ChatBootstrap {
     trust: vscode.workspace.isTrusted || config.get<boolean>('allowUntrustedRuns', false),
     config: {
       defaultModel: config.get<string>('defaultModel', 'sonnet'),
-      defaultPermissionMode: config.get<string>('defaultPermissionMode', 'workspace-write'),
+      defaultPermissionMode: config.get<string>('defaultPermissionMode', 'read-only'),
       defaultModelBackend: config.get<string>('defaultModelBackend', 'auto'),
       ollamaBaseUrl: config.get<string>('ollamaBaseUrl', 'http://127.0.0.1:11434/v1'),
       allowUntrustedRuns: config.get<boolean>('allowUntrustedRuns', false),
@@ -2852,6 +4162,7 @@ function createFallbackBootstrap(): ChatBootstrap {
     },
     sessions: {
       groups: []
-    }
+    },
+    identity: readWorkspaceIdentity()
   };
 }

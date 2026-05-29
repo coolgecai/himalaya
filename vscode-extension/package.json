@@ -1,0 +1,220 @@
+{
+  "name": "himalaya-code-vscode",
+  "displayName": "Himalaya Code",
+  "description": "VS Code companion for the Himalaya Code CLI",
+  "version": "0.1.0",
+  "publisher": "ultraworkers",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ultraworkers/Himalaya-code.git"
+  },
+  "engines": {
+    "vscode": "^1.88.0"
+  },
+  "categories": [
+    "Other",
+    "AI"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onChatParticipant:himalaya-code-vscode.himalaya",
+    "onView:himalaya.activityView",
+    "onView:himalaya.secondaryChatView"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "himalaya",
+          "title": "Himalaya",
+          "icon": "media/himalaya.svg"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "himalayaSecondary",
+          "title": "Himalaya",
+          "icon": "media/himalaya.svg"
+        }
+      ]
+    },
+    "views": {
+      "himalaya": [
+        {
+          "id": "himalaya.activityView",
+          "name": "Himalaya"
+        }
+      ],
+      "himalayaSecondary": [
+        {
+          "id": "himalaya.secondaryChatView",
+          "name": "Himalaya Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "chatParticipants": [
+      {
+        "id": "himalaya-code-vscode.himalaya",
+        "name": "himalaya",
+        "fullName": "Himalaya Agent",
+        "description": "Chat with the Himalaya CLI from VS Code, with quick actions and session recovery.",
+        "isSticky": true,
+        "disambiguation": [
+          {
+            "category": "himalaya",
+            "description": "The user wants to use the Himalaya CLI to inspect status, run diagnostics, open or resume sessions, or automate coding tasks.",
+            "examples": [
+              "Check Himalaya status",
+              "Run the Himalaya doctor command",
+              "Open my last Himalaya session",
+              "Use Himalaya to help with this selection"
+            ]
+          }
+        ],
+        "commands": [
+          {
+            "name": "doctor",
+            "description": "Run the Himalaya doctor health check."
+          },
+          {
+            "name": "status",
+            "description": "Check the current Himalaya status."
+          },
+          {
+            "name": "login",
+            "description": "Open the Himalaya login flow."
+          },
+          {
+            "name": "logout",
+            "description": "Sign out of Himalaya."
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "himalaya.openChat",
+        "title": "Himalaya: Open Chat"
+      },
+      {
+        "command": "himalaya.promptSelection",
+        "title": "Himalaya: Ask About Selection"
+      },
+      {
+        "command": "himalaya.configureModel",
+        "title": "Himalaya: Configure Model"
+      },
+      {
+        "command": "himalaya.status",
+        "title": "Himalaya: Status"
+      },
+      {
+        "command": "himalaya.doctor",
+        "title": "Himalaya: Doctor"
+      },
+      {
+        "command": "himalaya.login",
+        "title": "Himalaya: Login"
+      },
+      {
+        "command": "himalaya.logout",
+        "title": "Himalaya: Logout"
+      },
+      {
+        "command": "himalaya.refreshSessions",
+        "title": "Himalaya: Refresh Sessions"
+      },
+      {
+        "command": "himalaya.openSession",
+        "title": "Himalaya: Open Session"
+      },
+      {
+        "command": "himalaya.resumeSession",
+        "title": "Himalaya: Resume Session"
+      },
+      {
+        "command": "himalaya.configureBinaryPath",
+        "title": "Himalaya: Configure Binary Path"
+      }
+    ],
+    "configuration": {
+      "title": "Himalaya Code",
+      "properties": {
+        "himalayaCode.binaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the Himalaya binary. Leave empty to auto-detect from the workspace or PATH."
+        },
+        "himalayaCode.defaultModel": {
+          "type": "string",
+          "default": "sonnet",
+          "description": "Default model name or alias passed to Himalaya."
+        },
+        "himalayaCode.defaultPermissionMode": {
+          "type": "string",
+          "default": "read-only",
+          "enum": [
+            "read-only",
+            "workspace-write",
+            "danger-full-access"
+          ],
+          "description": "Default permission mode used for chat prompts."
+        },
+        "himalayaCode.dangerousPermissionConfirmationPolicy": {
+          "type": "string",
+          "default": "always",
+          "enum": [
+            "always",
+            "once-per-workspace",
+            "never"
+          ],
+          "description": "Confirmation policy before running prompts with danger-full-access permission mode."
+        },
+        "himalayaCode.defaultModelBackend": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "cloud",
+            "ollama"
+          ],
+          "description": "Select whether chat prompts should use cloud models or Ollama-managed local models."
+        },
+        "himalayaCode.ollamaBaseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434/v1",
+          "description": "OpenAI-compatible Ollama endpoint used when the local model backend is selected."
+        },
+        "himalayaCode.allowUntrustedRuns": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow chat prompts to run in untrusted workspaces."
+        },
+        "himalayaCode.showOutputChannelByDefault": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reveal the Himalaya output channel when a command starts."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "npm run test:regression",
+    "vscode:prepublish": "npm run prepackage",
+    "test:regression": "npm run compile && node --test tests/*.test.cjs",
+    "check:prepackage": "node scripts/prepackage-check.cjs",
+    "prepackage": "npm run test:regression && npm run check:prepackage",
+    "package:vsix": "npm run prepackage && vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "@types/vscode": "^1.88.0",
+    "@vscode/vsce": "^3.9.1",
+    "typescript": "^5.8.3"
+  }
+}

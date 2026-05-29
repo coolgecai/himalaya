@@ -1,0 +1,17 @@
+src/**
+**/*.ts
+**/*.map
+**/tsconfig.json
+.vscode/**
+.Himalaya/**
+node_modules/**/test/**
+node_modules/**/tests/**
+node_modules/typescript/**
+README.md
+package-lock.json
+rust/**
+target/**
+tests/**
+*.log
+compile_output.txt
+*.vsix
