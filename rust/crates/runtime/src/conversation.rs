@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::time::Instant;
 
-use serde_json::{Map, Value};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use telemetry::SessionTracer;
@@ -22,19 +22,29 @@ use crate::permissions::{
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::{
-    infer_tool_capabilities, tool_from_profile, DecisioningEngine, DecisioningEvent,
-    DecisioningEventKind, DecisioningSnapshot, ReasoningContext, RiskAssessment, SafetyOutcome,
-    SafetyPolicy, StepOutcome, Subtask, Task, Tool, ToolHistoryEntry, ToolSelector,
+    build_verification_request, evaluate_verification_result, infer_tool_capabilities,
+    infer_verification_policy, tool_from_profile, DecisioningEngine, DecisioningEvent,
+    DecisioningEventKind, DecisioningSnapshot, ExecutionScheduler, FailureClassifier,
+    MoERoutingPolicy, ModelRouteDecision, ModelRouteFeedback, ModelRouter, PlanExecution,
+    PlanExecutionEvent, ReasoningContext, RecoveryActionEngine, RecoveryOrchestrator,
+    RiskAssessment, RuntimeEvent, RuntimeEventReporter, SafetyOutcome, SafetyPolicy, StepOutcome,
+    Subtask, Task, TaskPacket, TaskRegistry, TeamExecutionEvent, TeamExecutionLedger, Tool,
+    ToolHistoryEntry, ToolSelector, VerificationDecision, VerificationResult, VerificationRunner,
 };
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
+const DEFAULT_MAX_CONVERSATION_ITERATIONS: usize = 32;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "Himalaya_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const WORKSPACE_CONTEXT_MAX_ENTRIES: usize = 220;
+const WORKSPACE_CONTEXT_MAX_DEPTH: usize = 4;
+const WORKSPACE_CONTEXT_MAX_SOURCE_FILES: usize = 14;
 
 /// Fully assembled request payload sent to the upstream model client.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
+    pub model_route: Option<ModelRouteDecision>,
 }
 
 /// Streamed events emitted while processing a single assistant turn.
@@ -53,12 +63,12 @@ pub enum AssistantEvent {
 }
 
 /// Reasoning step in the chain of thought process.
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReasoningStep {
     Analysis {
         content: String,
         confidence: Option<f32>,
+        signature: Option<String>,
     },
     Planning {
         plan: String,
@@ -71,6 +81,9 @@ pub enum ReasoningStep {
     Decision {
         choice: String,
         reasoning: String,
+    },
+    RedactedThinking {
+        data: String,
     },
 }
 
@@ -102,7 +115,7 @@ pub struct StrategyAdjustment {
     pub description: String,
 }
 
-/// Alternative approach suggestion recorded alongside ChainOfThought.
+/// Alternative approach suggestion recorded alongside `ChainOfThought`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlternativeApproach {
     pub description: String,
@@ -115,6 +128,12 @@ pub struct ChainOfThought {
     pub steps: Vec<ReasoningStep>,
     pub confidence: f32,
     pub alternatives: Vec<AlternativeApproach>,
+}
+
+impl Default for ChainOfThought {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ChainOfThought {
@@ -137,11 +156,13 @@ impl ChainOfThought {
         let mut sum = 0.0f32;
         let mut count = 0usize;
         for s in &self.steps {
-            if let ReasoningStep::Analysis { confidence, .. } = s {
-                if let Some(c) = confidence {
-                    sum += *c;
-                    count += 1;
-                }
+            if let ReasoningStep::Analysis {
+                confidence: Some(c),
+                ..
+            } = s
+            {
+                sum += *c;
+                count += 1;
             }
         }
         if count > 0 {
@@ -154,8 +175,26 @@ impl ChainOfThought {
 }
 
 /// Simple persistent long-term memory for the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKind {
+    General,
+    UserIdentity,
+    AssistantIdentity,
+    LanguagePreference,
+    UserPreference,
+}
+
+impl Default for MemoryKind {
+    fn default() -> Self {
+        Self::General
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryEntry {
+    #[serde(default)]
+    pub kind: MemoryKind,
     pub topic: String,
     pub note: String,
     pub confidence: f32,
@@ -171,27 +210,72 @@ pub struct LongTermMemory {
 impl LongTermMemory {
     #[must_use]
     pub fn load_for_workspace(workspace_root: Option<&std::path::Path>) -> Self {
-        let path = workspace_root
-            .map(|root| root.join(".Himalaya").join("long_term_memory.json"))
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".Himalaya").join("knowledge.json")))
-            .unwrap_or_else(|| PathBuf::from(".Himalaya/knowledge.json"));
+        // Primary path: workspace .Himalaya/long_term_memory.json
+        let primary =
+            workspace_root.map(|root| root.join(".Himalaya").join("long_term_memory.json"));
+        // Fallback path: ~/.Himalaya/knowledge.json
+        let fallback = std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".Himalaya").join("knowledge.json"));
 
-        if let Ok(contents) = fs::read_to_string(&path) {
-            if let Ok(entries) = serde_json::from_str::<Vec<MemoryEntry>>(&contents) {
-                return Self { path, entries };
+        let mut fallback_entries = Vec::new();
+        if let Some(candidate) = fallback.as_deref() {
+            if let Ok(contents) = fs::read_to_string(candidate) {
+                if let Ok(entries) = serde_json::from_str::<Vec<MemoryEntry>>(&contents) {
+                    fallback_entries = entries;
+                }
             }
         }
 
+        if let Some(primary_path) = primary.as_deref() {
+            let entries = fs::read_to_string(primary_path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<Vec<MemoryEntry>>(&contents).ok())
+                .unwrap_or_else(|| fallback_entries.clone());
+            return Self {
+                path: primary_path.to_path_buf(),
+                entries,
+            };
+        }
+
+        if let Some(fallback_path) = fallback {
+            return Self {
+                path: fallback_path,
+                entries: fallback_entries,
+            };
+        }
+
         Self {
-            path,
+            path: PathBuf::from(".Himalaya/knowledge.json"),
             entries: Vec::new(),
         }
     }
 
-    pub fn add_entry(&mut self, topic: impl Into<String>, note: impl Into<String>, confidence: f32) {
+    pub fn add_entry(
+        &mut self,
+        topic: impl Into<String>,
+        note: impl Into<String>,
+        confidence: f32,
+    ) {
+        self.add_typed_entry(MemoryKind::General, topic, note, confidence);
+    }
+
+    pub fn add_typed_entry(
+        &mut self,
+        kind: MemoryKind,
+        topic: impl Into<String>,
+        note: impl Into<String>,
+        confidence: f32,
+    ) {
+        let topic = topic.into();
+        let note = note.into();
+        if topic.trim().is_empty() || note.trim().is_empty() {
+            return;
+        }
         let entry = MemoryEntry {
-            topic: topic.into(),
-            note: note.into(),
+            kind,
+            topic,
+            note,
             confidence: confidence.clamp(0.0, 1.0),
             ts_ms: current_time_millis(),
         };
@@ -228,11 +312,58 @@ impl LongTermMemory {
         topics
     }
 
+    #[must_use]
+    pub fn relevant_entries(&self, query: &str, limit: usize) -> Vec<MemoryEntry> {
+        let query_tokens = memory_query_tokens(query);
+        let mut ranked = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.note.trim().is_empty())
+            .map(|entry| {
+                let haystack = format!("{} {}", entry.topic, entry.note).to_lowercase();
+                let token_hits = query_tokens
+                    .iter()
+                    .filter(|token| haystack.contains(token.as_str()))
+                    .count() as f32;
+                let kind_bonus = match entry.kind {
+                    MemoryKind::UserIdentity
+                    | MemoryKind::AssistantIdentity
+                    | MemoryKind::LanguagePreference
+                    | MemoryKind::UserPreference => 2.0,
+                    MemoryKind::General => 0.0,
+                };
+                let score = token_hits + kind_bonus + entry.confidence;
+                (score, entry)
+            })
+            .filter(|(score, entry)| *score > entry.confidence || query_tokens.is_empty())
+            .collect::<Vec<_>>();
+
+        ranked.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .partial_cmp(left_score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    right
+                        .confidence
+                        .partial_cmp(&left.confidence)
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| right.ts_ms.cmp(&left.ts_ms))
+        });
+
+        ranked
+            .into_iter()
+            .map(|(_, entry)| entry.clone())
+            .take(limit)
+            .collect()
+    }
+
     pub fn save(&self) -> Result<(), std::io::Error> {
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let serialized = serde_json::to_string_pretty(&self.entries).unwrap_or_else(|_| "[]".to_string());
+        let serialized =
+            serde_json::to_string_pretty(&self.entries).unwrap_or_else(|_| "[]".to_string());
         fs::write(&self.path, serialized)
     }
 }
@@ -242,6 +373,876 @@ fn current_time_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
+}
+
+fn memory_query_tokens(query: &str) -> BTreeSet<String> {
+    query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .map(|token| token.trim().to_lowercase())
+        .filter(|token| token.chars().count() >= 2)
+        .take(64)
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnTaskState {
+    objective: String,
+    requires_workspace_analysis: bool,
+    required_evidence: Vec<&'static str>,
+    observed_tools: BTreeSet<String>,
+    observed_files: BTreeSet<String>,
+    read_file_calls: usize,
+    failed_tools: Vec<String>,
+    evidence_gate_prompts: usize,
+    output_language: Option<String>,
+}
+
+impl TurnTaskState {
+    fn new(user_input: &str, requires_workspace_analysis: bool) -> Self {
+        let required_evidence = if requires_workspace_analysis {
+            vec![
+                "directory/file discovery",
+                "manifest or project metadata review",
+                "multiple source file reads",
+                "content search for entry points or module names",
+            ]
+        } else {
+            Vec::new()
+        };
+        Self {
+            objective: user_input.trim().chars().take(240).collect(),
+            requires_workspace_analysis,
+            required_evidence,
+            observed_tools: BTreeSet::new(),
+            observed_files: BTreeSet::new(),
+            read_file_calls: 0,
+            failed_tools: Vec::new(),
+            evidence_gate_prompts: 0,
+            output_language: None,
+        }
+    }
+
+    fn set_output_language(&mut self, language: Option<String>) {
+        self.output_language = language;
+    }
+
+    fn record_tool_use(&mut self, tool_name: &str, input: &str) {
+        self.observed_tools.insert(tool_name.to_string());
+        let normalized = normalize_tool_key(tool_name);
+        if normalized.contains("readfile") || normalized == "read" {
+            self.read_file_calls += 1;
+        }
+        if let Some(path) = extract_json_string_field(input, "path") {
+            self.observed_files.insert(path);
+        }
+        if let Some(pattern) = extract_json_string_field(input, "pattern") {
+            self.observed_files.insert(pattern);
+        }
+    }
+
+    fn record_tool_result(&mut self, tool_name: &str, is_error: bool, output: &str) {
+        if is_error {
+            self.failed_tools.push(format!(
+                "{tool_name}: {}",
+                output.chars().take(160).collect::<String>()
+            ));
+        }
+        for file in extract_file_candidates(output).into_iter().take(12) {
+            self.observed_files.insert(file);
+        }
+    }
+
+    fn source_read_count(&self) -> usize {
+        self.read_file_calls
+    }
+
+    fn has_search(&self) -> bool {
+        self.observed_tools.iter().any(|name| {
+            let normalized = normalize_tool_key(name);
+            normalized.contains("grep")
+                || normalized.contains("glob")
+                || normalized.contains("search")
+        })
+    }
+
+    fn evidence_complete(&self) -> bool {
+        !self.requires_workspace_analysis || (self.has_search() && self.source_read_count() >= 3)
+    }
+
+    fn should_prompt_for_evidence(&mut self) -> bool {
+        if !self.requires_workspace_analysis
+            || self.evidence_complete()
+            || self.evidence_gate_prompts >= 2
+        {
+            return false;
+        }
+        self.evidence_gate_prompts += 1;
+        true
+    }
+
+    fn format_context(&self) -> String {
+        let mut lines = vec![
+            "# Structured task state".to_string(),
+            format!("- Objective: {}", self.objective),
+        ];
+        if let Some(language) = &self.output_language {
+            lines.push(format!("- Output language: {language}"));
+            lines.push(format!("- {}", language_output_contract(language)));
+        }
+        if self.requires_workspace_analysis {
+            lines.push("- Task class: current workspace/source analysis".to_string());
+            lines.push(format!(
+                "- Required evidence before final answer: {}",
+                self.required_evidence.join("; ")
+            ));
+            lines.push(format!("- Evidence complete: {}", self.evidence_complete()));
+        }
+        if !self.observed_tools.is_empty() {
+            lines.push(format!(
+                "- Tools used this turn: {}",
+                self.observed_tools
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !self.observed_files.is_empty() {
+            lines.push(format!(
+                "- Files/patterns observed this turn: {}",
+                self.observed_files
+                    .iter()
+                    .take(16)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !self.failed_tools.is_empty() {
+            lines.push("- Failed tool attempts:".to_string());
+            lines.extend(
+                self.failed_tools
+                    .iter()
+                    .take(6)
+                    .map(|item| format!("  - {item}")),
+            );
+        }
+        lines.join("\n")
+    }
+}
+
+fn workspace_evidence_tools_available(available_tool_names: &BTreeSet<String>) -> bool {
+    let has_search = available_tool_names.iter().any(|name| {
+        let normalized = normalize_tool_key(name);
+        normalized.contains("grep") || normalized.contains("glob") || normalized.contains("search")
+    });
+    let has_read = available_tool_names.iter().any(|name| {
+        let normalized = normalize_tool_key(name);
+        normalized.contains("read")
+    });
+    has_search && has_read
+}
+
+fn workspace_evidence_gate_prompt() -> &'static str {
+    "Workspace analysis is not allowed to finish from the injected navigation snapshot. Use local evidence tools now: run glob_search or grep_search to discover relevant files/entry points, read root manifests with read_file, read at least three relevant source files with read_file, then answer only from those observations. Preserve the active output-language contract from the system prompt."
+}
+
+fn extract_json_string_field(input: &str, field: &str) -> Option<String> {
+    serde_json::from_str::<Value>(input).ok().and_then(|value| {
+        value
+            .get(field)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserMemoryFact {
+    kind: MemoryKind,
+    topic: &'static str,
+    note: String,
+}
+
+fn clean_memory_value(value: &str) -> String {
+    value
+        .trim_matches(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ',' | '.'
+                        | ';'
+                        | ':'
+                        | '!'
+                        | '?'
+                        | '，'
+                        | '。'
+                        | '；'
+                        | '：'
+                        | '！'
+                        | '？'
+                        | '"'
+                        | '\''
+                        | '`'
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                )
+        })
+        .trim()
+        .to_string()
+}
+
+fn take_until_delimiter(value: &str) -> String {
+    let lower = value.to_lowercase();
+    let mut end = value.len();
+    for delimiter in [
+        " and ",
+        " but ",
+        " from now on",
+        " going forward",
+        "以后",
+        "以后用",
+        "以后请",
+    ] {
+        if let Some(index) = lower.find(delimiter) {
+            end = end.min(index);
+        }
+    }
+    if let Some((index, _)) = value.char_indices().find(|(_, ch)| {
+        matches!(
+            ch,
+            ',' | '.' | ';' | '!' | '?' | '，' | '。' | '；' | '！' | '？' | '\n' | '\r'
+        )
+    }) {
+        end = end.min(index);
+    }
+    clean_memory_value(&value[..end])
+}
+
+fn extract_after_any(text: &str, lower_text: &str, markers: &[&str]) -> Option<String> {
+    markers.iter().find_map(|marker| {
+        lower_text.find(marker).and_then(|index| {
+            let start = index + marker.len();
+            let value = take_until_delimiter(&text[start..]);
+            (!value.is_empty() && value.chars().count() <= 64).then_some(value)
+        })
+    })
+}
+
+fn detect_language_preference(text: &str) -> Option<&'static str> {
+    let lower = text.to_lowercase();
+    if [
+        "以后用中文",
+        "请用中文",
+        "用中文回答",
+        "中文交流",
+        "中文回复",
+        "preferred response language: chinese",
+        "output language: chinese",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+        || [
+            "respond in chinese",
+            "answer in chinese",
+            "use chinese",
+            "speak chinese",
+            "reply in chinese",
+            "write in chinese",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        Some("Chinese")
+    } else if [
+        "以后用英文",
+        "请用英文",
+        "用英文回答",
+        "英文交流",
+        "英文回复",
+        "preferred response language: english",
+        "output language: english",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+        || [
+            "respond in english",
+            "answer in english",
+            "use english",
+            "speak english",
+            "reply in english",
+            "write in english",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        Some("English")
+    } else {
+        None
+    }
+}
+
+pub fn extract_user_memory_facts(text: &str) -> Vec<(MemoryKind, String, String)> {
+    let lower = text.to_lowercase();
+    let mut facts = Vec::<UserMemoryFact>::new();
+
+    if let Some(name) = extract_after_any(
+        text,
+        &lower,
+        &["我叫", "我的名字是", "叫我", "my name is ", "call me "],
+    ) {
+        facts.push(UserMemoryFact {
+            kind: MemoryKind::UserIdentity,
+            topic: "user_identity",
+            note: name,
+        });
+    }
+
+    if let Some(name) = extract_after_any(
+        text,
+        &lower,
+        &[
+            "以后你叫",
+            "你叫",
+            "你的名字是",
+            "your name is ",
+            "i will call you ",
+            "i'll call you ",
+        ],
+    ) {
+        facts.push(UserMemoryFact {
+            kind: MemoryKind::AssistantIdentity,
+            topic: "assistant_identity",
+            note: name,
+        });
+    }
+
+    if let Some(language) = detect_language_preference(text) {
+        facts.push(UserMemoryFact {
+            kind: MemoryKind::LanguagePreference,
+            topic: "language_preference",
+            note: language.to_string(),
+        });
+    }
+
+    if let Some(preference) = extract_after_any(
+        text,
+        &lower,
+        &["我喜欢", "我偏好", "我希望", "i prefer ", "i like "],
+    ) {
+        facts.push(UserMemoryFact {
+            kind: MemoryKind::UserPreference,
+            topic: "user_preference",
+            note: preference,
+        });
+    }
+
+    let mut seen = BTreeSet::new();
+    facts
+        .into_iter()
+        .filter(|fact| seen.insert((fact.kind, fact.topic, fact.note.clone())))
+        .map(|fact| (fact.kind, fact.topic.to_string(), fact.note))
+        .collect()
+}
+
+fn record_user_memory(memory: &mut LongTermMemory, facts: &[(MemoryKind, String, String)]) {
+    for (kind, topic, note) in facts {
+        memory.add_typed_entry(*kind, topic.clone(), note.clone(), 0.98);
+    }
+}
+
+fn task_packet_from_input(input: &str) -> Option<TaskPacket> {
+    let trimmed = input.trim();
+    serde_json::from_str::<TaskPacket>(trimmed)
+        .ok()
+        .or_else(|| {
+            let start = trimmed.find('{')?;
+            let end = trimmed.rfind('}')?;
+            if end <= start {
+                return None;
+            }
+            serde_json::from_str::<TaskPacket>(&trimmed[start..=end]).ok()
+        })
+}
+
+fn user_requests_current_workspace_analysis(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let has_current_scope = [
+        "当前工程",
+        "当前项目",
+        "当前工作目录",
+        "当前vscode",
+        "当前 vscode",
+        "当前workspace",
+        "当前 workspace",
+        "本工程",
+        "本项目",
+        "current project",
+        "current repo",
+        "current repository",
+        "current workspace",
+        "current working directory",
+        "this project",
+        "this repo",
+        "this repository",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let has_code_analysis = [
+        "源代码",
+        "代码",
+        "目录结构",
+        "源码目录",
+        "功能模块",
+        "source code",
+        "source tree",
+        "codebase",
+        "directory structure",
+        "project structure",
+        "module",
+        "architecture",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    has_current_scope && has_code_analysis
+}
+
+fn should_skip_workspace_entry(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "target"
+            | "node_modules"
+            | "dist"
+            | "build"
+            | "out"
+            | ".Himalaya"
+            | ".claude"
+            | ".vscode-test"
+            | "coverage"
+    )
+}
+
+fn collect_workspace_tree(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    entries: &mut Vec<String>,
+    truncated: &mut bool,
+) {
+    if depth > WORKSPACE_CONTEXT_MAX_DEPTH || entries.len() >= WORKSPACE_CONTEXT_MAX_ENTRIES {
+        *truncated = true;
+        return;
+    }
+
+    let mut children = match fs::read_dir(dir) {
+        Ok(children) => children
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| !should_skip_workspace_entry(name))
+            })
+            .collect::<Vec<_>>(),
+        Err(_) => return,
+    };
+    children.sort_by_key(|entry| entry.path());
+
+    for child in children {
+        if entries.len() >= WORKSPACE_CONTEXT_MAX_ENTRIES {
+            *truncated = true;
+            return;
+        }
+        let path = child.path();
+        let is_dir = path.is_dir();
+        let relative = path.strip_prefix(root).unwrap_or(path.as_path());
+        let indent = "  ".repeat(depth);
+        entries.push(format!(
+            "{indent}{}{}",
+            relative.display(),
+            if is_dir { "/" } else { "" }
+        ));
+        if is_dir {
+            collect_workspace_tree(root, &path, depth + 1, entries, truncated);
+        }
+    }
+}
+
+fn manifest_candidates(root: &Path) -> Vec<PathBuf> {
+    [
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "settings.gradle",
+        "README.md",
+        "Himalaya.md",
+    ]
+    .into_iter()
+    .map(|path| root.join(path))
+    .filter(|path| path.is_file())
+    .collect()
+}
+
+fn is_source_candidate(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "rs" | "ts"
+                    | "tsx"
+                    | "js"
+                    | "jsx"
+                    | "py"
+                    | "go"
+                    | "java"
+                    | "kt"
+                    | "swift"
+                    | "c"
+                    | "cc"
+                    | "cpp"
+                    | "h"
+                    | "hpp"
+            )
+        })
+}
+
+fn source_priority(relative: &Path) -> usize {
+    let text = relative.to_string_lossy().to_ascii_lowercase();
+    let mut score = 10_000usize;
+    for marker in [
+        "src/main.",
+        "src/lib.",
+        "src/extension.",
+        "src/chatpanel.",
+        "src/conversation.",
+        "src/prompt.",
+        "src/session.",
+        "src/cli.",
+        "main.",
+        "lib.",
+        "index.",
+    ] {
+        if text.contains(marker) {
+            score = score.min(100);
+        }
+    }
+    if text.contains("test") || text.contains("spec") {
+        score += 500;
+    }
+    score + text.matches('/').count() * 10 + text.len()
+}
+
+fn collect_source_candidates(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) {
+    if files.len() >= WORKSPACE_CONTEXT_MAX_ENTRIES {
+        return;
+    }
+    let Ok(children) = fs::read_dir(dir) else {
+        return;
+    };
+    for child in children.filter_map(Result::ok) {
+        let path = child.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if should_skip_workspace_entry(name) {
+            continue;
+        }
+        if path.is_dir() {
+            collect_source_candidates(root, &path, files);
+        } else if is_source_candidate(&path) {
+            files.push(
+                path.strip_prefix(root)
+                    .unwrap_or(path.as_path())
+                    .to_path_buf(),
+            );
+        }
+    }
+}
+
+fn workspace_analysis_context(root: &Path) -> Option<String> {
+    if !root.is_dir() {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    collect_workspace_tree(root, root, 0, &mut entries, &mut truncated);
+    let mut sections = vec![format!(
+        "[Current workspace context]\nWorkspace root: {}\n\nDirectory tree snapshot:",
+        root.display()
+    )];
+    if entries.is_empty() {
+        sections.push("(no readable entries found)".to_string());
+    } else {
+        sections.push(entries.join("\n"));
+        if truncated {
+            sections.push("... directory snapshot truncated ...".to_string());
+        }
+    }
+
+    let manifests = manifest_candidates(root)
+        .into_iter()
+        .filter_map(|path| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|relative| relative.display().to_string())
+        })
+        .collect::<Vec<_>>();
+    if !manifests.is_empty() {
+        sections.push(format!(
+            "\nManifest candidates to read with read_file: {}",
+            manifests.join(", ")
+        ));
+    }
+
+    let mut source_candidates = Vec::new();
+    collect_source_candidates(root, root, &mut source_candidates);
+    source_candidates.sort_by_key(|relative| source_priority(relative));
+    source_candidates.dedup();
+    let source_preview = source_candidates
+        .into_iter()
+        .take(WORKSPACE_CONTEXT_MAX_SOURCE_FILES)
+        .map(|relative| relative.display().to_string())
+        .collect::<Vec<_>>();
+    if !source_preview.is_empty() {
+        sections.push(format!(
+            "\nSource candidates to inspect with read_file after search/glob discovery: {}",
+            source_preview.join(", ")
+        ));
+    }
+
+    sections.push(
+        "\nWorkspace-analysis execution contract: the directory tree above is only navigation aid, not analysis evidence. Before giving a final architecture or modification recommendation, use available local file tools to inspect this workspace. Minimum evidence: glob_search or grep_search results, root manifests read with read_file, at least three relevant source files read with read_file, and at least one content search for major entry points or module names. Preserve the active output-language contract from the system prompt. If tools are unavailable, explicitly say the conclusion is based only on the navigation snapshot. Do not ask the user to upload code or provide a repository link for this request."
+            .to_string(),
+    );
+    Some(sections.join("\n"))
+}
+
+fn is_interesting_file_candidate(candidate: &str) -> bool {
+    Path::new(candidate)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            [
+                "rs", "ts", "tsx", "js", "jsx", "json", "toml", "yaml", "yml", "md",
+            ]
+            .iter()
+            .any(|expected| extension.eq_ignore_ascii_case(expected))
+        })
+}
+
+fn extract_file_candidates(content: &str) -> Vec<String> {
+    content
+        .split_whitespace()
+        .filter_map(|token| {
+            let candidate = token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    ',' | '.' | ':' | ';' | ')' | '(' | ']' | '[' | '}' | '{' | '"' | '\'' | '`'
+                )
+            });
+            (candidate.contains('/') && is_interesting_file_candidate(candidate))
+                .then_some(candidate.to_string())
+        })
+        .collect()
+}
+
+fn is_workspace_evidence_tool(tool_name: &str) -> bool {
+    let normalized = normalize_tool_key(tool_name);
+    normalized.contains("read")
+        || normalized.contains("grep")
+        || normalized.contains("glob")
+        || normalized.contains("search")
+        || normalized.contains("find")
+}
+
+fn normalize_tool_key(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn tool_alias_key(normalized_key: &str) -> Option<&'static str> {
+    match normalized_key {
+        "functionwebsearch" | "functiongooglesearch" | "googlesearch" | "searchweb" => {
+            Some("websearch")
+        }
+        "functionwebfetch" | "fetchurl" | "urlfetch" => Some("webfetch"),
+        "read" | "readfile" | "functionreadfile" => Some("readfile"),
+        "write" | "writefile" | "functionwritefile" => Some("writefile"),
+        "edit" | "editfile" | "functioneditfile" => Some("editfile"),
+        "grep" | "grepsearch" | "functiongrepsearch" => Some("grepsearch"),
+        "glob" | "globsearch" | "functionglobsearch" => Some("globsearch"),
+        _ => None,
+    }
+}
+
+fn resolve_requested_tool_name(
+    requested_name: &str,
+    available_tool_names: &BTreeSet<String>,
+) -> Option<String> {
+    if available_tool_names.contains(requested_name) {
+        return Some(requested_name.to_string());
+    }
+
+    let normalized_available = available_tool_names
+        .iter()
+        .map(|name| (normalize_tool_key(name), name.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let requested_key = normalize_tool_key(requested_name);
+    if let Some(canonical) = normalized_available.get(&requested_key) {
+        return Some(canonical.clone());
+    }
+    tool_alias_key(&requested_key).and_then(|alias| normalized_available.get(alias).cloned())
+}
+
+fn normalize_tool_uses(
+    message: &mut ConversationMessage,
+    available_tool_names: &BTreeSet<String>,
+) -> Vec<(String, String, String)> {
+    message
+        .blocks
+        .iter_mut()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => {
+                if let Some(canonical_name) =
+                    resolve_requested_tool_name(name, available_tool_names)
+                {
+                    *name = canonical_name;
+                }
+                Some((id.clone(), name.clone(), input.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn unsupported_tool_output(tool_name: &str, available_tool_names: &BTreeSet<String>) -> String {
+    let mut available = available_tool_names.iter().cloned().collect::<Vec<_>>();
+    available.sort();
+    let preview = if available.is_empty() {
+        "no tools are currently available".to_string()
+    } else {
+        let mut shown = available
+            .into_iter()
+            .take(16)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if available_tool_names.len() > 16 {
+            shown.push_str(", ...");
+        }
+        format!("available tools include: {shown}")
+    };
+    format!(
+        "unsupported tool requested by model: `{tool_name}`. The tool was not executed; {preview}. Use one of the advertised tool names exactly."
+    )
+}
+
+fn language_output_contract(language: &str) -> String {
+    match language {
+        "Chinese" => "Output-language contract: respond to the user in Chinese for this and later turns unless the user explicitly changes language. Keep technical identifiers, commands, code, file paths, and quoted source text unchanged; prose headings and explanations must be Chinese.".to_string(),
+        "English" => "Output-language contract: respond to the user in English for this and later turns unless the user explicitly changes language. Keep technical identifiers, commands, code, file paths, and quoted source text unchanged.".to_string(),
+        other => format!(
+            "Output-language contract: respond to the user in {other} for this and later turns unless the user explicitly changes language. Keep technical identifiers, commands, code, file paths, and quoted source text unchanged."
+        ),
+    }
+}
+
+fn latest_language_preference(memory: &LongTermMemory) -> Option<String> {
+    memory
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.kind == MemoryKind::LanguagePreference
+                && entry.topic == "language_preference"
+                && !entry.note.trim().is_empty()
+        })
+        .max_by(|left, right| {
+            left.confidence
+                .partial_cmp(&right.confidence)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.ts_ms.cmp(&right.ts_ms))
+        })
+        .map(|entry| entry.note.clone())
+}
+
+fn active_language_preference(
+    facts: &[(MemoryKind, String, String)],
+    memory: &LongTermMemory,
+) -> Option<String> {
+    facts
+        .iter()
+        .rev()
+        .find(|(kind, topic, note)| {
+            *kind == MemoryKind::LanguagePreference
+                && topic == "language_preference"
+                && !note.trim().is_empty()
+        })
+        .map(|(_, _, note)| note.clone())
+        .or_else(|| latest_language_preference(memory))
+}
+
+fn format_user_memory_override(facts: &[(MemoryKind, String, String)]) -> Option<String> {
+    if facts.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec![
+        "# User-declared identity and preferences for this turn".to_string(),
+        "The user explicitly provided these facts or preferences in the current message. Follow them immediately.".to_string(),
+    ];
+    for (kind, _, note) in facts {
+        match kind {
+            MemoryKind::UserIdentity => lines.push(format!("- Address the user as: {note}")),
+            MemoryKind::AssistantIdentity => {
+                lines.push(format!("- Use this assistant name for yourself: {note}"));
+            }
+            MemoryKind::LanguagePreference => {
+                lines.push(format!("- Preferred response language: {note}"));
+                lines.push(format!("- {}", language_output_contract(note)));
+            }
+            MemoryKind::UserPreference => lines.push(format!("- User preference: {note}")),
+            MemoryKind::General => {}
+        }
+    }
+    lines.push("User-declared assistant name and language preference override provider/model identity and default language. Do not identify yourself as the underlying model or provider unless the user asks about technical implementation.".to_string());
+    Some(lines.join("\n"))
+}
+
+fn format_relevant_memory_context(entries: &[MemoryEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec![
+        "# Relevant long-term memory for this turn".to_string(),
+        "These recalled notes matched the current request. Use them when they are applicable, but prefer current workspace evidence when they conflict.".to_string(),
+    ];
+    for entry in entries {
+        let kind = match entry.kind {
+            MemoryKind::General => "general",
+            MemoryKind::UserIdentity => "user_identity",
+            MemoryKind::AssistantIdentity => "assistant_identity",
+            MemoryKind::LanguagePreference => "language_preference",
+            MemoryKind::UserPreference => "user_preference",
+        };
+        lines.push(format!(
+            "- [{kind}] {}: {} (confidence: {:.0}%)",
+            entry.topic,
+            entry.note,
+            entry.confidence * 100.0
+        ));
+    }
+    Some(lines.join("\n"))
 }
 
 fn reasoning_step_summary(step: &ReasoningStep) -> String {
@@ -255,20 +1256,58 @@ fn reasoning_step_summary(step: &ReasoningStep) -> String {
             }
             summary
         }
-        ReasoningStep::Reflection { critique, adjustment } => adjustment
+        ReasoningStep::Reflection {
+            critique,
+            adjustment,
+        } => adjustment
             .as_ref()
             .map_or_else(|| critique.clone(), |value| format!("{critique} {value}")),
         ReasoningStep::Decision { choice, reasoning } => format!("{choice} {reasoning}"),
+        ReasoningStep::RedactedThinking { .. } => "[redacted thinking]".to_string(),
     }
 }
 
 fn extract_memory_topics(text: &str, limit: usize) -> Vec<String> {
     const STOP_WORDS: &[&str] = &[
-        "about", "after", "again", "also", "analysis", "and", "another", "because",
-        "before", "being", "between", "could", "decision", "during", "first", "from",
-        "have", "into", "need", "next", "only", "plan", "reason", "reasoning",
-        "reflection", "should", "steps", "that", "their", "there", "this", "tool",
-        "turn", "used", "using", "with", "within", "would", "your",
+        "about",
+        "after",
+        "again",
+        "also",
+        "analysis",
+        "and",
+        "another",
+        "because",
+        "before",
+        "being",
+        "between",
+        "could",
+        "decision",
+        "during",
+        "first",
+        "from",
+        "have",
+        "into",
+        "need",
+        "next",
+        "only",
+        "plan",
+        "reason",
+        "reasoning",
+        "reflection",
+        "should",
+        "steps",
+        "that",
+        "their",
+        "there",
+        "this",
+        "tool",
+        "turn",
+        "used",
+        "using",
+        "with",
+        "within",
+        "would",
+        "your",
     ];
 
     let mut topics = BTreeSet::new();
@@ -351,7 +1390,10 @@ fn record_reflection_memory(
                 0.90,
             );
 
-            for capability in infer_tool_capabilities(&tool_name, None).into_iter().take(3) {
+            for capability in infer_tool_capabilities(&tool_name, None)
+                .into_iter()
+                .take(3)
+            {
                 memory.add_entry(
                     capability.clone(),
                     format!(
@@ -396,7 +1438,13 @@ fn record_reflection_memory(
             let note = cot
                 .alternatives
                 .iter()
-                .map(|alternative| alternative.description.chars().take(100).collect::<String>())
+                .map(|alternative| {
+                    alternative
+                        .description
+                        .chars()
+                        .take(100)
+                        .collect::<String>()
+                })
                 .collect::<Vec<_>>()
                 .join(" | ");
             memory.add_entry("alternative_approach", note, cot.confidence.max(0.4));
@@ -503,11 +1551,31 @@ pub trait DecisioningEventReporter: Send + Sync {
     fn emit_decisioning_event(&self, event: &DecisioningEvent);
 }
 
+pub trait PlanExecutionEventReporter: Send + Sync {
+    fn emit_plan_execution_event(&self, event: &PlanExecutionEvent);
+}
+
+pub trait ModelRouteEventReporter: Send + Sync {
+    fn emit_model_route_event(&self, event: &ModelRouteDecision);
+}
+
+pub trait TaskLedgerEventReporter: Send + Sync {
+    fn emit_task_ledger_event(&self, event: &crate::ProgressLedgerEntry);
+}
+
+pub trait TeamExecutionEventReporter: Send + Sync {
+    fn emit_team_execution_event(&self, event: &TeamExecutionEvent);
+}
+
 struct DecisioningTurnPlan {
     engine: DecisioningEngine,
     task: Task,
     snapshot: DecisioningSnapshot,
+    dag: crate::PlanDag,
+    execution: PlanExecution,
+    next_execution_event_offset: usize,
     selected_positions: BTreeMap<String, usize>,
+    workspace_evidence_stage_active: bool,
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
@@ -522,10 +1590,23 @@ pub struct ConversationRuntime<C, T> {
     hook_runner: HookRunner,
     decisioning_config: DecisioningConfig,
     decisioning_event_reporter: Option<Arc<dyn DecisioningEventReporter>>,
+    plan_execution_event_reporter: Option<Arc<dyn PlanExecutionEventReporter>>,
+    task_ledger_event_reporter: Option<Arc<dyn TaskLedgerEventReporter>>,
+    model_route_event_reporter: Option<Arc<dyn ModelRouteEventReporter>>,
+    team_execution_event_reporter: Option<Arc<dyn TeamExecutionEventReporter>>,
+    runtime_event_reporter: Option<Arc<dyn RuntimeEventReporter>>,
+    task_registry: TaskRegistry,
+    model_router: ModelRouter,
+    workspace_route_feedback: Vec<ModelRouteFeedback>,
+    verification_runner: VerificationRunner,
+    failure_classifier: FailureClassifier,
+    recovery_action_engine: RecoveryActionEngine,
     auto_compaction_input_tokens_threshold: u32,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    pending_user_blocks: Vec<ContentBlock>,
+    resume_task_id: Option<String>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -562,21 +1643,35 @@ where
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
+        let verification_workspace_root = session.workspace_root().map(Path::to_path_buf);
         Self {
             session,
             api_client,
             tool_executor,
             permission_policy,
             system_prompt,
-            max_iterations: usize::MAX,
+            max_iterations: DEFAULT_MAX_CONVERSATION_ITERATIONS,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             decisioning_config: feature_config.decisioning().clone(),
             decisioning_event_reporter: None,
+            plan_execution_event_reporter: None,
+            task_ledger_event_reporter: None,
+            model_route_event_reporter: None,
+            team_execution_event_reporter: None,
+            runtime_event_reporter: None,
+            task_registry: TaskRegistry::new(),
+            model_router: ModelRouter::new(MoERoutingPolicy::balanced("sonnet")),
+            workspace_route_feedback: Vec::new(),
+            verification_runner: VerificationRunner::new(verification_workspace_root),
+            failure_classifier: FailureClassifier::new(),
+            recovery_action_engine: RecoveryActionEngine::new(),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            pending_user_blocks: Vec::new(),
+            resume_task_id: None,
         }
     }
 
@@ -619,6 +1714,92 @@ where
         reporter: impl DecisioningEventReporter + 'static,
     ) -> Self {
         self.decisioning_event_reporter = Some(Arc::new(reporter));
+        self
+    }
+
+    #[must_use]
+    pub fn with_plan_execution_event_reporter(
+        mut self,
+        reporter: impl PlanExecutionEventReporter + 'static,
+    ) -> Self {
+        self.plan_execution_event_reporter = Some(Arc::new(reporter));
+        self
+    }
+
+    #[must_use]
+    pub fn with_task_ledger_event_reporter(
+        mut self,
+        reporter: impl TaskLedgerEventReporter + 'static,
+    ) -> Self {
+        self.task_ledger_event_reporter = Some(Arc::new(reporter));
+        self
+    }
+
+    #[must_use]
+    pub fn with_model_route_event_reporter(
+        mut self,
+        reporter: impl ModelRouteEventReporter + 'static,
+    ) -> Self {
+        self.model_route_event_reporter = Some(Arc::new(reporter));
+        self
+    }
+
+    #[must_use]
+    pub fn with_team_execution_event_reporter(
+        mut self,
+        reporter: impl TeamExecutionEventReporter + 'static,
+    ) -> Self {
+        self.team_execution_event_reporter = Some(Arc::new(reporter));
+        self
+    }
+
+    #[must_use]
+    pub fn with_runtime_event_reporter(
+        mut self,
+        reporter: impl RuntimeEventReporter + 'static,
+    ) -> Self {
+        self.runtime_event_reporter = Some(Arc::new(reporter));
+        self
+    }
+
+    #[must_use]
+    pub fn with_task_registry(mut self, registry: TaskRegistry) -> Self {
+        self.task_registry = registry;
+        self
+    }
+
+    #[must_use]
+    pub fn with_model_router(mut self, router: ModelRouter) -> Self {
+        self.model_router = router;
+        self
+    }
+
+    #[must_use]
+    pub fn with_workspace_route_feedback(mut self, feedback: Vec<ModelRouteFeedback>) -> Self {
+        self.workspace_route_feedback = feedback;
+        self
+    }
+
+    #[must_use]
+    pub fn task_registry(&self) -> &TaskRegistry {
+        &self.task_registry
+    }
+
+    #[must_use]
+    pub fn with_resume_task_id(mut self, task_id: impl Into<String>) -> Self {
+        self.resume_task_id = Some(task_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_verification_runner(mut self, runner: VerificationRunner) -> Self {
+        self.verification_runner = runner;
+        self
+    }
+
+    #[must_use]
+    pub fn with_failure_classifier(mut self, classifier: FailureClassifier) -> Self {
+        self.failure_classifier = classifier;
         self
     }
 
@@ -693,28 +1874,19 @@ where
         }
     }
 
-    /// Inject a user message containing the given content blocks into the
-    /// session before the next [`run_turn`] call.
+    /// Queue content blocks to be included in the next user turn.
     ///
-    /// This is used to attach file or image content to a turn without
-    /// changing the `run_turn` signature. The blocks are merged into a single
-    /// user message so providers that reject consecutive user messages work
-    /// correctly.
+    /// This is used to attach file or image content without changing the
+    /// `run_turn` signature. The next [`run_turn`] call merges the blocks after
+    /// the prompt text in the same user message so providers and models see the
+    /// attachment as context for the request without burying the actual ask.
     ///
     /// # Errors
-    /// Returns [`RuntimeError`] if the session cannot persist the message.
+    /// This method currently cannot fail; it returns [`Result`] for API
+    /// compatibility with earlier eager-persistence behavior.
     pub fn inject_user_blocks(&mut self, blocks: Vec<ContentBlock>) -> Result<(), RuntimeError> {
-        if blocks.is_empty() {
-            return Ok(());
-        }
-        let message = ConversationMessage {
-            role: MessageRole::User,
-            blocks,
-            usage: None,
-        };
-        self.session
-            .push_message(message)
-            .map_err(|e| RuntimeError::new(e.to_string()))
+        self.pending_user_blocks.extend(blocks);
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -724,9 +1896,55 @@ where
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
+        let requires_workspace_analysis = user_requests_current_workspace_analysis(&user_input);
+        let mut task_state = TurnTaskState::new(&user_input, requires_workspace_analysis);
+        let runtime_task = if let Some(task_id) = self.resume_task_id.take() {
+            self.task_registry
+                .resume(&task_id)
+                .map_err(RuntimeError::new)?
+        } else {
+            task_packet_from_input(&user_input)
+                .and_then(|packet| self.task_registry.create_from_packet(packet).ok())
+                .unwrap_or_else(|| {
+                    self.task_registry
+                        .create(&user_input, Some("conversation_turn"))
+                })
+        };
+        let runtime_task_id = runtime_task.task_id.clone();
+        let mut task_ledger_offset = 0;
+        self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+        task_ledger_offset = self.task_registry.ledger_for_task(&runtime_task_id).len();
+        if !matches!(
+            runtime_task.status,
+            crate::TaskStatus::Completed
+                | crate::TaskStatus::Failed
+                | crate::TaskStatus::Stopped
+                | crate::TaskStatus::Cancelled
+        ) {
+            let _ = self
+                .task_registry
+                .set_status(&runtime_task_id, crate::TaskStatus::Running);
+        }
+        self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+        task_ledger_offset = self.task_registry.ledger_for_task(&runtime_task_id).len();
         self.record_turn_started(&user_input);
+        let mut user_blocks = vec![ContentBlock::Text {
+            text: user_input.clone(),
+        }];
+        if requires_workspace_analysis {
+            if let Some(root) = self.session.workspace_root() {
+                if let Some(context) = workspace_analysis_context(root) {
+                    user_blocks.push(ContentBlock::Text { text: context });
+                }
+            }
+        }
+        user_blocks.extend(std::mem::take(&mut self.pending_user_blocks));
         self.session
-            .push_user_text(user_input.clone())
+            .push_message(ConversationMessage {
+                role: MessageRole::User,
+                blocks: user_blocks,
+                usage: None,
+            })
             .map_err(|error| RuntimeError::new(error.to_string()))?;
 
         let mut assistant_messages = Vec::new();
@@ -734,6 +1952,30 @@ where
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
         let mut chain_of_thought: Option<ChainOfThought> = None;
+        let user_memory_facts = extract_user_memory_facts(&user_input);
+        if !user_memory_facts.is_empty() {
+            let mut memory = LongTermMemory::load_for_workspace(self.session.workspace_root());
+            record_user_memory(&mut memory, &user_memory_facts);
+        }
+        let mut effective_system_prompt = self.system_prompt.clone();
+        if let Some(memory_override) = format_user_memory_override(&user_memory_facts) {
+            effective_system_prompt.push(memory_override);
+        }
+        let memory = LongTermMemory::load_for_workspace(self.session.workspace_root());
+        let active_language = active_language_preference(&user_memory_facts, &memory);
+        task_state.set_output_language(active_language.clone());
+        if let Some(language) = &active_language {
+            effective_system_prompt.push(format!(
+                "# Active output language\n{}",
+                language_output_contract(language)
+            ));
+        }
+        if let Some(relevant_memory) =
+            format_relevant_memory_context(&memory.relevant_entries(&user_input, 12))
+        {
+            effective_system_prompt.push(relevant_memory);
+        }
+        effective_system_prompt.push(task_state.format_context());
 
         loop {
             iterations += 1;
@@ -745,9 +1987,16 @@ where
                 return Err(error);
             }
 
+            let model_route =
+                self.select_model_route_for_task(&runtime_task_id, crate::ModelRoutePhase::Coding);
             let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
+                system_prompt: {
+                    let mut prompt = effective_system_prompt.clone();
+                    prompt.push(task_state.format_context());
+                    prompt
+                },
                 messages: self.session.messages.clone(),
+                model_route: Some(model_route),
             };
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
@@ -756,7 +2005,7 @@ where
                     return Err(error);
                 }
             };
-            let (assistant_message, usage, turn_prompt_cache_events, cot_part) =
+            let (mut assistant_message, usage, turn_prompt_cache_events, cot_part) =
                 match build_assistant_message(events) {
                     Ok(result) => result,
                     Err(error) => {
@@ -779,16 +2028,33 @@ where
                     chain_of_thought = Some(part);
                 }
             }
-            let pending_tool_uses = assistant_message
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::ToolUse { id, name, input } => {
-                        Some((id.clone(), name.clone(), input.clone()))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+            let available_tool_names = self
+                .tool_executor
+                .available_tools()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<BTreeSet<_>>();
+            let pending_tool_uses =
+                normalize_tool_uses(&mut assistant_message, &available_tool_names);
+            if pending_tool_uses.is_empty()
+                && task_state.requires_workspace_analysis
+                && !task_state.evidence_complete()
+                && workspace_evidence_tools_available(&available_tool_names)
+            {
+                if task_state.should_prompt_for_evidence() {
+                    self.session
+                        .push_message(ConversationMessage::user_text(
+                            workspace_evidence_gate_prompt(),
+                        ))
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    continue;
+                }
+                let error = RuntimeError::new(
+                    "workspace analysis required local search/read evidence, but the assistant did not request the required workspace tools before answering",
+                );
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
             self.record_assistant_iteration(
                 iterations,
                 &assistant_message,
@@ -804,10 +2070,12 @@ where
                 break;
             }
 
-            let decisioning_plan = self.build_decisioning_turn_plan(
+            let mut decisioning_plan = self.build_decisioning_turn_plan(
+                &runtime_task_id,
                 &user_input,
                 chain_of_thought.as_ref(),
                 &pending_tool_uses,
+                !task_state.evidence_complete(),
             );
 
             let mut ordered_pending_tool_uses = pending_tool_uses
@@ -815,27 +2083,80 @@ where
                 .enumerate()
                 .collect::<Vec<_>>();
             if let Some(plan) = decisioning_plan.as_ref() {
-                ordered_pending_tool_uses.sort_by(|(left_index, left_use), (right_index, right_use)| {
-                    let left_rank = plan
-                        .selected_positions
-                        .get(&left_use.1)
-                        .copied()
-                        .unwrap_or(usize::MAX);
-                    let right_rank = plan
-                        .selected_positions
-                        .get(&right_use.1)
-                        .copied()
-                        .unwrap_or(usize::MAX);
-                    left_rank
-                        .cmp(&right_rank)
-                        .then_with(|| left_index.cmp(right_index))
-                });
+                ordered_pending_tool_uses.sort_by(
+                    |(left_index, left_use), (right_index, right_use)| {
+                        let left_rank = plan
+                            .selected_positions
+                            .get(&left_use.1)
+                            .copied()
+                            .unwrap_or(usize::MAX);
+                        let right_rank = plan
+                            .selected_positions
+                            .get(&right_use.1)
+                            .copied()
+                            .unwrap_or(usize::MAX);
+                        left_rank
+                            .cmp(&right_rank)
+                            .then_with(|| left_index.cmp(right_index))
+                    },
+                );
             }
 
             let mut step_outcomes = Vec::new();
 
             for (_, (tool_use_id, tool_name, input)) in ordered_pending_tool_uses {
                 let tool_started_at = Instant::now();
+                if !available_tool_names.contains(&tool_name) {
+                    let plan_step_id = decisioning_plan
+                        .as_ref()
+                        .and_then(|plan| {
+                            plan.snapshot.plan.steps.iter().find(|step| {
+                                step.candidate_tools
+                                    .iter()
+                                    .any(|candidate| candidate == &tool_name)
+                            })
+                        })
+                        .map(|step| step.id.clone())
+                        .unwrap_or_else(|| tool_use_id.clone());
+                    if let Some(plan) = decisioning_plan.as_mut() {
+                        let mut scheduler = ExecutionScheduler::new(&plan.dag, &mut plan.execution);
+                        let _ = scheduler.fail_node(&plan_step_id, "unsupported_tool");
+                    }
+                    if let Some(plan) = decisioning_plan.as_ref() {
+                        self.emit_plan_execution_events(
+                            &plan.execution,
+                            plan.next_execution_event_offset,
+                        );
+                    }
+                    if let Some(plan) = decisioning_plan.as_mut() {
+                        plan.next_execution_event_offset = plan.execution.events.len();
+                    }
+                    task_state.record_tool_use(&tool_name, &input);
+                    let output = unsupported_tool_output(&tool_name, &available_tool_names);
+                    let result_message = ConversationMessage::tool_result(
+                        tool_use_id.clone(),
+                        tool_name.clone(),
+                        output.clone(),
+                        true,
+                    );
+                    let step_latency_ms = tool_started_at
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u32::MAX)) as u32;
+                    step_outcomes.push(StepOutcome {
+                        step_id: plan_step_id,
+                        succeeded: false,
+                        latency_ms: step_latency_ms,
+                        notes: vec![format!("unsupported_tool={tool_name}")],
+                    });
+                    self.session
+                        .push_message(result_message.clone())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    self.record_tool_finished(iterations, &result_message);
+                    task_state.record_tool_result(&tool_name, true, &output);
+                    tool_results.push(result_message);
+                    continue;
+                }
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -845,9 +2166,9 @@ where
                     pre_hook_result.permission_reason().map(ToOwned::to_owned),
                 );
 
-                let decisioning_outcome = decisioning_plan
-                    .as_ref()
-                    .and_then(|plan| self.assess_tool_decisioning(plan, &tool_name, &effective_input));
+                let decisioning_outcome = decisioning_plan.as_ref().and_then(|plan| {
+                    self.assess_tool_decisioning(plan, &tool_name, &effective_input)
+                });
 
                 let permission_outcome = if pre_hook_result.is_cancelled() {
                     PermissionOutcome::Deny {
@@ -909,16 +2230,37 @@ where
                     )
                 };
 
+                task_state.record_tool_use(&tool_name, &effective_input);
+
                 let plan_step_id = decisioning_plan
                     .as_ref()
                     .and_then(|plan| {
                         plan.snapshot.plan.steps.iter().find(|step| {
-                            step.candidate_tools.iter().any(|candidate| candidate == &tool_name)
+                            step.candidate_tools
+                                .iter()
+                                .any(|candidate| candidate == &tool_name)
                         })
                     })
                     .map(|step| step.id.clone())
                     .unwrap_or_else(|| tool_use_id.clone());
                 let permission_allowed = matches!(&permission_outcome, PermissionOutcome::Allow);
+                let started_plan_step_id = if let Some(plan) = decisioning_plan.as_mut() {
+                    let mut scheduler = ExecutionScheduler::new(&plan.dag, &mut plan.execution);
+                    scheduler
+                        .start_ready_node_for_tool(&tool_name)
+                        .map(|selection| selection.node_id)
+                } else {
+                    None
+                };
+                if let Some(plan) = decisioning_plan.as_ref() {
+                    self.emit_plan_execution_events(
+                        &plan.execution,
+                        plan.next_execution_event_offset,
+                    );
+                }
+                if let Some(plan) = decisioning_plan.as_mut() {
+                    plan.next_execution_event_offset = plan.execution.events.len();
+                }
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
                         self.record_tool_started(iterations, &tool_name);
@@ -971,15 +2313,50 @@ where
                         true,
                     ),
                 };
-                let step_latency_ms = tool_started_at.elapsed().as_millis().min(u128::from(u32::MAX))
-                    as u32;
+                let step_latency_ms = tool_started_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u32::MAX)) as u32;
+                let step_succeeded = permission_allowed
+                    && !matches!(
+                        result_message.blocks.first(),
+                        Some(ContentBlock::ToolResult { is_error: true, .. })
+                    );
+                if let Some(node_id) = started_plan_step_id.as_ref() {
+                    if let Some(plan) = decisioning_plan.as_mut() {
+                        let mut scheduler = ExecutionScheduler::new(&plan.dag, &mut plan.execution);
+                        let _ = scheduler.finish_node(
+                            node_id,
+                            step_succeeded,
+                            Some(format!("tool {tool_name} completed")),
+                            "tool_result_error",
+                        );
+                    }
+                    if let Some(plan) = decisioning_plan.as_ref() {
+                        self.emit_plan_execution_events(
+                            &plan.execution,
+                            plan.next_execution_event_offset,
+                        );
+                    }
+                    if let Some(plan) = decisioning_plan.as_mut() {
+                        plan.next_execution_event_offset = plan.execution.events.len();
+                    }
+                }
                 step_outcomes.push(StepOutcome {
                     step_id: plan_step_id,
-                    succeeded: permission_allowed
-                        && !matches!(result_message.blocks.first(), Some(ContentBlock::ToolResult { is_error: true, .. })),
+                    succeeded: step_succeeded,
                     latency_ms: step_latency_ms,
                     notes: vec![format!("tool={tool_name}",)],
                 });
+                if let Some(ContentBlock::ToolResult {
+                    tool_name,
+                    output,
+                    is_error,
+                    ..
+                }) = result_message.blocks.first()
+                {
+                    task_state.record_tool_result(tool_name, *is_error, output);
+                }
                 self.session
                     .push_message(result_message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -989,7 +2366,10 @@ where
 
             if let Some(plan) = decisioning_plan.as_ref() {
                 if step_outcomes.iter().any(|outcome| !outcome.succeeded) {
-                    let adjustment = plan.engine.planner.adjust_plan(&plan.snapshot.plan, &step_outcomes);
+                    let adjustment = plan
+                        .engine
+                        .planner
+                        .adjust_plan(&plan.snapshot.plan, &step_outcomes);
                     if self.decisioning_config.emit_events() {
                         self.emit_decisioning_adjustment_event(plan, &adjustment);
                     }
@@ -1007,8 +2387,164 @@ where
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
         };
+        let verification_route = self
+            .select_model_route_for_task(&runtime_task_id, crate::ModelRoutePhase::Verification);
+        let mut verification_decision = self.evaluate_runtime_task_completion(&runtime_task_id);
+        if let VerificationDecision::Required(request) = &verification_decision {
+            let result = if matches!(
+                self.permission_policy.active_mode(),
+                crate::PermissionMode::DangerFullAccess | crate::PermissionMode::Allow
+            ) {
+                self.verification_runner.run(request)
+            } else {
+                VerificationResult {
+                    task_id: runtime_task_id.clone(),
+                    passed: false,
+                    observed_green_level: None,
+                    summary: format!(
+                        "verification command execution requires danger-full-access; current mode is {}",
+                        self.permission_policy.active_mode().as_str()
+                    ),
+                    evidence: request.acceptance_tests.clone(),
+                }
+            };
+            let _ = self
+                .task_registry
+                .record_verification(&runtime_task_id, result);
+            self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+            task_ledger_offset = self.task_registry.ledger_for_task(&runtime_task_id).len();
+            verification_decision = self.evaluate_runtime_task_completion(&runtime_task_id);
+        }
+        let mut team_ledger = TeamExecutionLedger::new(
+            format!("team-{}", self.session.session_id),
+            runtime_task_id.clone(),
+        );
+        self.emit_team_execution_event_for_task(
+            &runtime_task_id,
+            team_ledger
+                .record_verification(&verification_decision, Some(verification_route.clone())),
+        );
+        match verification_decision {
+            VerificationDecision::Failed { reason } => {
+                let _ = self
+                    .task_registry
+                    .set_status(&runtime_task_id, crate::TaskStatus::Recovering);
+                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+                task_ledger_offset = self.task_registry.ledger_for_task(&runtime_task_id).len();
+                let classification = self.failure_classifier.classify_reason(&reason);
+                let mut recovery = RecoveryOrchestrator::new();
+                let outcome = recovery.recover_once(classification.scenario);
+                let recovery_succeeded = matches!(
+                    outcome.decision,
+                    crate::RecoveryOrchestratorDecision::Recovered
+                );
+                for event in outcome.events.clone() {
+                    let _ = self
+                        .task_registry
+                        .record_recovery_event(&runtime_task_id, event.clone());
+                    self.emit_runtime_event(RuntimeEvent::Recovery(event));
+                }
+                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+                task_ledger_offset = self.task_registry.ledger_for_task(&runtime_task_id).len();
+                let action_plan = self.recovery_action_engine.plan(
+                    runtime_task_id.clone(),
+                    &outcome,
+                    self.task_registry
+                        .get(&runtime_task_id)
+                        .and_then(|task| task.plan)
+                        .and_then(|plan| plan.resume_cursor)
+                        .and_then(|cursor| cursor.node_id),
+                );
+                let action_execution = self.recovery_action_engine.execute_against_registry(
+                    action_plan,
+                    self.permission_policy.active_mode(),
+                    &self.task_registry,
+                );
+                self.emit_runtime_event(RuntimeEvent::RecoveryAction(action_execution));
+                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+                task_ledger_offset = self.task_registry.ledger_for_task(&runtime_task_id).len();
+                let terminal_status = if recovery_succeeded {
+                    crate::TaskStatus::Blocked
+                } else {
+                    crate::TaskStatus::Failed
+                };
+                let _ = self
+                    .task_registry
+                    .set_status(&runtime_task_id, terminal_status);
+                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+                let _ = self.task_registry.record_route_feedback(
+                    &runtime_task_id,
+                    crate::ModelRouteFeedback::pending(
+                        runtime_task_id.clone(),
+                        verification_route.clone(),
+                        current_time_millis() / 1_000,
+                    )
+                    .with_outcome(
+                        false,
+                        Some(false),
+                        true,
+                        Some(reason.clone()),
+                    ),
+                );
+                self.record_turn_failed(iterations, &RuntimeError::new(reason.clone()));
+                return Err(RuntimeError::new(reason));
+            }
+            VerificationDecision::Required(request) => {
+                let result = VerificationResult {
+                    task_id: runtime_task_id.clone(),
+                    passed: false,
+                    observed_green_level: None,
+                    summary: format!(
+                        "verification required before completion: {:?}",
+                        request.policy
+                    ),
+                    evidence: request.acceptance_tests,
+                };
+                let _ = self
+                    .task_registry
+                    .record_verification(&runtime_task_id, result);
+                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+                task_ledger_offset = self.task_registry.ledger_for_task(&runtime_task_id).len();
+                let _ = self
+                    .task_registry
+                    .set_status(&runtime_task_id, crate::TaskStatus::Failed);
+                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+                let error = RuntimeError::new("verification is required before task completion");
+                let _ = self.task_registry.record_route_feedback(
+                    &runtime_task_id,
+                    crate::ModelRouteFeedback::pending(
+                        runtime_task_id.clone(),
+                        verification_route.clone(),
+                        current_time_millis() / 1_000,
+                    )
+                    .with_outcome(
+                        false,
+                        Some(false),
+                        false,
+                        Some("verification remained required".to_string()),
+                    ),
+                );
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
+            VerificationDecision::NotRequired | VerificationDecision::Passed => {
+                let _ = self.task_registry.record_route_feedback(
+                    &runtime_task_id,
+                    crate::ModelRouteFeedback::pending(
+                        runtime_task_id.clone(),
+                        verification_route.clone(),
+                        current_time_millis() / 1_000,
+                    )
+                    .with_outcome(true, Some(true), false, None),
+                );
+                let _ = self
+                    .task_registry
+                    .set_status(&runtime_task_id, crate::TaskStatus::Completed);
+                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+            }
+        }
         // Run lightweight reflection and learning hooks before completing the turn.
-        let _ = self.reflect_on_outcome(chain_of_thought, &summary);
+        self.reflect_on_outcome(&chain_of_thought, &summary);
         self.record_turn_completed(&summary);
 
         Ok(summary)
@@ -1184,7 +2720,10 @@ where
         session_tracer.record("turn_failed", attributes);
     }
 
-    fn build_reasoning_context(&self, chain_of_thought: Option<&ChainOfThought>) -> ReasoningContext {
+    fn build_reasoning_context(
+        &self,
+        chain_of_thought: Option<&ChainOfThought>,
+    ) -> ReasoningContext {
         ReasoningContext {
             chain_of_thought: chain_of_thought.cloned(),
             workspace_root: self.session.workspace_root().map(PathBuf::from),
@@ -1241,10 +2780,20 @@ where
             constraints.push(format!("workspace-root:{}", workspace_root.display()));
         }
 
+        if let Some(language) = latest_language_preference(&LongTermMemory::load_for_workspace(
+            self.session.workspace_root(),
+        )) {
+            constraints.push(format!("output-language:{language}"));
+        }
+
         constraints
     }
 
-    fn build_decisioning_tools(&self, pending_tool_uses: &[(String, String, String)]) -> Vec<Tool> {
+    fn build_decisioning_tools(
+        &self,
+        user_input: &str,
+        pending_tool_uses: &[(String, String, String)],
+    ) -> Vec<Tool> {
         let recent_history = self.collect_recent_tool_history();
         let mut tools = BTreeMap::new();
 
@@ -1263,7 +2812,10 @@ where
                 .iter()
                 .filter(|entry| entry.tool_name == tool.name)
                 .collect::<Vec<_>>();
-            let successful_count = matching_history.iter().filter(|entry| entry.succeeded).count() as f32;
+            let successful_count = matching_history
+                .iter()
+                .filter(|entry| entry.succeeded)
+                .count() as f32;
             let total_count = matching_history.len() as f32;
             if total_count > 0.0 {
                 let historical_success_rate = (successful_count / total_count).clamp(0.05, 0.99);
@@ -1276,7 +2828,24 @@ where
                     + (historical_success_rate * 0.4))
                     .clamp(0.05, 0.99);
                 tool.avg_latency_ms = ((tool.avg_latency_ms as f32 * 0.6)
-                    + (historical_latency_ms as f32 * 0.4)) as u32;
+                    + (historical_latency_ms as f32 * 0.4))
+                    as u32;
+            }
+        }
+
+        if user_requests_current_workspace_analysis(user_input) {
+            for tool in tools.values_mut() {
+                if is_workspace_evidence_tool(&tool.name) {
+                    tool.capabilities.extend([
+                        "workspace".to_string(),
+                        "evidence".to_string(),
+                        "source-analysis".to_string(),
+                    ]);
+                    tool.capabilities.sort();
+                    tool.capabilities.dedup();
+                    tool.avg_success_rate = (tool.avg_success_rate + 0.20).min(0.99);
+                    tool.cost = (tool.cost - 0.10).max(0.0);
+                }
             }
         }
 
@@ -1285,19 +2854,33 @@ where
 
     fn build_decisioning_task(
         &self,
+        task_id: &str,
         user_input: &str,
         pending_tool_uses: &[(String, String, String)],
         reasoning_context: &ReasoningContext,
     ) -> Task {
-        let mut required_capabilities = pending_tool_uses
-            .iter()
-            .flat_map(|(_, tool_name, _)| infer_tool_capabilities(tool_name, None))
-            .collect::<Vec<_>>();
+        let mut required_capabilities = if user_requests_current_workspace_analysis(user_input) {
+            vec![
+                "search".to_string(),
+                "read".to_string(),
+                "file".to_string(),
+                "grep".to_string(),
+                "glob".to_string(),
+                "workspace".to_string(),
+                "evidence".to_string(),
+                "source-analysis".to_string(),
+            ]
+        } else {
+            pending_tool_uses
+                .iter()
+                .flat_map(|(_, tool_name, _)| infer_tool_capabilities(tool_name, None))
+                .collect::<Vec<_>>()
+        };
         required_capabilities.sort();
         required_capabilities.dedup();
 
         Task::new(
-            format!("turn-{}", self.session.session_id),
+            task_id.to_string(),
             user_input.to_string(),
             pending_tool_uses.len().clamp(1, 5) as u8,
             required_capabilities,
@@ -1321,25 +2904,36 @@ where
 
     fn build_decisioning_turn_plan(
         &self,
+        task_id: &str,
         user_input: &str,
         chain_of_thought: Option<&ChainOfThought>,
         pending_tool_uses: &[(String, String, String)],
+        workspace_evidence_stage_active: bool,
     ) -> Option<DecisioningTurnPlan> {
         if !self.decisioning_config.enabled() || pending_tool_uses.is_empty() {
             return None;
         }
 
         let reasoning_context = self.build_reasoning_context(chain_of_thought);
-        let decisioning_task = self.build_decisioning_task(user_input, pending_tool_uses, &reasoning_context);
+        let decisioning_task =
+            self.build_decisioning_task(task_id, user_input, pending_tool_uses, &reasoning_context);
         let decisioning_engine = self.build_decisioning_engine(
-            self.build_decisioning_tools(pending_tool_uses),
+            self.build_decisioning_tools(user_input, pending_tool_uses),
             reasoning_context,
         );
         let snapshot = decisioning_engine.analyze(&decisioning_task);
+        let dag = crate::build_plan_dag(&snapshot.task, &snapshot.plan, &snapshot.selected_tools);
+        let execution = PlanExecution::new(&dag);
+        let mut next_execution_event_offset = 0;
         if self.decisioning_config.emit_events() {
             self.record_decisioning_snapshot(&snapshot);
             self.emit_decisioning_events(&snapshot);
+            self.emit_plan_execution_events(&execution, next_execution_event_offset);
+            next_execution_event_offset = execution.events.len();
         }
+        let _ = self
+            .task_registry
+            .record_plan(task_id, dag.clone(), execution.clone());
 
         let selected_positions = snapshot
             .selected_tools
@@ -1352,7 +2946,12 @@ where
             engine: decisioning_engine,
             task: decisioning_task,
             snapshot,
+            dag,
+            execution,
+            next_execution_event_offset,
             selected_positions,
+            workspace_evidence_stage_active: workspace_evidence_stage_active
+                && user_requests_current_workspace_analysis(user_input),
         })
     }
 
@@ -1362,7 +2961,10 @@ where
         };
 
         let mut attributes = Map::new();
-        attributes.insert("task_id".to_string(), Value::String(snapshot.task.id.clone()));
+        attributes.insert(
+            "task_id".to_string(),
+            Value::String(snapshot.task.id.clone()),
+        );
         attributes.insert(
             "selected_tool_count".to_string(),
             Value::from(snapshot.selected_tools.len() as u64),
@@ -1387,13 +2989,115 @@ where
     }
 
     fn emit_decisioning_events(&self, snapshot: &DecisioningSnapshot) {
-        let Some(reporter) = &self.decisioning_event_reporter else {
-            return;
-        };
-
         for event in &snapshot.events {
-            reporter.emit_decisioning_event(event);
+            if let Some(reporter) = &self.decisioning_event_reporter {
+                reporter.emit_decisioning_event(event);
+            }
+            self.emit_runtime_event(RuntimeEvent::Decisioning(Box::new(event.clone())));
         }
+    }
+
+    fn emit_plan_execution_events(&self, execution: &PlanExecution, offset: usize) {
+        if !self.decisioning_config.emit_events() {
+            return;
+        }
+
+        for event in execution.events_since(offset) {
+            if let Some(reporter) = &self.plan_execution_event_reporter {
+                reporter.emit_plan_execution_event(event);
+            }
+            self.emit_runtime_event(RuntimeEvent::PlanExecution(event.clone()));
+        }
+        if offset < execution.events.len() {
+            if let Some(snapshot) = self
+                .task_registry
+                .get(&execution.task_id)
+                .and_then(|task| task.plan)
+            {
+                let _ = self.task_registry.record_plan(
+                    &execution.task_id,
+                    snapshot.dag,
+                    execution.clone(),
+                );
+            }
+        }
+    }
+
+    fn emit_runtime_event(&self, event: RuntimeEvent) {
+        if let Some(reporter) = &self.runtime_event_reporter {
+            reporter.emit_runtime_event(&event);
+        }
+    }
+
+    fn emit_task_ledger_events(&self, task_id: &str, offset: usize) {
+        for event in self
+            .task_registry
+            .ledger_for_task(task_id)
+            .into_iter()
+            .skip(offset)
+        {
+            if let Some(reporter) = &self.task_ledger_event_reporter {
+                reporter.emit_task_ledger_event(&event);
+            }
+            self.emit_runtime_event(RuntimeEvent::TaskLedger(event));
+        }
+    }
+
+    fn select_model_route_for_task(
+        &self,
+        task_id: &str,
+        phase: crate::ModelRoutePhase,
+    ) -> ModelRouteDecision {
+        let mut feedback = self.workspace_route_feedback.clone();
+        feedback.extend(
+            self.task_registry
+                .get(task_id)
+                .map(|task| task.route_feedback)
+                .unwrap_or_default(),
+        );
+        let decision = self.model_router.select_with_feedback(phase, &feedback);
+        if let Some(reporter) = &self.model_route_event_reporter {
+            reporter.emit_model_route_event(&decision);
+        }
+        self.emit_runtime_event(RuntimeEvent::ModelRoute(decision.clone()));
+        let _ = self.task_registry.record_route_feedback(
+            task_id,
+            crate::ModelRouteFeedback::pending(
+                task_id.to_string(),
+                decision.clone(),
+                current_time_millis() / 1_000,
+            ),
+        );
+        decision
+    }
+
+    fn emit_team_execution_event(&self, event: TeamExecutionEvent) {
+        if let Some(reporter) = &self.team_execution_event_reporter {
+            reporter.emit_team_execution_event(&event);
+        }
+        self.emit_runtime_event(RuntimeEvent::TeamExecution(event));
+    }
+
+    fn emit_team_execution_event_for_task(&self, task_id: &str, event: TeamExecutionEvent) {
+        let _ = self.task_registry.record_team_event(task_id, event.clone());
+        self.emit_team_execution_event(event);
+    }
+
+    fn evaluate_runtime_task_completion(&self, task_id: &str) -> VerificationDecision {
+        let Some(task) = self.task_registry.get(task_id) else {
+            return VerificationDecision::Failed {
+                reason: format!("task not found: {task_id}"),
+            };
+        };
+        let policy = infer_verification_policy(task.task_packet.as_ref());
+        if task.verification_result.is_none() {
+            if let Some(packet) = task.task_packet.as_ref() {
+                return VerificationDecision::Required(build_verification_request(
+                    task_id, packet, policy,
+                ));
+            }
+        }
+        evaluate_verification_result(policy, task.verification_result.as_ref())
     }
 
     fn emit_decisioning_adjustment_event(
@@ -1434,6 +3138,11 @@ where
                 &adjustment.revised_plan,
                 &plan.snapshot.selected_tools,
             )),
+            plan_dag: Some(crate::build_plan_dag(
+                &plan.task,
+                &adjustment.revised_plan,
+                &plan.snapshot.selected_tools,
+            )),
             details: adjustment
                 .changed_step_ids
                 .iter()
@@ -1448,7 +3157,21 @@ where
         tool_name: &str,
         effective_input: &str,
     ) -> Option<(PermissionOverride, String)> {
+        if plan.workspace_evidence_stage_active && !is_workspace_evidence_tool(tool_name) {
+            return Some((
+                PermissionOverride::Deny,
+                format!(
+                    "Decisioning evidence stage requires workspace discovery/search/read tools before {tool_name}; gather local source evidence first."
+                ),
+            ));
+        }
+
         if !plan.selected_positions.contains_key(tool_name) {
+            if user_requests_current_workspace_analysis(&plan.task.description)
+                && is_workspace_evidence_tool(tool_name)
+            {
+                return None;
+            }
             let selected_tools = plan
                 .snapshot
                 .selected_tools
@@ -1541,11 +3264,7 @@ where
 
     /// Perform lightweight reflection on the completed turn and persist
     /// notable facts to the long-term memory store.
-    fn reflect_on_outcome(
-        &mut self,
-        chain: Option<ChainOfThought>,
-        summary: &TurnSummary,
-    ) -> Result<(), RuntimeError> {
+    fn reflect_on_outcome(&mut self, chain: &Option<ChainOfThought>, summary: &TurnSummary) {
         // Load or create a workspace-scoped memory store.
         let workspace = self.session.workspace_root();
         let mut memory = LongTermMemory::load_for_workspace(workspace);
@@ -1554,7 +3273,6 @@ where
 
         // best-effort save (already attempted in add_entry)
         let _ = memory.save();
-        Ok(())
     }
 }
 
@@ -1576,17 +3294,16 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
 }
 
+type AssistantBuildResult = (
+    ConversationMessage,
+    Option<TokenUsage>,
+    Vec<PromptCacheEvent>,
+    Option<ChainOfThought>,
+);
+
 fn build_assistant_message(
     events: Vec<AssistantEvent>,
-) -> Result<
-    (
-        ConversationMessage,
-        Option<TokenUsage>,
-        Vec<PromptCacheEvent>,
-        Option<ChainOfThought>,
-    ),
-    RuntimeError,
-> {
+) -> Result<AssistantBuildResult, RuntimeError> {
     let mut text = String::new();
     let mut blocks = Vec::new();
     let mut prompt_cache_events = Vec::new();
@@ -1602,17 +3319,30 @@ fn build_assistant_message(
                 blocks.push(ContentBlock::ToolUse { id, name, input });
             }
             AssistantEvent::ReasoningStep(step) => {
-                // Flush any pending text so reasoning steps separate text blocks
                 flush_text_block(&mut text, &mut blocks);
-                // Collect reasoning steps into an optional ChainOfThought so
-                // the runtime can reflect and persist learning.
                 if chain.is_none() {
                     chain = Some(ChainOfThought::new());
                 }
                 if let Some(ref mut c) = chain {
-                    c.add_step(step);
+                    c.add_step(step.clone());
                 }
-                // reasoning steps are not added to message blocks
+                // Store thinking content in session blocks so the API can
+                // round-trip reasoning_content. Providers like DeepSeek reject
+                // 400 when this is missing.
+                match step {
+                    ReasoningStep::Analysis {
+                        content, signature, ..
+                    } => {
+                        blocks.push(ContentBlock::Thinking {
+                            thinking: content,
+                            signature,
+                        });
+                    }
+                    ReasoningStep::RedactedThinking { data } => {
+                        blocks.push(ContentBlock::RedactedThinking { data });
+                    }
+                    _ => {}
+                }
             }
             AssistantEvent::Usage(value) => usage = Some(value),
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
@@ -1718,11 +3448,11 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, AlternativeApproach, ChainOfThought,
-        ConversationRuntime, DecisioningEvent, DecisioningEventReporter, LongTermMemory,
-        MemoryEntry, PromptCacheEvent, ReasoningStep, RuntimeError, StaticToolExecutor,
-        ToolExecutor, TurnSummary, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        build_assistant_message, parse_auto_compaction_threshold, AlternativeApproach, ApiClient,
+        ApiRequest, AssistantEvent, AutoCompactionEvent, ChainOfThought, ConversationRuntime,
+        DecisioningEvent, DecisioningEventReporter, LongTermMemory, MemoryEntry, MemoryKind,
+        PromptCacheEvent, ReasoningStep, RuntimeError, StaticToolExecutor, ToolExecutor,
+        TurnSummary, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{DecisioningConfig, RuntimeFeatureConfig, RuntimeHookConfig};
@@ -1863,6 +3593,302 @@ mod tests {
         ));
     }
 
+    struct AliasedToolApiClient {
+        call_count: usize,
+    }
+
+    impl ApiClient for AliasedToolApiClient {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.call_count += 1;
+            if self.call_count == 1 {
+                return Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "search-1".to_string(),
+                        name: "function:google_search".to_string(),
+                        input: r#"{"query":"himalaya"}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ]);
+            }
+
+            let last_message = request.messages.last().expect("tool result should exist");
+            assert!(matches!(
+                &last_message.blocks[0],
+                ContentBlock::ToolResult { tool_name, is_error: false, .. } if tool_name == "WebSearch"
+            ));
+            Ok(vec![
+                AssistantEvent::TextDelta("searched".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    #[test]
+    fn current_workspace_analysis_request_injects_local_tree_context() {
+        struct InspectingApi;
+        impl ApiClient for InspectingApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let first_message = request
+                    .messages
+                    .first()
+                    .expect("user message should be present");
+                assert_eq!(first_message.role, MessageRole::User);
+                let joined = first_message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(joined.contains("[Current workspace context]"));
+                assert!(joined.contains("Workspace root:"));
+                assert!(joined.contains("Directory tree snapshot:"));
+                assert!(joined.contains("Cargo.toml"));
+                assert!(joined.contains("src/"));
+                assert!(joined.contains("Manifest candidates to read with read_file"));
+                assert!(joined.contains("Source candidates to inspect with read_file"));
+                assert!(joined.contains("only navigation aid, not analysis evidence"));
+                assert!(!joined.contains("fn main()"));
+                assert!(joined.contains("Do not ask the user to upload code"));
+                Ok(vec![
+                    AssistantEvent::TextDelta("已检查当前工程。".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "himalaya-workspace-analysis-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).expect("workspace src dir");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n")
+            .expect("manifest should be written");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n")
+            .expect("source should be written");
+        fs::create_dir_all(root.join(".Himalaya")).expect("memory dir should exist");
+        fs::write(root.join(".Himalaya").join("long_term_memory.json"), "[]")
+            .expect("memory should be isolated");
+
+        let session = Session::new().with_workspace_root(&root);
+        let mut runtime = ConversationRuntime::new(
+            session,
+            InspectingApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("请分析当前工程下的源代码目录结构及源代码", None)
+            .expect("workspace context should be injected");
+        fs::remove_dir_all(root).expect("cleanup workspace");
+    }
+
+    #[test]
+    fn workspace_analysis_blocks_snapshot_answer_when_evidence_tools_are_available() {
+        struct SnapshotAnswerApi;
+        impl ApiClient for SnapshotAnswerApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta(
+                        "Workspace layout derived from supplied snapshot".to_string(),
+                    ),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "himalaya-workspace-analysis-blocks-snapshot-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).expect("workspace src dir");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n")
+            .expect("manifest should be written");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n")
+            .expect("source should be written");
+        fs::create_dir_all(root.join(".Himalaya")).expect("memory dir should exist");
+        fs::write(root.join(".Himalaya").join("long_term_memory.json"), "[]")
+            .expect("memory should be isolated");
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new().with_workspace_root(&root),
+            SnapshotAnswerApi,
+            StaticToolExecutor::new()
+                .register(
+                    "grep_search",
+                    |_input| Ok("src/main.rs:fn main".to_string()),
+                )
+                .register("read_file", |input| Ok(format!("read {input}"))),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn("请分析当前工程下的源代码目录结构及源代码", None)
+            .expect_err("snapshot-only workspace answer should be blocked");
+
+        assert!(error
+            .to_string()
+            .contains("workspace analysis required local search/read evidence"));
+        assert!(!runtime
+            .session()
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Assistant));
+        fs::remove_dir_all(root).expect("cleanup workspace");
+    }
+
+    #[test]
+    fn normalizes_common_function_tool_aliases_before_execution() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            AliasedToolApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("WebSearch", |input| {
+                assert!(input.contains("himalaya"));
+                Ok("search results".to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::ReadOnly)
+                .with_tool_requirement("WebSearch", PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("search", None)
+            .expect("aliased tool should execute");
+
+        assert_eq!(summary.tool_results.len(), 1);
+        assert!(matches!(
+            &summary.tool_results[0].blocks[0],
+            ContentBlock::ToolResult { tool_name, is_error: false, .. } if tool_name == "WebSearch"
+        ));
+    }
+
+    struct UnsupportedToolApiClient {
+        call_count: usize,
+    }
+
+    impl ApiClient for UnsupportedToolApiClient {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.call_count += 1;
+            if self.call_count == 1 {
+                return Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "bad-1".to_string(),
+                        name: "functionern_api".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ]);
+            }
+
+            let last_message = request.messages.last().expect("tool result should exist");
+            assert!(matches!(
+                &last_message.blocks[0],
+                ContentBlock::ToolResult { tool_name, output, is_error: true, .. }
+                    if tool_name == "functionern_api" && output.contains("unsupported tool")
+            ));
+            Ok(vec![
+                AssistantEvent::TextDelta("recovered".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    struct PanicPrompter;
+
+    impl PermissionPrompter for PanicPrompter {
+        fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+            panic!("unsupported tools should not request permission")
+        }
+    }
+
+    #[test]
+    fn unsupported_model_tool_names_skip_permission_prompts() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            UnsupportedToolApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("WebSearch", |_input| Ok("unused".to_string())),
+            PermissionPolicy::new(PermissionMode::ReadOnly)
+                .with_tool_requirement("WebSearch", PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+        );
+        let mut prompter = PanicPrompter;
+
+        let summary = runtime
+            .run_turn("use bad tool", Some(&mut prompter))
+            .expect("unsupported tool should be returned to model as an error result");
+
+        assert_eq!(summary.tool_results.len(), 1);
+        assert!(matches!(
+            &summary.tool_results[0].blocks[0],
+            ContentBlock::ToolResult { tool_name, output, is_error: true, .. }
+                if tool_name == "functionern_api" && output.contains("unsupported tool")
+        ));
+    }
+
+    struct AttachmentMergeApiClient;
+
+    impl ApiClient for AttachmentMergeApiClient {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            assert_eq!(request.messages.len(), 1);
+            let message = request.messages.first().expect("user message should exist");
+            assert_eq!(message.role, MessageRole::User);
+            assert_eq!(message.blocks.len(), 2);
+            assert!(matches!(
+                &message.blocks[0],
+                ContentBlock::Text { text } if text == "summarize the paper"
+            ));
+            assert!(matches!(
+                &message.blocks[1],
+                ContentBlock::Text { text } if text.contains("[File: paper.pdf]")
+            ));
+            Ok(vec![
+                AssistantEvent::TextDelta("summary".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    #[test]
+    fn injected_user_blocks_merge_into_next_prompt_message() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            AttachmentMergeApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .inject_user_blocks(vec![ContentBlock::Text {
+                text: "[File: paper.pdf]\npaper body".to_string(),
+            }])
+            .expect("file blocks should queue");
+        runtime
+            .run_turn("summarize the paper", None)
+            .expect("turn should run");
+
+        assert_eq!(runtime.session().messages.len(), 2);
+        let user_message = &runtime.session().messages[0];
+        assert_eq!(user_message.role, MessageRole::User);
+        assert_eq!(user_message.blocks.len(), 2);
+    }
+
     #[test]
     fn records_runtime_session_trace_events() {
         let sink = Arc::new(MemoryTelemetrySink::default());
@@ -1902,24 +3928,28 @@ mod tests {
             path: PathBuf::from("/tmp/unused-memory.json"),
             entries: vec![
                 MemoryEntry {
+                    kind: MemoryKind::General,
                     topic: "older-topic".to_string(),
                     note: "older entry".to_string(),
                     confidence: 0.30,
                     ts_ms: 10,
                 },
                 MemoryEntry {
+                    kind: MemoryKind::General,
                     topic: "fresh-topic".to_string(),
                     note: "higher confidence".to_string(),
                     confidence: 0.90,
                     ts_ms: 20,
                 },
                 MemoryEntry {
+                    kind: MemoryKind::General,
                     topic: "fresh-topic".to_string(),
                     note: "duplicate with lower confidence".to_string(),
                     confidence: 0.70,
                     ts_ms: 30,
                 },
                 MemoryEntry {
+                    kind: MemoryKind::General,
                     topic: "mid-topic".to_string(),
                     note: "mid confidence".to_string(),
                     confidence: 0.60,
@@ -1939,6 +3969,152 @@ mod tests {
     }
 
     #[test]
+    fn workspace_memory_writes_to_workspace_path_even_without_existing_file() {
+        let root = std::env::temp_dir().join(format!(
+            "himalaya-workspace-memory-path-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("workspace should be created");
+
+        let mut memory = LongTermMemory::load_for_workspace(Some(&root));
+        let expected_path = root.join(".Himalaya").join("long_term_memory.json");
+        assert_eq!(memory.path, expected_path);
+        memory.add_typed_entry(
+            MemoryKind::LanguagePreference,
+            "language_preference",
+            "Chinese",
+            0.98,
+        );
+
+        let saved = fs::read_to_string(&expected_path).expect("workspace memory should be saved");
+        assert!(saved.contains("language_preference"));
+        assert!(saved.contains("Chinese"));
+        fs::remove_dir_all(root).expect("cleanup workspace");
+    }
+    #[test]
+    fn language_preference_persists_as_output_contract_across_turns() {
+        struct InspectingLanguageApi {
+            call_count: usize,
+        }
+
+        impl ApiClient for InspectingLanguageApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                let system = request.system_prompt.join("\n");
+                assert!(system.contains("Output-language contract: respond to the user in Chinese"));
+                assert!(system.contains("prose headings and explanations must be Chinese"));
+
+                let is_workspace_analysis_turn = request.messages.iter().any(|message| {
+                    message.role == MessageRole::User
+                        && message.blocks.iter().any(|block| match block {
+                            ContentBlock::Text { text } => {
+                                text.contains("请分析当前工程")
+                                    || text.contains("Workspace analysis requires local evidence")
+                            }
+                            _ => false,
+                        })
+                });
+                if is_workspace_analysis_turn {
+                    assert!(system.contains("# Active output language"));
+                    assert!(system.contains("- Output language: Chinese"));
+                    assert!(system.contains("Task class: current workspace/source analysis"));
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("好的。".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "himalaya-language-contract-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).expect("workspace src dir");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n")
+            .expect("manifest should be written");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n")
+            .expect("source should be written");
+        fs::create_dir_all(root.join(".Himalaya")).expect("memory dir should exist");
+        fs::write(root.join(".Himalaya").join("long_term_memory.json"), "[]")
+            .expect("memory should be isolated");
+
+        let session = Session::new().with_workspace_root(&root);
+        let mut runtime = ConversationRuntime::new(
+            session,
+            InspectingLanguageApi { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+        );
+        runtime
+            .run_turn("你好，请用中文和我交流", None)
+            .expect("language preference turn should succeed");
+        runtime
+            .run_turn("请分析当前工程下的源代码目录结构及源代码", None)
+            .expect("later workspace turn should retain language contract");
+        fs::remove_dir_all(root).expect("cleanup workspace");
+    }
+
+    #[test]
+    fn extracts_explicit_chinese_identity_memory() {
+        let facts = super::extract_user_memory_facts("记住，我叫沐沐，你叫拉雅，以后用中文交流。");
+
+        assert!(facts.iter().any(|(kind, topic, note)| {
+            *kind == MemoryKind::UserIdentity && topic == "user_identity" && note == "沐沐"
+        }));
+        assert!(facts.iter().any(|(kind, topic, note)| {
+            *kind == MemoryKind::AssistantIdentity
+                && topic == "assistant_identity"
+                && note == "拉雅"
+        }));
+        assert!(facts.iter().any(|(kind, topic, note)| {
+            *kind == MemoryKind::LanguagePreference
+                && topic == "language_preference"
+                && note == "Chinese"
+        }));
+    }
+
+    #[test]
+    fn extracts_explicit_english_identity_memory() {
+        let facts = super::extract_user_memory_facts(
+            "Remember, my name is Mumu and your name is Raya. Use Chinese from now on.",
+        );
+
+        assert!(facts.iter().any(|(kind, topic, note)| {
+            *kind == MemoryKind::UserIdentity && topic == "user_identity" && note == "Mumu"
+        }));
+        assert!(facts.iter().any(|(kind, topic, note)| {
+            *kind == MemoryKind::AssistantIdentity
+                && topic == "assistant_identity"
+                && note == "Raya"
+        }));
+        assert!(facts.iter().any(|(kind, topic, note)| {
+            *kind == MemoryKind::LanguagePreference
+                && topic == "language_preference"
+                && note == "Chinese"
+        }));
+    }
+
+    #[test]
+    fn legacy_memory_json_defaults_to_general_kind() {
+        let entries = serde_json::from_str::<Vec<MemoryEntry>>(
+            r#"[{"topic":"older-topic","note":"older entry","confidence":0.7,"ts_ms":10}]"#,
+        )
+        .expect("legacy memory should deserialize");
+
+        assert_eq!(entries[0].kind, MemoryKind::General);
+        assert_eq!(entries[0].topic, "older-topic");
+    }
+    #[test]
     fn reflection_records_failed_tools_and_reasoning_topics() {
         let workspace_root = std::env::temp_dir().join(format!(
             "himalaya-reflection-{}-{}",
@@ -1949,7 +4125,9 @@ mod tests {
                 .as_millis()
         ));
         let mut memory = LongTermMemory {
-            path: workspace_root.join(".Himalaya").join("long_term_memory.json"),
+            path: workspace_root
+                .join(".Himalaya")
+                .join("long_term_memory.json"),
             entries: Vec::new(),
         };
 
@@ -1957,6 +4135,7 @@ mod tests {
         chain.add_step(ReasoningStep::Analysis {
             content: "Need shell access to inspect workspace write behavior".to_string(),
             confidence: Some(0.30),
+            signature: None,
         });
         chain.alternatives.push(AlternativeApproach {
             description: "Use read-only inspection first".to_string(),
@@ -1979,7 +4158,10 @@ mod tests {
 
         super::record_reflection_memory(&mut memory, Some(&chain), &summary);
 
-        assert!(memory.entries.iter().any(|entry| entry.topic == "tool_failure"));
+        assert!(memory
+            .entries
+            .iter()
+            .any(|entry| entry.topic == "tool_failure"));
         assert!(memory.entries.iter().any(|entry| entry.topic == "shell"));
         assert!(memory
             .entries
@@ -1989,9 +4171,45 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.topic == "low_confidence_decision"));
-        assert!(memory.entries.iter().any(|entry| entry.topic == "turn_summary"));
+        assert!(memory
+            .entries
+            .iter()
+            .any(|entry| entry.topic == "turn_summary"));
     }
 
+    #[test]
+    fn reflection_does_not_store_assistant_identity_claims() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "himalaya-reflection-identity-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after UNIX_EPOCH")
+                .as_millis()
+        ));
+        let mut memory = LongTermMemory {
+            path: workspace_root
+                .join(".Himalaya")
+                .join("long_term_memory.json"),
+            entries: Vec::new(),
+        };
+        let summary = TurnSummary {
+            assistant_messages: vec![ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "My name is Nemotron, I was created by NVIDIA.".to_string(),
+            }])],
+            tool_results: Vec::new(),
+            prompt_cache_events: Vec::new(),
+            iterations: 1,
+            usage: TokenUsage::default(),
+            auto_compaction: None,
+        };
+
+        super::record_reflection_memory(&mut memory, None, &summary);
+
+        assert!(!memory
+            .entries
+            .iter()
+            .any(|entry| entry.note.contains("Nemotron")));
+    }
     #[test]
     fn decisioning_reorders_and_limits_tool_execution() {
         struct MultiToolApiClient;
@@ -2063,8 +4281,21 @@ mod tests {
                 .with_max_parallelism(1),
         );
 
+        let workspace_root = std::env::temp_dir().join(format!(
+            "himalaya-decisioning-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after UNIX_EPOCH")
+                .as_millis()
+        ));
+        let memory_dir = workspace_root.join(".Himalaya");
+        fs::create_dir_all(&memory_dir).expect("workspace memory dir should be created");
+        fs::write(memory_dir.join("long_term_memory.json"), "[]")
+            .expect("workspace memory should be isolated");
+
         let mut runtime = ConversationRuntime::new_with_features(
-            Session::new(),
+            Session::new().with_workspace_root(workspace_root),
             MultiToolApiClient,
             StaticToolExecutor::new()
                 .register("a_tool", |_input| Ok("selected".to_string()))
@@ -2124,6 +4355,329 @@ mod tests {
     }
 
     #[test]
+    fn runtime_reporter_emits_long_task_lifecycle_events() {
+        struct ToolApiClient {
+            call_count: usize,
+        }
+
+        impl ApiClient for ToolApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert!(request.model_route.is_some());
+                self.call_count += 1;
+                if request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == MessageRole::Tool)
+                {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "read_file".to_string(),
+                        input: r#"{"path":"fixture.txt"}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        struct RecordingRuntimeReporter {
+            events: Arc<Mutex<Vec<crate::RuntimeEvent>>>,
+        }
+
+        impl crate::RuntimeEventReporter for RecordingRuntimeReporter {
+            fn emit_runtime_event(&self, event: &crate::RuntimeEvent) {
+                self.events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event.clone());
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(true)
+                .with_max_parallelism(2),
+        );
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            ToolApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("read_file", |_input| Ok("contents".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        )
+        .with_runtime_event_reporter(RecordingRuntimeReporter {
+            events: events.clone(),
+        });
+
+        runtime
+            .run_turn("read the fixture", None)
+            .expect("runtime turn should succeed");
+
+        let events = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::TaskLedger(entry)
+                if entry.event == "created" && entry.status == crate::TaskStatus::Created
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::TaskLedger(entry)
+                if entry.event == "status_changed" && entry.status == crate::TaskStatus::Completed
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::ModelRoute(route) if route.phase == crate::ModelRoutePhase::Coding
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::ModelRoute(route) if route.phase == crate::ModelRoutePhase::Verification
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::PlanExecution(plan_event)
+                if plan_event.kind == crate::PlanExecutionEventKind::NodeStarted
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::PlanExecution(plan_event)
+                if plan_event.kind == crate::PlanExecutionEventKind::NodeSucceeded
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::TeamExecution(team_event)
+                if team_event.kind == crate::TeamExecutionEventKind::VerificationPassed
+        )));
+    }
+
+    #[test]
+    fn packet_verification_failure_emits_recovery_events() {
+        struct FinalTextApiClient;
+
+        impl ApiClient for FinalTextApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert!(request.model_route.is_some());
+                Ok(vec![
+                    AssistantEvent::TextDelta("implemented".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        struct RecordingRuntimeReporter {
+            events: Arc<Mutex<Vec<crate::RuntimeEvent>>>,
+        }
+
+        impl crate::RuntimeEventReporter for RecordingRuntimeReporter {
+            fn emit_runtime_event(&self, event: &crate::RuntimeEvent) {
+                self.events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event.clone());
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            FinalTextApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_runtime_event_reporter(RecordingRuntimeReporter {
+            events: events.clone(),
+        });
+        let packet = serde_json::json!({
+            "objective": "Ship verified work",
+            "scope": "runtime verification",
+            "repo": "Himalaya",
+            "branch_policy": "no branch change",
+            "acceptance_tests": ["rustc --definitely-not-a-real-flag"],
+            "commit_policy": "no commit",
+            "reporting_contract": "report verification result",
+            "escalation_policy": "manual"
+        })
+        .to_string();
+
+        let error = runtime
+            .run_turn(packet, None)
+            .expect_err("failing acceptance test should fail the turn");
+        assert!(error.to_string().contains("verification command"));
+
+        let events = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::TaskLedger(entry)
+                if entry.event == "verification_recorded" && entry.status == crate::TaskStatus::Running
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::TaskLedger(entry)
+                if entry.event == "status_changed" && entry.status == crate::TaskStatus::Recovering
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::TaskLedger(entry)
+                if entry.event == "status_changed" && entry.status == crate::TaskStatus::Blocked
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::TaskLedger(entry)
+                if entry.event == "recovery_recorded" && entry.status == crate::TaskStatus::Recovering
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::TaskLedger(entry)
+                if entry.event == "route_feedback_recorded"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::TeamExecution(team_event)
+                if team_event.kind == crate::TeamExecutionEventKind::VerificationFailed
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::RuntimeEvent::Recovery(crate::RecoveryEvent::RecoveryAttempted { scenario, .. })
+                if *scenario == crate::FailureScenario::CompileRedCrossCrate
+        )));
+    }
+    #[test]
+    fn decisioning_keeps_workspace_analysis_in_evidence_stage() {
+        struct WorkspaceStageApiClient {
+            call_count: usize,
+        }
+
+        impl ApiClient for WorkspaceStageApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                let tool_results = request
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == MessageRole::Tool)
+                    .count();
+
+                match self.call_count {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-final".to_string(),
+                            name: "final_summary".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert_eq!(tool_results, 1);
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "tool-search".to_string(),
+                                name: "grep_search".to_string(),
+                                input: r#"{"pattern":"main"}"#.to_string(),
+                            },
+                            AssistantEvent::ToolUse {
+                                id: "tool-read-1".to_string(),
+                                name: "read_file".to_string(),
+                                input: r#"{"path":"Cargo.toml"}"#.to_string(),
+                            },
+                            AssistantEvent::ToolUse {
+                                id: "tool-read-2".to_string(),
+                                name: "read_file".to_string(),
+                                input: r#"{"path":"src/lib.rs"}"#.to_string(),
+                            },
+                            AssistantEvent::ToolUse {
+                                id: "tool-read-3".to_string(),
+                                name: "read_file".to_string(),
+                                input: r#"{"path":"src/main.rs"}"#.to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => {
+                        assert!(tool_results >= 5);
+                        Ok(vec![
+                            AssistantEvent::TextDelta("final answer from evidence".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                }
+            }
+        }
+
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(false)
+                .with_max_parallelism(2),
+        );
+        let workspace_root = std::env::temp_dir().join(format!(
+            "himalaya-decisioning-evidence-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after UNIX_EPOCH")
+                .as_millis()
+        ));
+        fs::create_dir_all(workspace_root.join("src")).expect("workspace src should be created");
+        fs::write(
+            workspace_root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n",
+        )
+        .expect("manifest should be written");
+        fs::write(workspace_root.join("src/lib.rs"), "pub fn lib() {}\n")
+            .expect("lib source should be written");
+        fs::write(workspace_root.join("src/main.rs"), "fn main() {}\n")
+            .expect("main source should be written");
+        fs::create_dir_all(workspace_root.join(".Himalaya")).expect("memory dir should exist");
+        fs::write(workspace_root.join(".Himalaya/long_term_memory.json"), "[]")
+            .expect("memory should be isolated");
+
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new().with_workspace_root(workspace_root),
+            WorkspaceStageApiClient { call_count: 0 },
+            StaticToolExecutor::new()
+                .register("final_summary", |_input| {
+                    panic!("final_summary should be blocked before evidence is complete")
+                })
+                .register(
+                    "grep_search",
+                    |_input| Ok("src/main.rs:fn main".to_string()),
+                )
+                .register("read_file", |input| Ok(format!("read {input}"))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+
+        let summary = runtime
+            .run_turn("请分析当前工程的源代码目录结构和功能模块关系", None)
+            .expect("workspace analysis should recover by gathering evidence");
+
+        assert!(matches!(
+            &summary.tool_results[0].blocks[0],
+            ContentBlock::ToolResult {
+                tool_name,
+                is_error: true,
+                output,
+                ..
+            } if tool_name == "final_summary" && output.contains("evidence stage")
+        ));
+        assert_eq!(summary.tool_results.len(), 5);
+    }
+
+    #[test]
     fn decisioning_blocks_sensitive_tool_inputs_before_execution() {
         struct SensitiveToolApiClient;
 
@@ -2144,7 +4698,8 @@ mod tests {
                     AssistantEvent::ToolUse {
                         id: "tool-sensitive".to_string(),
                         name: "safe_tool".to_string(),
-                        input: "delete secret token credential network shell overwrite remove".to_string(),
+                        input: "delete secret token credential network shell overwrite remove"
+                            .to_string(),
                     },
                     AssistantEvent::MessageStop,
                 ])
@@ -2223,7 +4778,9 @@ mod tests {
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             SingleCallApiClient,
-            StaticToolExecutor::new(),
+            StaticToolExecutor::new().register("blocked", |_input| {
+                panic!("blocked tool should not execute when permission is denied")
+            }),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
         );
@@ -2822,6 +5379,7 @@ mod tests {
             AssistantEvent::ReasoningStep(crate::conversation::ReasoningStep::Analysis {
                 content: "The user is asking me to analyze a codebase and provide insights.".to_string(),
                 confidence: Some(0.92),
+                signature: None,
             }),
             AssistantEvent::ReasoningStep(crate::conversation::ReasoningStep::Planning {
                 plan: "I need to examine the project structure, understand the technology stack, and provide actionable recommendations.".to_string(),
@@ -2847,10 +5405,14 @@ mod tests {
 
         // Verify the events can be processed without errors
         let result = build_assistant_message(demo_reasoning_events);
-        assert!(result.is_ok(), "Reasoning steps should not break message building");
+        assert!(
+            result.is_ok(),
+            "Reasoning steps should not break message building"
+        );
 
         let (message, _, _, chain_opt) = result.unwrap();
-        assert_eq!(message.blocks.len(), 2); // Two text blocks
+        assert_eq!(message.blocks.len(), 3);
+        assert!(matches!(message.blocks[0], ContentBlock::Thinking { .. }));
         assert!(chain_opt.is_some(), "Chain of thought should be collected");
     }
 

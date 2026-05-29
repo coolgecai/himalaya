@@ -1,0 +1,15 @@
+[package]
+name = "file-generate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+docx-rs   = "0.4"
+lopdf     = { version = "0.34", default-features = false, features = ["nom_parser"] }
+zip       = "0.6"
+thiserror = "1"
+
+[lints]
+workspace = true

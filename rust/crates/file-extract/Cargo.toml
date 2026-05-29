@@ -1,0 +1,15 @@
+[package]
+name = "file-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = "0.22"
+lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }
+calamine = { version = "0.24", features = ["dates"] }
+docx-rs = "0.4"
+zip = "0.6"
+quick-xml = "0.36"
+thiserror = "1"

@@ -1,0 +1,8 @@
+target/
+.omx/
+.clawd-agents/
+.Himalayad-agents/
+.Himalaya/
+.sandbox-home/
+.env
+*.env

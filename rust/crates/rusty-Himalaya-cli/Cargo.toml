@@ -1,0 +1,53 @@
+[package]
+name = "rusty-Himalaya-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "Himalaya"
+path = "src/main.rs"
+
+[dependencies]
+api = { path = "../api" }
+commands = { path = "../commands" }
+compat-harness = { path = "../compat-harness" }
+crossterm = "0.28"
+file-extract = { path = "../file-extract" }
+pulldown-cmark = "0.13"
+rustyline = "15"
+runtime = { path = "../runtime" }
+plugins = { path = "../plugins" }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+syntect = "5"
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
+tools = { path = "../tools" }
+
+[lints]
+workspace = true
+
+[package.metadata.deb]
+name = "himalaya-code"
+maintainer = "Himalaya Code Maintainers <maintainers@example.com>"
+copyright = "2024, Himalaya Code Contributors"
+extended-description = "AI-powered CLI coding assistant built on the Anthropic Claude API."
+depends = "$auto"
+section = "devel"
+priority = "optional"
+assets = [
+  ["target/release/Himalaya", "usr/bin/himalaya-code", "755"],
+  ["../../../README.md", "usr/share/doc/himalaya-code/README.md", "644"],
+  ["../plugins/bundled/example-bundled/.Himalaya-plugin/plugin.json", "usr/share/himalaya-code/bundled/example-bundled/.Himalaya-plugin/plugin.json", "644"],
+  ["../plugins/bundled/example-bundled/hooks/pre.sh", "usr/share/himalaya-code/bundled/example-bundled/hooks/pre.sh", "755"],
+  ["../plugins/bundled/example-bundled/hooks/post.sh", "usr/share/himalaya-code/bundled/example-bundled/hooks/post.sh", "755"],
+  ["../plugins/bundled/sample-hooks/.Himalaya-plugin/plugin.json", "usr/share/himalaya-code/bundled/sample-hooks/.Himalaya-plugin/plugin.json", "644"],
+  ["../plugins/bundled/sample-hooks/hooks/pre.sh", "usr/share/himalaya-code/bundled/sample-hooks/hooks/pre.sh", "755"],
+  ["../plugins/bundled/sample-hooks/hooks/post.sh", "usr/share/himalaya-code/bundled/sample-hooks/hooks/post.sh", "755"],
+]
+
+[dev-dependencies]
+mock-anthropic-service = { path = "../mock-anthropic-service" }
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
