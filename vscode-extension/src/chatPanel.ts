@@ -835,6 +835,13 @@ export class HimalayaChatPanel {
         case 'task_packet_status':
         case 'task_scheduler_tick':
         case 'task_scheduler_queue':
+        case 'task_scheduler_daemon_run':
+        case 'task_scheduler_daemon_status':
+        case 'task_scheduler_daemon_logs':
+        case 'route_feedback_summary':
+        case 'benchmark_suite':
+        case 'benchmark_task':
+        case 'benchmark_run':
         case 'task_execution':
         case 'task_recovery':
         case 'task_verification':
@@ -844,6 +851,8 @@ export class HimalayaChatPanel {
         case 'task_cancelled':
         case 'worker_list':
         case 'worker_create':
+        case 'worker_spawn':
+        case 'worker_probe':
         case 'worker_observe':
         case 'worker_ready':
         case 'worker_resolve_trust':
@@ -2149,15 +2158,42 @@ export class HimalayaChatPanel {
       flex-direction: column;
       gap: 6px;
     }
+    .task-board-worker-detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      margin-top: 6px;
+    }
     .task-board-task,
     .task-board-node,
     .task-board-recovery-item,
     .task-board-worker,
+    .task-board-worker-detail,
     .task-board-supervisor {
       border: 1px solid rgba(255,255,255,0.07);
       border-radius: 8px;
       background: rgba(255,255,255,0.03);
       padding: 7px 8px;
+    }
+    .task-board-worker {
+      cursor: pointer;
+    }
+    .task-board-worker.selected {
+      border-color: rgba(78,201,176,0.45);
+      background: rgba(78,201,176,0.08);
+    }
+    .task-board-detail-label {
+      color: var(--text-dim);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      margin-bottom: 2px;
+    }
+    .task-board-detail-value {
+      color: var(--text);
+      font-size: 11px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
     }
     .task-board-task-head {
       display: flex;
@@ -2331,6 +2367,7 @@ export class HimalayaChatPanel {
         recoveryEvents: [],
         workers: {},
         workerOrder: [],
+        selectedWorkerId: null,
         workerSupervisor: null
       },
       historyRecords: HISTORY
@@ -3178,6 +3215,7 @@ export class HimalayaChatPanel {
         recoveryEvents: [],
         workers: {},
         workerOrder: [],
+        selectedWorkerId: null,
         workerSupervisor: null
       };
     }
@@ -3217,6 +3255,9 @@ export class HimalayaChatPanel {
       state.taskBoard.workers[workerId] = Object.assign({}, previous, patch, { worker_id: workerId });
       if (state.taskBoard.workerOrder.indexOf(workerId) < 0) {
         state.taskBoard.workerOrder.unshift(workerId);
+      }
+      if (!state.taskBoard.selectedWorkerId) {
+        state.taskBoard.selectedWorkerId = workerId;
       }
     }
 
@@ -3321,7 +3362,7 @@ export class HimalayaChatPanel {
           if (task.task_id) { rememberTaskBoardTask(Object.assign({}, task, { status: 'cancelled' })); }
         } else if (kind === 'worker_list' && Array.isArray(value.workers)) {
           value.workers.forEach(function(worker) { rememberTaskBoardWorker(worker); });
-        } else if (kind === 'worker_create' || kind === 'worker_observe' || kind === 'worker_resolve_trust' || kind === 'worker_prompt' || kind === 'worker_complete' || kind === 'worker_restart' || kind === 'worker_terminate') {
+        } else if (kind === 'worker_create' || kind === 'worker_spawn' || kind === 'worker_probe' || kind === 'worker_observe' || kind === 'worker_resolve_trust' || kind === 'worker_prompt' || kind === 'worker_complete' || kind === 'worker_restart' || kind === 'worker_terminate') {
           if (value.worker && typeof value.worker === 'object') { rememberTaskBoardWorker(value.worker); }
         } else if (kind === 'worker_ready') {
           if (value.ready && typeof value.ready === 'object') { rememberTaskBoardWorker(value.ready); }
@@ -3366,18 +3407,62 @@ export class HimalayaChatPanel {
       '</div>';
     }
 
+    function taskBoardDetailCell(label, value) {
+      if (value === undefined || value === null || value === '') { return ''; }
+      return '<div class="task-board-worker-detail"><div class="task-board-detail-label">' + esc(label) + '</div><div class="task-board-detail-value">' + esc(value) + '</div></div>';
+    }
+
     function renderTaskBoardWorker(worker) {
       const workerId = String(worker.worker_id || 'worker');
       const status = String(worker.status || (worker.ready ? 'ready_for_prompt' : 'unknown'));
       const lease = worker.lease_expires_at ? 'lease ' + worker.lease_expires_at : undefined;
       const restarts = worker.restart_count !== undefined ? 'restarts ' + worker.restart_count + '/' + (worker.max_restarts !== undefined ? worker.max_restarts : '?') : undefined;
       const replay = worker.replay_prompt || worker.replay_prompt_ready ? 'replay armed' : undefined;
-      const meta = [workerId, lease, restarts, replay].filter(Boolean).join(' · ');
-      return '<div class="task-board-worker" data-worker-id="' + esc(workerId) + '">' +
+      const process = worker.process && typeof worker.process === 'object' ? worker.process : null;
+      const processMeta = process && process.pid ? 'pid ' + process.pid : undefined;
+      const meta = [workerId, lease, restarts, replay, processMeta].filter(Boolean).join(' · ');
+      const selected = state.taskBoard.selectedWorkerId === workerId ? ' selected' : '';
+      return '<div class="task-board-worker' + selected + '" data-worker-id="' + esc(workerId) + '">' +
         '<div class="task-board-task-head"><div class="task-board-task-title" title="' + esc(workerId) + '">' + esc(workerId) + '</div>' +
         '<span class="task-board-status status-' + esc(sanitizeDecisioningClassToken(status)) + '">' + esc(status) + '</span></div>' +
         '<div class="task-board-meta">' + esc(meta || workerId) + '</div>' +
       '</div>';
+    }
+
+    function renderTaskBoardWorkerDetail(worker) {
+      if (!worker) {
+        return '<div class="task-board-empty">Select a worker to inspect process and isolation details.</div>';
+      }
+      const workerId = String(worker.worker_id || 'worker');
+      const status = String(worker.status || (worker.ready ? 'ready_for_prompt' : 'unknown'));
+      const process = worker.process && typeof worker.process === 'object' ? worker.process : {};
+      const isolation = worker.isolation && typeof worker.isolation === 'object' ? worker.isolation : {};
+      const lastError = worker.last_error && typeof worker.last_error === 'object' ? worker.last_error : {};
+      const command = Array.isArray(process.command) ? process.command.join(' ') : undefined;
+      const recentEvents = Array.isArray(worker.events) ? worker.events.slice(-3).map(function(event) {
+        return [event.kind, event.status, event.detail].filter(Boolean).join(' · ');
+      }).join('\\n') : undefined;
+      const cells = [
+        taskBoardDetailCell('Worker', workerId),
+        taskBoardDetailCell('Status', status),
+        taskBoardDetailCell('PID', process.pid),
+        taskBoardDetailCell('Command', command),
+        taskBoardDetailCell('Cwd', worker.cwd),
+        taskBoardDetailCell('Isolation', isolation.kind),
+        taskBoardDetailCell('Worktree', isolation.worktree_path),
+        taskBoardDetailCell('Source cwd', isolation.source_cwd),
+        taskBoardDetailCell('Started', process.started_at),
+        taskBoardDetailCell('Exited', process.exited_at),
+        taskBoardDetailCell('Exit status', process.exit_status),
+        taskBoardDetailCell('Lease expires', worker.lease_expires_at),
+        taskBoardDetailCell('Restarts', worker.restart_count !== undefined ? worker.restart_count + '/' + (worker.max_restarts !== undefined ? worker.max_restarts : '?') : undefined),
+        taskBoardDetailCell('Replay prompt', worker.replay_prompt || worker.replay_prompt_ready ? 'armed' : undefined),
+        taskBoardDetailCell('Last error', lastError.message),
+        taskBoardDetailCell('Recent events', recentEvents)
+      ].filter(Boolean).join('');
+      return '<div class="task-board-worker-detail"><div class="task-board-task-head"><div class="task-board-task-title" title="' + esc(workerId) + '">Worker detail</div>' +
+        '<span class="task-board-status status-' + esc(sanitizeDecisioningClassToken(status)) + '">' + esc(status) + '</span></div>' +
+        '<div class="task-board-worker-detail-grid">' + cells + '</div></div>';
     }
 
     function renderTaskBoardWorkerSupervisor() {
@@ -3404,6 +3489,7 @@ export class HimalayaChatPanel {
         const event = entry && entry.event && typeof entry.event === 'object' ? entry.event : {};
         return '<div class="task-board-meta">' + esc([entry.worker_id, event.kind, event.detail].filter(Boolean).join(' · ')) + '</div>';
       }).join('');
+      const selectedWorker = state.taskBoard.workers[state.taskBoard.selectedWorkerId] || workers[0];
       return '<div class="task-board-supervisor">' +
         '<div class="task-board-task-head"><div class="task-board-task-title">Worker supervisor</div>' +
         '<span class="task-board-status status-' + esc(sanitizeDecisioningClassToken(status)) + '">' + esc(status) + '</span></div>' +
@@ -3411,7 +3497,8 @@ export class HimalayaChatPanel {
         (tick && tick.message ? '<div class="task-board-meta">' + esc(String(tick.message)) + '</div>' : '') +
         (events ? '<div style="margin-top:6px">' + events + '</div>' : '') +
       '</div>' +
-      (workers.length ? '<div class="task-board-worker-list" style="margin-top:6px">' + workers.map(renderTaskBoardWorker).join('') + '</div>' : '');
+      (workers.length ? '<div class="task-board-worker-list" style="margin-top:6px">' + workers.map(renderTaskBoardWorker).join('') + '</div>' : '') +
+      '<div class="task-board-panel-title" style="margin-top:8px;">Worker Detail</div>' + renderTaskBoardWorkerDetail(selectedWorker);
     }
 
 
@@ -3669,6 +3756,20 @@ export class HimalayaChatPanel {
           promptInput.value = chip.getAttribute('data-prompt');
           promptInput.focus();
           autoResize();
+        } catch (_) {}
+      });
+    }
+
+    if (taskBoardSurface) {
+      taskBoardSurface.addEventListener('click', function(e) {
+        try {
+          if (!(e.target instanceof Element)) { return; }
+          const worker = e.target.closest('[data-worker-id]');
+          if (!worker) { return; }
+          const workerId = worker.getAttribute('data-worker-id');
+          if (!workerId || !state.taskBoard.workers[workerId]) { return; }
+          state.taskBoard.selectedWorkerId = workerId;
+          updateTaskBoardSurface();
         } catch (_) {}
       });
     }

@@ -11,6 +11,7 @@ const chatParticipantPath = path.join(root, 'src', 'chatParticipant.ts');
 const extensionPath = path.join(root, 'src', 'extension.ts');
 const packageJsonPath = path.join(root, 'package.json');
 const streamJsonSchemaPath = path.resolve(root, '..', 'protocol', 'stream-json-v1.schema.json');
+const goldenStreamTranscriptPath = path.resolve(root, '..', 'protocol', 'stream-json-v1.golden.ndjson');
 const streamJsonSchema = JSON.parse(fs.readFileSync(streamJsonSchemaPath, 'utf8'));
 const historyPath = path.join(root, 'src', 'history.ts');
 const vscodeignorePath = path.join(root, '.vscodeignore');
@@ -317,21 +318,7 @@ test('chat panel replays stream-json transcripts through webview messages', asyn
       onDidDispose: () => ({ dispose() {} }),
     };
     const outputLines = [];
-    const transcript = [
-      { type: 'session_meta', session_id: 'sess-replay', session_path: '/tmp/session.jsonl', model: 'sonnet', protocol_version: 1 },
-      { type: 'message_start', protocol_version: 1 },
-      { type: 'reasoning_step', reasoning_step: { step_type: 'analysis', content: 'thinking' }, protocol_version: 1 },
-      { type: 'text_delta', text: 'Hello ', protocol_version: 1 },
-      { type: 'tool_use', id: 'toolu_1', name: 'read_file', input: { path: 'fixture.txt' }, protocol_version: 1 },
-      { type: 'tool_result', id: 'toolu_1', name: 'read_file', output: 'ok', is_error: false, protocol_version: 1 },
-      { type: 'decisioning_event', decisioning_event: { kind: 'safety_assessment', title: 'Safety', summary: 'Allowed', risk_score: 0, risk_level: 'low', action: 'allow' }, protocol_version: 1 },
-      { type: 'plan_execution_event', plan_execution_event: { seq: 1, task_id: 'task-1', node_id: 'node-1', kind: 'node_started', status: 'running', message: 'started' }, protocol_version: 1 },
-      { type: 'worker_supervisor_tick', tick: { status: 'running', active_workers: 1, blocked_workers: 0, restarted_workers: 1, trust_queue: [], capacity: { max_workers: 4, active_workers: 1, available_slots: 3 }, workers: [{ worker_id: 'worker-1', status: 'spawning', restart_count: 1, max_restarts: 2 }], event_index: [{ worker_id: 'worker-1', event: { kind: 'restarted', detail: 'stale worker restarted' } }], message: 'worker supervisor has active work' }, protocol_version: 1 },
-      { type: 'recovery_suggestion', source_event: 'permission_denial', failure_class: 'trust_gate', tool: 'write_file', reason: 'requires permission', action: 'retry_with_danger_full_access', suggestion: 'Retry with full access', protocol_version: 1 },
-      { type: 'permission_request', tool: 'write_file', input: { path: 'generated.txt' }, current_mode: 'read-only', required_mode: 'workspace-write', reason: 'requires workspace-write', protocol_version: 1 },
-      { type: 'text_delta', text: 'world', protocol_version: 1 },
-      { type: 'done', iterations: 1, protocol_version: 1 },
-    ].map((event) => JSON.stringify(event)).join('\n') + '\n';
+    const transcript = fs.readFileSync(goldenStreamTranscriptPath, 'utf8');
     const runCalls = [];
     const cli = {
       run: async (args, options) => {
@@ -372,31 +359,62 @@ test('chat panel replays stream-json transcripts through webview messages', asyn
 
     await panel.executePromptSubmission({ prompt: 'Replay stream', model: 'sonnet', permissionMode: 'read-only', cwd: root });
 
+    const runtimeEvents = posted.filter((message) => message.type === 'runtimeEvent');
+    const runtimeKinds = new Set(runtimeEvents.map((message) => message.kind));
+
     assert.deepEqual(runCalls[0].slice(0, 2), ['--output-format', 'stream-json']);
-    assert.equal(posted.find((message) => message.type === 'sessionMeta').sessionId, 'sess-replay');
-    assert.deepEqual(posted.filter((message) => message.type === 'assistantChunk').map((message) => message.text), ['Hello ', 'world']);
-    assert.equal(posted.find((message) => message.type === 'reasoningStep').step.content, 'thinking');
+    assert.equal(posted.find((message) => message.type === 'sessionMeta').sessionId, 'golden-session');
+    assert.deepEqual(posted.filter((message) => message.type === 'assistantChunk').map((message) => message.text), ['Golden ', 'replay']);
+    assert.equal(posted.find((message) => message.type === 'reasoningStep').step.content, 'plan golden replay');
     assert.equal(posted.find((message) => message.type === 'toolStep' && message.step === 'use').name, 'read_file');
-    assert.equal(posted.find((message) => message.type === 'toolStep' && message.step === 'result').output, 'ok');
-    assert.equal(posted.find((message) => message.type === 'decisioningEvent').event.kind, 'safety_assessment');
-    assert.equal(posted.find((message) => message.type === 'runtimeEvent' && message.kind === 'plan_execution_event').event.kind, 'node_started');
-    assert.equal(posted.find((message) => message.type === 'runtimeEvent' && message.kind === 'worker_supervisor_tick').event.tick.restarted_workers, 1);
+    assert.equal(posted.find((message) => message.type === 'toolStep' && message.step === 'result').output, 'fixture ok');
+    assert.equal(posted.find((message) => message.type === 'decisioningEvent').event.kind, 'task_decomposition');
+    for (const kind of [
+      'plan_execution_event',
+      'task_ledger_event',
+      'model_route_event',
+      'team_execution_event',
+      'recovery_event',
+      'recovery_action_event',
+      'task_execution_event',
+      'task_scheduler_daemon_run',
+      'task_scheduler_daemon_status',
+      'task_scheduler_daemon_logs',
+      'route_feedback_summary',
+      'benchmark_suite',
+      'benchmark_task',
+      'benchmark_run',
+      'worker_spawn',
+      'worker_supervisor_tick',
+    ]) {
+      assert.equal(runtimeKinds.has(kind), true, `${kind} should replay into the webview`);
+    }
+    assert.equal(runtimeEvents.find((message) => message.kind === 'route_feedback_summary').event.feedback_count, 2);
+    assert.equal(runtimeEvents.find((message) => message.kind === 'benchmark_run').event.run.summary.total_tasks, 1);
+    assert.equal(runtimeEvents.find((message) => message.kind === 'worker_spawn').event.worker.process.pid, 123);
+    assert.equal(runtimeEvents.find((message) => message.kind === 'worker_supervisor_tick').event.tick.active_workers, 1);
     assert.equal(posted.find((message) => message.type === 'recoverySuggestion').failureClass, 'trust_gate');
     assert.equal(posted.find((message) => message.type === 'permissionRequest').requiredMode, 'workspace-write');
     assert.equal(posted.at(-1).type, 'assistantDone');
-    assert.equal(records[0].resumeTarget, 'sess-replay');
-    assert.equal(records[0].messages.at(-1).text, 'Hello world');
+    assert.equal(records[0].resumeTarget, 'golden-session');
+    assert.equal(records[0].messages.at(-1).text, 'Golden replay');
     assert.equal(records[0].recoveryEvidence[0].failureClass, 'trust_gate');
     assert.equal(outputLines.length, 0);
   } finally {
     Module._load = oldLoad;
   }
 });
-
 test('task board surfaces worker supervisor state', () => {
   assert.match(chatPanelSource, /workerSupervisor:\s*null/);
+  assert.match(chatPanelSource, /selectedWorkerId:\s*null/);
   assert.match(chatPanelSource, /function rememberTaskBoardWorkerSupervisor\(tick\)/);
   assert.match(chatPanelSource, /function renderTaskBoardWorkerSupervisor\(\)/);
+  assert.match(chatPanelSource, /function renderTaskBoardWorkerDetail\(worker\)/);
+  assert.match(chatPanelSource, /task-board-worker-detail-grid/);
+  assert.match(chatPanelSource, /data-worker-id/);
+  assert.match(chatPanelSource, /worker\.process/);
+  assert.match(chatPanelSource, /worker\.isolation/);
+  assert.match(chatPanelSource, /Worker Detail/);
   assert.match(chatPanelSource, /kind === 'worker_supervisor_tick'/);
   assert.match(chatPanelSource, /Live task status, worker health, active node, and recovery timeline/);
 });
@@ -495,11 +513,14 @@ test('stream protocol helpers behave as expected', async () => {
     ['task_scheduler_queue', '{"type":"task_scheduler_queue","queue":[{"task_id":"task-1","status":"pending","task_status":"created"}],"protocol_version":1}'],
     ['task_scheduler_daemon_run', '{"type":"task_scheduler_daemon_run","runs":[],"state":null,"protocol_version":1}'],
     ['task_scheduler_daemon_status', '{"type":"task_scheduler_daemon_status","state":null,"state_path":"/tmp/state.json","events_path":"/tmp/events.jsonl","protocol_version":1}'],
+    ['route_feedback_summary', '{"type":"route_feedback_summary","summaries":[],"feedback_count":0,"feedback_path":"/tmp/feedback.json","protocol_version":1}'],
     ['benchmark_suite', '{"type":"benchmark_suite","suite_id":"complex-coding-agent-v1","version":"2026.05","tasks":[],"protocol_version":1}'],
     ['benchmark_task', '{"type":"benchmark_task","task":{"id":"task-1","title":"Task"},"protocol_version":1}'],
     ['benchmark_run', '{"type":"benchmark_run","run":{"summary":{"total_tasks":10}},"protocol_version":1}'],
     ['worker_list', '{"type":"worker_list","workers":[],"protocol_version":1}'],
     ['worker_create', '{"type":"worker_create","worker":{"worker_id":"worker-1","status":"spawning"},"protocol_version":1}'],
+    ['worker_spawn', '{"type":"worker_spawn","worker":{"worker_id":"worker-1","status":"running","process":{"pid":123,"command":["sh","-c","exit 0"],"started_at":123}},"protocol_version":1}'],
+    ['worker_probe', '{"type":"worker_probe","worker":{"worker_id":"worker-1","status":"finished"},"protocol_version":1}'],
     ['worker_observe', '{"type":"worker_observe","worker":{"worker_id":"worker-1","status":"ready_for_prompt"},"protocol_version":1}'],
     ['worker_ready', '{"type":"worker_ready","ready":{"worker_id":"worker-1","ready":true},"protocol_version":1}'],
     ['worker_resolve_trust', '{"type":"worker_resolve_trust","worker":{"worker_id":"worker-1","status":"ready_for_prompt"},"protocol_version":1}'],
@@ -547,11 +568,14 @@ test('stream protocol helpers behave as expected', async () => {
     '{"type":"task_scheduler_queue","tick":{},"protocol_version":1}',
     '{"type":"task_scheduler_daemon_run","state":null,"protocol_version":1}',
     '{"type":"task_scheduler_daemon_status","state":null,"protocol_version":1}',
+    '{"type":"route_feedback_summary","feedback_count":0,"protocol_version":1}',
     '{"type":"benchmark_suite","suite_id":"complex-coding-agent-v1","version":"2026.05","protocol_version":1}',
     '{"type":"benchmark_task","tasks":[],"protocol_version":1}',
     '{"type":"benchmark_run","summary":{},"protocol_version":1}',
     '{"type":"worker_list","worker":{},"protocol_version":1}',
     '{"type":"worker_create","workers":[],"protocol_version":1}',
+    '{"type":"worker_spawn","workers":[],"protocol_version":1}',
+    '{"type":"worker_probe","workers":[],"protocol_version":1}',
     '{"type":"worker_ready","worker":{},"protocol_version":1}',
     '{"type":"worker_complete","workers":[],"protocol_version":1}',
     '{"type":"worker_supervisor_tick","workers":[],"protocol_version":1}',

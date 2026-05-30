@@ -40,11 +40,15 @@ export type KnownStreamEventType =
   | 'task_scheduler_queue'
   | 'task_scheduler_daemon_run'
   | 'task_scheduler_daemon_status'
+  | 'task_scheduler_daemon_logs'
+  | 'route_feedback_summary'
   | 'benchmark_suite'
   | 'benchmark_task'
   | 'benchmark_run'
   | 'worker_list'
   | 'worker_create'
+  | 'worker_spawn'
+  | 'worker_probe'
   | 'worker_observe'
   | 'worker_ready'
   | 'worker_resolve_trust'
@@ -409,11 +413,15 @@ export const KNOWN_STREAM_EVENT_TYPES: readonly KnownStreamEventType[] = [
   'task_scheduler_queue',
   'task_scheduler_daemon_run',
   'task_scheduler_daemon_status',
+  'task_scheduler_daemon_logs',
+  'route_feedback_summary',
   'benchmark_suite',
   'benchmark_task',
   'benchmark_run',
   'worker_list',
   'worker_create',
+  'worker_spawn',
+  'worker_probe',
   'worker_observe',
   'worker_ready',
   'worker_resolve_trust',
@@ -594,6 +602,10 @@ function validateStreamEventShape(event: Record<string, unknown>): boolean {
       return hasArray(event, 'runs') && ('state' in event);
     case 'task_scheduler_daemon_status':
       return 'state' in event && hasString(event, 'state_path') && hasString(event, 'events_path');
+    case 'task_scheduler_daemon_logs':
+      return hasArray(event, 'events') && hasString(event, 'events_path');
+    case 'route_feedback_summary':
+      return hasArray(event, 'summaries') && hasNumber(event, 'feedback_count');
     case 'benchmark_suite':
       return hasString(event, 'suite_id') && hasString(event, 'version') && hasArray(event, 'tasks');
     case 'benchmark_task':
@@ -603,6 +615,8 @@ function validateStreamEventShape(event: Record<string, unknown>): boolean {
     case 'worker_list':
       return hasArray(event, 'workers');
     case 'worker_create':
+    case 'worker_spawn':
+    case 'worker_probe':
     case 'worker_observe':
     case 'worker_resolve_trust':
     case 'worker_prompt':
