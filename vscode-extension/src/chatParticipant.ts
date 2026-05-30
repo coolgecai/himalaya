@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { extractReferencePathCandidate, prepareAttachmentDescriptors } from './attachmentPaths';
 import { HimalayaCli } from './cli';
 import { readModelRoute, ModelRouteState } from './modelRoute';
+import { DEFAULT_PERMISSION_MODE, normalizePermissionMode } from './permissionPolicy';
 
 export function registerHimalayaChatParticipant(
   context: vscode.ExtensionContext,
@@ -148,7 +149,7 @@ function buildPromptArgs(
   const args: string[] = [];
 
   const model = route?.model?.trim() || config.get<string>('defaultModel', 'sonnet');
-  const permissionMode = config.get<string>('defaultPermissionMode', 'read-only');
+  const permissionMode = normalizePermissionMode(config.get<string>('defaultPermissionMode', DEFAULT_PERMISSION_MODE));
 
   if (model) {
     args.push('--model', model);

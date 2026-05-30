@@ -22,6 +22,7 @@ export type KnownStreamEventType =
   | 'recovery_event'
   | 'recovery_action_event'
   | 'task_execution_event'
+  | 'local_command'
   | 'recovery_suggestion'
   | 'task_list'
   | 'task_show'
@@ -37,6 +38,8 @@ export type KnownStreamEventType =
   | 'task_packet_status'
   | 'task_scheduler_tick'
   | 'task_scheduler_queue'
+  | 'task_scheduler_daemon_run'
+  | 'task_scheduler_daemon_status'
   | 'benchmark_suite'
   | 'benchmark_task'
   | 'benchmark_run'
@@ -46,6 +49,7 @@ export type KnownStreamEventType =
   | 'worker_ready'
   | 'worker_resolve_trust'
   | 'worker_prompt'
+  | 'worker_complete'
   | 'worker_restart'
   | 'worker_terminate'
   | 'worker_supervisor_tick'
@@ -366,7 +370,7 @@ export type ParsedStreamEvent =
   | { ok: true; event: StreamEvent }
   | { ok: false; reason: 'not-json' | 'invalid-shape' };
 
-const KNOWN_EVENT_TYPES: ReadonlySet<KnownStreamEventType> = new Set([
+export const KNOWN_STREAM_EVENT_TYPES: readonly KnownStreamEventType[] = [
   'text_delta',
   'tool_use',
   'tool_result',
@@ -387,6 +391,7 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownStreamEventType> = new Set([
   'recovery_event',
   'recovery_action_event',
   'task_execution_event',
+  'local_command',
   'recovery_suggestion',
   'task_list',
   'task_show',
@@ -402,6 +407,8 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownStreamEventType> = new Set([
   'task_packet_status',
   'task_scheduler_tick',
   'task_scheduler_queue',
+  'task_scheduler_daemon_run',
+  'task_scheduler_daemon_status',
   'benchmark_suite',
   'benchmark_task',
   'benchmark_run',
@@ -411,11 +418,14 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownStreamEventType> = new Set([
   'worker_ready',
   'worker_resolve_trust',
   'worker_prompt',
+  'worker_complete',
   'worker_restart',
   'worker_terminate',
   'worker_supervisor_tick',
   'error',
-]);
+];
+
+const KNOWN_EVENT_TYPES: ReadonlySet<KnownStreamEventType> = new Set(KNOWN_STREAM_EVENT_TYPES);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -550,6 +560,8 @@ function validateStreamEventShape(event: Record<string, unknown>): boolean {
       const outcome = event.task_execution_event as Record<string, unknown>;
       return hasString(outcome, 'task_id') && hasArray(outcome, 'steps') && hasBoolean(outcome, 'completed') && hasBoolean(outcome, 'blocked') && hasString(outcome, 'message');
     }
+    case 'local_command':
+      return hasString(event, 'command') && hasString(event, 'status') && hasString(event, 'summary');
     case 'recovery_suggestion':
       return hasString(event, 'source_event') && hasString(event, 'failure_class') && hasString(event, 'tool') && hasString(event, 'reason') && hasString(event, 'action') && hasString(event, 'suggestion');
     case 'task_list':
@@ -578,6 +590,10 @@ function validateStreamEventShape(event: Record<string, unknown>): boolean {
       return hasObject(event, 'tick');
     case 'task_scheduler_queue':
       return hasArray(event, 'queue');
+    case 'task_scheduler_daemon_run':
+      return hasArray(event, 'runs') && ('state' in event);
+    case 'task_scheduler_daemon_status':
+      return 'state' in event && hasString(event, 'state_path') && hasString(event, 'events_path');
     case 'benchmark_suite':
       return hasString(event, 'suite_id') && hasString(event, 'version') && hasArray(event, 'tasks');
     case 'benchmark_task':
@@ -590,6 +606,7 @@ function validateStreamEventShape(event: Record<string, unknown>): boolean {
     case 'worker_observe':
     case 'worker_resolve_trust':
     case 'worker_prompt':
+    case 'worker_complete':
     case 'worker_restart':
     case 'worker_terminate':
       return hasObject(event, 'worker');

@@ -189,7 +189,7 @@
         const dotClass = b === 'cloud' ? 'cloud' : b === 'ollama' ? 'local' : 'unknown';
         modelDot.className = 'dot ' + dotClass;
         modelLabel.textContent = state.model || 'No model';
-        permLabel.textContent = state.permissionMode || 'workspace-write';
+        permLabel.textContent = state.permissionMode || 'read-only';
         // Update perm pill color class
         if (permLabel) {
           permLabel.classList.remove('read-only', 'workspace-write', 'danger-full-access');

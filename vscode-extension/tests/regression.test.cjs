@@ -10,6 +10,8 @@ const chatPanelPath = path.join(root, 'src', 'chatPanel.ts');
 const chatParticipantPath = path.join(root, 'src', 'chatParticipant.ts');
 const extensionPath = path.join(root, 'src', 'extension.ts');
 const packageJsonPath = path.join(root, 'package.json');
+const streamJsonSchemaPath = path.resolve(root, '..', 'protocol', 'stream-json-v1.schema.json');
+const streamJsonSchema = JSON.parse(fs.readFileSync(streamJsonSchemaPath, 'utf8'));
 const historyPath = path.join(root, 'src', 'history.ts');
 const vscodeignorePath = path.join(root, '.vscodeignore');
 const vscodeignoreSource = fs.readFileSync(vscodeignorePath, 'utf8');
@@ -24,6 +26,7 @@ const chatPanelSource = fs.readFileSync(chatPanelPath, 'utf8');
 const chatParticipantSource = fs.readFileSync(chatParticipantPath, 'utf8');
 const extensionSource = fs.readFileSync(extensionPath, 'utf8');
 const historySource = fs.readFileSync(historyPath, 'utf8');
+const permissionPolicySource = fs.readFileSync(path.join(root, 'src', 'permissionPolicy.ts'), 'utf8');
 const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 
 test('default permission mode aligns with CLI read-only default', () => {
@@ -31,9 +34,12 @@ test('default permission mode aligns with CLI read-only default', () => {
   const permissionMode = props['himalayaCode.defaultPermissionMode'];
   assert.ok(permissionMode, 'missing defaultPermissionMode setting');
   assert.equal(permissionMode.default, 'read-only');
-  assert.match(extensionSource, /defaultPermissionMode:\s*config\.get<string>\('defaultPermissionMode',\s*'read-only'\)/);
-  assert.match(chatPanelSource, /defaultPermissionMode:\s*config\.get<string>\('defaultPermissionMode',\s*'read-only'\)/);
-  assert.match(chatPanelSource, /bootstrap\.config\?\.defaultPermissionMode \?\? 'read-only'/);
+  assert.deepEqual(permissionMode.enum, ['read-only', 'workspace-write', 'danger-full-access']);
+  assert.match(permissionPolicySource, /DEFAULT_PERMISSION_MODE:\s*PublicPermissionMode\s*=\s*'read-only'/);
+  assert.match(permissionPolicySource, /PUBLIC_PERMISSION_MODES:\s*readonly PublicPermissionMode\[\]/);
+  assert.match(extensionSource, /normalizePermissionMode\(config\.get<string>\('defaultPermissionMode',\s*DEFAULT_PERMISSION_MODE\)\)/);
+  assert.match(chatPanelSource, /normalizePermissionMode\(config\.get<string>\('defaultPermissionMode',\s*DEFAULT_PERMISSION_MODE\)\)/);
+  assert.match(chatPanelSource, /normalizePermissionMode\(options\.permissionMode \?\? bootstrap\.config\?\.defaultPermissionMode\)/);
 });
 
 test('VSIX packaging keeps runtime entrypoints includable', () => {
@@ -320,6 +326,7 @@ test('chat panel replays stream-json transcripts through webview messages', asyn
       { type: 'tool_result', id: 'toolu_1', name: 'read_file', output: 'ok', is_error: false, protocol_version: 1 },
       { type: 'decisioning_event', decisioning_event: { kind: 'safety_assessment', title: 'Safety', summary: 'Allowed', risk_score: 0, risk_level: 'low', action: 'allow' }, protocol_version: 1 },
       { type: 'plan_execution_event', plan_execution_event: { seq: 1, task_id: 'task-1', node_id: 'node-1', kind: 'node_started', status: 'running', message: 'started' }, protocol_version: 1 },
+      { type: 'worker_supervisor_tick', tick: { status: 'running', active_workers: 1, blocked_workers: 0, restarted_workers: 1, trust_queue: [], capacity: { max_workers: 4, active_workers: 1, available_slots: 3 }, workers: [{ worker_id: 'worker-1', status: 'spawning', restart_count: 1, max_restarts: 2 }], event_index: [{ worker_id: 'worker-1', event: { kind: 'restarted', detail: 'stale worker restarted' } }], message: 'worker supervisor has active work' }, protocol_version: 1 },
       { type: 'recovery_suggestion', source_event: 'permission_denial', failure_class: 'trust_gate', tool: 'write_file', reason: 'requires permission', action: 'retry_with_danger_full_access', suggestion: 'Retry with full access', protocol_version: 1 },
       { type: 'permission_request', tool: 'write_file', input: { path: 'generated.txt' }, current_mode: 'read-only', required_mode: 'workspace-write', reason: 'requires workspace-write', protocol_version: 1 },
       { type: 'text_delta', text: 'world', protocol_version: 1 },
@@ -373,6 +380,7 @@ test('chat panel replays stream-json transcripts through webview messages', asyn
     assert.equal(posted.find((message) => message.type === 'toolStep' && message.step === 'result').output, 'ok');
     assert.equal(posted.find((message) => message.type === 'decisioningEvent').event.kind, 'safety_assessment');
     assert.equal(posted.find((message) => message.type === 'runtimeEvent' && message.kind === 'plan_execution_event').event.kind, 'node_started');
+    assert.equal(posted.find((message) => message.type === 'runtimeEvent' && message.kind === 'worker_supervisor_tick').event.tick.restarted_workers, 1);
     assert.equal(posted.find((message) => message.type === 'recoverySuggestion').failureClass, 'trust_gate');
     assert.equal(posted.find((message) => message.type === 'permissionRequest').requiredMode, 'workspace-write');
     assert.equal(posted.at(-1).type, 'assistantDone');
@@ -385,6 +393,13 @@ test('chat panel replays stream-json transcripts through webview messages', asyn
   }
 });
 
+test('task board surfaces worker supervisor state', () => {
+  assert.match(chatPanelSource, /workerSupervisor:\s*null/);
+  assert.match(chatPanelSource, /function rememberTaskBoardWorkerSupervisor\(tick\)/);
+  assert.match(chatPanelSource, /function renderTaskBoardWorkerSupervisor\(\)/);
+  assert.match(chatPanelSource, /kind === 'worker_supervisor_tick'/);
+  assert.match(chatPanelSource, /Live task status, worker health, active node, and recovery timeline/);
+});
 test('assistant placeholder message is created before streaming chunks', () => {
   assert.match(chatPanelSource, /await this\.history\.appendMessage\(record\.id,\s*\{\s*role:\s*'assistant',\s*text:\s*''/s);
   assert.match(chatPanelSource, /createAssistantTailPersistence\(record\.id, \(\) => assistantText\)/);
@@ -422,11 +437,30 @@ test('permission policy helpers behave as expected', async () => {
 test('stream protocol helpers behave as expected', async () => {
   const {
     STREAM_PROTOCOL_VERSION,
+    KNOWN_STREAM_EVENT_TYPES,
     parseStreamEventLine,
     isKnownStreamEventType,
     readProtocolVersion,
     classifyProtocolVersion,
   } = require(streamProtocolPath);
+
+  assert.equal(streamJsonSchema.properties.protocol_version.const, STREAM_PROTOCOL_VERSION);
+  assert.deepEqual(streamJsonSchema.$defs.eventType.enum, KNOWN_STREAM_EVENT_TYPES);
+  const schemaBranchTypes = new Set();
+  for (const branch of streamJsonSchema.allOf[0].oneOf) {
+    const defName = branch.$ref.replace('#/$defs/', '');
+    const definition = streamJsonSchema.$defs[defName];
+    const typeSchema = definition.allOf[1].properties.type;
+    if (typeSchema.const) {
+      schemaBranchTypes.add(typeSchema.const);
+    }
+    if (typeSchema.enum) {
+      for (const type of typeSchema.enum) {
+        schemaBranchTypes.add(type);
+      }
+    }
+  }
+  assert.deepEqual([...schemaBranchTypes].sort(), [...KNOWN_STREAM_EVENT_TYPES].sort());
 
   const fixtures = [
     ['message_start', '{"type":"message_start","protocol_version":1}'],
@@ -451,6 +485,7 @@ test('stream protocol helpers behave as expected', async () => {
     ['recovery_event', '{"type":"recovery_event","recovery_event":{"recovery_attempted":{"scenario":"compile_red_cross_crate","recipe":{"scenario":"compile_red_cross_crate","steps":["clean_build"],"max_attempts":1,"escalation_policy":"alert_human"},"result":{"recovered":{"steps_taken":1}}}},"protocol_version":1}'],
     ['recovery_action_event', '{"type":"recovery_action_event","recovery_action_event":{"task_id":"task-1","results":[{"action":{"kind":"retry_node","scenario":"prompt_misdelivery","risk":"safe","node_id":"node-1","message":"retry"},"executed":true,"blocked":false,"reason":"scheduled"}]},"protocol_version":1}'],
     ['task_execution_event', '{"type":"task_execution_event","task_execution_event":{"task_id":"task-1","steps":[{"task_id":"task-1","node_id":"node-1","kind":"resume_node","message":"resumed"}],"completed":true,"blocked":false,"message":"done"},"protocol_version":1}'],
+    ['local_command', '{"type":"local_command","command":"workspace","status":"ok","summary":"workspace context loaded","protocol_version":1}'],
     ['task_execution', '{"type":"task_execution","outcome":{"task_id":"task-1","steps":[{"task_id":"task-1","node_id":"node-1","kind":"resume_node","message":"resumed"}],"completed":true,"blocked":false,"message":"done"},"protocol_version":1}'],
     ['task_recovery', '{"type":"task_recovery","execution":{"task_id":"task-1","results":[{"action":{"kind":"retry_node","scenario":"prompt_misdelivery","risk":"safe","node_id":"node-1","message":"retry"},"executed":true,"blocked":false,"reason":"scheduled"}]},"protocol_version":1}'],
     ['task_packet_create', '{"type":"task_packet_create","task":{"task_id":"task-1"},"ledger":[],"verification_handoff":{},"protocol_version":1}'],
@@ -458,6 +493,8 @@ test('stream protocol helpers behave as expected', async () => {
     ['task_packet_status', '{"type":"task_packet_status","task":{"task_id":"task-1"},"ledger":[],"verification_handoff":{},"protocol_version":1}'],
     ['task_scheduler_tick', '{"type":"task_scheduler_tick","tick":{"status":"blocked","selected_task_id":"task-1","queue":[]},"protocol_version":1}'],
     ['task_scheduler_queue', '{"type":"task_scheduler_queue","queue":[{"task_id":"task-1","status":"pending","task_status":"created"}],"protocol_version":1}'],
+    ['task_scheduler_daemon_run', '{"type":"task_scheduler_daemon_run","runs":[],"state":null,"protocol_version":1}'],
+    ['task_scheduler_daemon_status', '{"type":"task_scheduler_daemon_status","state":null,"state_path":"/tmp/state.json","events_path":"/tmp/events.jsonl","protocol_version":1}'],
     ['benchmark_suite', '{"type":"benchmark_suite","suite_id":"complex-coding-agent-v1","version":"2026.05","tasks":[],"protocol_version":1}'],
     ['benchmark_task', '{"type":"benchmark_task","task":{"id":"task-1","title":"Task"},"protocol_version":1}'],
     ['benchmark_run', '{"type":"benchmark_run","run":{"summary":{"total_tasks":10}},"protocol_version":1}'],
@@ -467,6 +504,7 @@ test('stream protocol helpers behave as expected', async () => {
     ['worker_ready', '{"type":"worker_ready","ready":{"worker_id":"worker-1","ready":true},"protocol_version":1}'],
     ['worker_resolve_trust', '{"type":"worker_resolve_trust","worker":{"worker_id":"worker-1","status":"ready_for_prompt"},"protocol_version":1}'],
     ['worker_prompt', '{"type":"worker_prompt","worker":{"worker_id":"worker-1","status":"prompt_accepted"},"protocol_version":1}'],
+    ['worker_complete', '{"type":"worker_complete","worker":{"worker_id":"worker-1","status":"finished"},"protocol_version":1}'],
     ['worker_restart', '{"type":"worker_restart","worker":{"worker_id":"worker-1","status":"spawning"},"protocol_version":1}'],
     ['worker_terminate', '{"type":"worker_terminate","worker":{"worker_id":"worker-1","status":"failed"},"protocol_version":1}'],
     ['worker_supervisor_tick', '{"type":"worker_supervisor_tick","tick":{"status":"running","active_workers":1},"protocol_version":1}'],
@@ -503,15 +541,19 @@ test('stream protocol helpers behave as expected', async () => {
     '{"type":"reasoning_step","reasoning_step":{"step_type":"redacted_thinking"},"protocol_version":1}',
     '{"type":"decisioning_event","decisioning_event":{"kind":"tool_selection","summary":"missing title"},"protocol_version":1}',
     '{"type":"plan_execution_event","plan_execution_event":{"seq":"1","task_id":"task-1","node_id":"node-1","kind":"node_started","status":"running"},"protocol_version":1}',
-    '{"type":"task_packet_status","task":{"task_id":"task-1"},"verification_handoff":{},"protocol_version":1}',
+    '{"type":"task_execution_event","task_execution_event":{"task_id":"task-1","steps":[],"completed":true,"blocked":false},"protocol_version":1}',
+    '{"type":"local_command","command":"workspace","summary":"missing status","protocol_version":1}',
     '{"type":"task_scheduler_tick","queue":[],"protocol_version":1}',
     '{"type":"task_scheduler_queue","tick":{},"protocol_version":1}',
+    '{"type":"task_scheduler_daemon_run","state":null,"protocol_version":1}',
+    '{"type":"task_scheduler_daemon_status","state":null,"protocol_version":1}',
     '{"type":"benchmark_suite","suite_id":"complex-coding-agent-v1","version":"2026.05","protocol_version":1}',
     '{"type":"benchmark_task","tasks":[],"protocol_version":1}',
     '{"type":"benchmark_run","summary":{},"protocol_version":1}',
     '{"type":"worker_list","worker":{},"protocol_version":1}',
     '{"type":"worker_create","workers":[],"protocol_version":1}',
     '{"type":"worker_ready","worker":{},"protocol_version":1}',
+    '{"type":"worker_complete","workers":[],"protocol_version":1}',
     '{"type":"worker_supervisor_tick","workers":[],"protocol_version":1}',
   ];
   for (const line of invalidKnownShapes) {
@@ -724,7 +766,7 @@ test('task board MVP renders task status, node, and recovery events', () => {
   assert.match(chatPanelSource, /function renderTaskBoardNode\(node\)/);
   assert.match(chatPanelSource, /function renderTaskBoardRecovery\(\)/);
   assert.match(chatPanelSource, /rememberTaskBoardRecovery\('recoverySuggestion', msg\)/);
-  assert.match(chatPanelSource, /Live task status, active node, and recovery timeline from stream events/);
+  assert.match(chatPanelSource, /Live task status, worker health, active node, and recovery timeline from stream events/);
 });
 
 

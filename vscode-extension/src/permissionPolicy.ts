@@ -1,3 +1,19 @@
+export type PublicPermissionMode = 'read-only' | 'workspace-write' | 'danger-full-access';
+
+export const DEFAULT_PERMISSION_MODE: PublicPermissionMode = 'read-only';
+export const DANGEROUS_PERMISSION_MODE: PublicPermissionMode = 'danger-full-access';
+export const PUBLIC_PERMISSION_MODES: readonly PublicPermissionMode[] = [
+  DEFAULT_PERMISSION_MODE,
+  'workspace-write',
+  DANGEROUS_PERMISSION_MODE,
+];
+
+export function normalizePermissionMode(value: string | undefined): PublicPermissionMode {
+  return PUBLIC_PERMISSION_MODES.includes(value as PublicPermissionMode)
+    ? value as PublicPermissionMode
+    : DEFAULT_PERMISSION_MODE;
+}
+
 export type DangerousPermissionConfirmationPolicy = 'always' | 'once-per-workspace' | 'never';
 
 export function normalizeDangerousPermissionConfirmationPolicy(

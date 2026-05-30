@@ -5,8 +5,12 @@ import { HimalayaCli, type HimalayaReplHandle } from './cli';
 import { ChatHistoryRecord, ChatHistorySnapshot, HimalayaHistoryStore, RecoveryEvidence } from './history';
 import { readModelRoute, writeModelRoute } from './modelRoute';
 import {
+  DANGEROUS_PERMISSION_MODE,
+  DEFAULT_PERMISSION_MODE,
+  PUBLIC_PERMISSION_MODES,
   buildWorkspaceDangerApprovalKey,
   normalizeDangerousPermissionConfirmationPolicy,
+  normalizePermissionMode,
   shouldAutoAllowDangerRun,
 } from './permissionPolicy';
 import {
@@ -567,10 +571,10 @@ export class HimalayaChatPanel {
           this.replCanReuse = false;
         }
         this.isStreamingPrompt = false;
-        this.output.appendLine(`[permission] user approved via ${source} — retrying with danger-full-access`);
+        this.output.appendLine(`[permission] user approved via ${source} — retrying with ${DANGEROUS_PERMISSION_MODE}`);
         void this.executePromptSubmission({
           ...capturedOptions,
-          permissionMode: 'danger-full-access',
+          permissionMode: DANGEROUS_PERMISSION_MODE,
         });
       }
     });
@@ -605,7 +609,7 @@ export class HimalayaChatPanel {
       this.host.webview.postMessage({ type: 'error', text: 'Prompt execution is blocked in this workspace.' });
       return;
     }
-    const permissionMode = input.permissionMode?.trim() || this.currentBootstrap.config.defaultPermissionMode;
+    const permissionMode = normalizePermissionMode(input.permissionMode?.trim() || this.currentBootstrap.config.defaultPermissionMode);
 
     let gateBlocked = false;
     await executeWithPermissionGate({
@@ -838,6 +842,16 @@ export class HimalayaChatPanel {
         case 'task_node_verification':
         case 'task_compacted':
         case 'task_cancelled':
+        case 'worker_list':
+        case 'worker_create':
+        case 'worker_observe':
+        case 'worker_ready':
+        case 'worker_resolve_trust':
+        case 'worker_prompt':
+        case 'worker_complete':
+        case 'worker_restart':
+        case 'worker_terminate':
+        case 'worker_supervisor_tick':
           this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event });
           break;
         case 'recovery_suggestion': {
@@ -1066,7 +1080,7 @@ export class HimalayaChatPanel {
     return workspaceRoots.every((root) => root === resolvedCwd || root.startsWith(resolvedCwd + path.sep));
   }
   private async confirmPermissionForRun(permissionMode: string, prompt: string): Promise<boolean> {
-    if (permissionMode !== 'danger-full-access') {
+    if (permissionMode !== DANGEROUS_PERMISSION_MODE) {
       return true;
     }
 
@@ -1075,7 +1089,7 @@ export class HimalayaChatPanel {
     const workspaceApproved = this.context.workspaceState.get<boolean>(workspaceKey, false) ?? false;
 
     if (shouldAutoAllowDangerRun(policy, workspaceApproved)) {
-      this.output.appendLine(`[permission-audit] mode=danger-full-access policy=${policy} decision=auto-allow`);
+      this.output.appendLine(`[permission-audit] mode=${DANGEROUS_PERMISSION_MODE} policy=${policy} decision=auto-allow`);
       return true;
     }
 
@@ -1085,19 +1099,19 @@ export class HimalayaChatPanel {
       : ['Run once', 'Cancel'] as const;
 
     const answer = await vscode.window.showWarningMessage(
-      `Run with danger-full-access? This may execute destructive actions.\n\nPrompt: ${preview}${prompt.length > 120 ? '…' : ''}`,
+      `Run with ${DANGEROUS_PERMISSION_MODE}? This may execute destructive actions.\n\nPrompt: ${preview}${prompt.length > 120 ? '…' : ''}`,
       { modal: true },
       ...actions
     );
 
     if (answer === 'Always for this workspace') {
       await this.context.workspaceState.update(workspaceKey, true);
-      this.output.appendLine(`[permission-audit] mode=danger-full-access policy=${policy} decision=allow-workspace workspace=${workspaceKey}`);
+      this.output.appendLine(`[permission-audit] mode=${DANGEROUS_PERMISSION_MODE} policy=${policy} decision=allow-workspace workspace=${workspaceKey}`);
       return true;
     }
 
     const allowed = answer === 'Run once';
-    this.output.appendLine(`[permission-audit] mode=danger-full-access policy=${policy} decision=${allowed ? 'allow-once' : 'deny'}`);
+    this.output.appendLine(`[permission-audit] mode=${DANGEROUS_PERMISSION_MODE} policy=${policy} decision=${allowed ? 'allow-once' : 'deny'}`);
 
     if (!allowed && policy === 'once-per-workspace') {
       await this.context.workspaceState.update(workspaceKey, false);
@@ -1136,7 +1150,7 @@ export class HimalayaChatPanel {
       title: `/${command}`,
       model,
       modelBackend,
-      permissionMode: this.currentOptions.permissionMode ?? this.currentBootstrap.config.defaultPermissionMode,
+      permissionMode: normalizePermissionMode(this.currentOptions.permissionMode ?? this.currentBootstrap.config.defaultPermissionMode),
       resumeTarget: this.currentOptions.resumeTarget,
       cwd: this.currentOptions.cwd
     });
@@ -1383,11 +1397,12 @@ export class HimalayaChatPanel {
     const defaultModel: string = bootstrap.config?.defaultModel ?? 'sonnet';
     const currentModel: string = (options.model ?? defaultModel).trim() || defaultModel;
     const currentBackend: string = options.modelBackend ?? bootstrap.config?.defaultModelBackend ?? 'auto';
-    const currentPermission: string = options.permissionMode ?? bootstrap.config?.defaultPermissionMode ?? 'read-only';
+    const currentPermission: string = normalizePermissionMode(options.permissionMode ?? bootstrap.config?.defaultPermissionMode);
     const resumeTarget: string = options.resumeTarget ?? '';
     const isTrusted: boolean = Boolean(bootstrap.trust);
     const historyJson = JSON.stringify(historyRecords).replace(/</g, '\\u003c');
     const localModelsJson = JSON.stringify(localModels).replace(/</g, '\\u003c');
+    const permissionModesJson = JSON.stringify(PUBLIC_PERMISSION_MODES).replace(/</g, '\\u003c');
     const stateJson = JSON.stringify({
       model: currentModel,
       modelBackend: currentBackend,
@@ -2128,14 +2143,17 @@ export class HimalayaChatPanel {
       margin-bottom: 6px;
     }
     .task-board-list,
-    .task-board-recovery-list {
+    .task-board-recovery-list,
+    .task-board-worker-list {
       display: flex;
       flex-direction: column;
       gap: 6px;
     }
     .task-board-task,
     .task-board-node,
-    .task-board-recovery-item {
+    .task-board-recovery-item,
+    .task-board-worker,
+    .task-board-supervisor {
       border: 1px solid rgba(255,255,255,0.07);
       border-radius: 8px;
       background: rgba(255,255,255,0.03);
@@ -2281,6 +2299,8 @@ export class HimalayaChatPanel {
     const INIT = ${stateJson};
     const HISTORY = ${historyJson};
     const LOCAL_MODELS = ${localModelsJson};
+    const DEFAULT_PERMISSION = ${JSON.stringify(DEFAULT_PERMISSION_MODE)};
+    const PERMISSION_MODES = ${permissionModesJson};
     const ACTIVE_RECORD = ((HISTORY || []).find(function(rec) { return rec.id === INIT.activeRecordId; }) || {});
 
     const state = {
@@ -2308,7 +2328,10 @@ export class HimalayaChatPanel {
         tasks: {},
         taskOrder: [],
         currentNode: null,
-        recoveryEvents: []
+        recoveryEvents: [],
+        workers: {},
+        workerOrder: [],
+        workerSupervisor: null
       },
       historyRecords: HISTORY
     };
@@ -2396,7 +2419,7 @@ export class HimalayaChatPanel {
         const dotClass = b === 'cloud' ? 'cloud' : b === 'ollama' ? 'local' : 'unknown';
         modelDot.className = 'dot ' + dotClass;
         modelLabel.textContent = state.model || 'No model';
-        permLabel.textContent = state.permissionMode || 'read-only';
+        permLabel.textContent = state.permissionMode || DEFAULT_PERMISSION;
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'updateModelBar failed: ' + String(e) }); } catch (_) {}
       }
@@ -3139,6 +3162,12 @@ export class HimalayaChatPanel {
         const task = value.task && typeof value.task === 'object' ? value.task : {};
         return ['Task cancelled', task.task_id].filter(Boolean).join(' · ') || 'Task cancelled';
       }
+      if (kind === 'worker_supervisor_tick') {
+        const tick = value.tick && typeof value.tick === 'object' ? value.tick : value;
+        const capacity = tick.capacity && typeof tick.capacity === 'object' ? tick.capacity : {};
+        const trustQueue = Array.isArray(tick.trust_queue) ? tick.trust_queue : [];
+        return ['Workers', tick.status, tick.active_workers !== undefined ? tick.active_workers + ' active' : undefined, tick.restarted_workers ? tick.restarted_workers + ' restarted' : undefined, capacity.available_slots !== undefined ? capacity.available_slots + ' slots free' : undefined, trustQueue.length ? trustQueue.length + ' trust blocked' : undefined].filter(Boolean).join(' · ') || 'Worker supervisor updated';
+      }
       return event && typeof event === 'object' ? JSON.stringify(event) : String(event || '');
     }
     function taskBoardInitialState() {
@@ -3146,7 +3175,10 @@ export class HimalayaChatPanel {
         tasks: {},
         taskOrder: [],
         currentNode: null,
-        recoveryEvents: []
+        recoveryEvents: [],
+        workers: {},
+        workerOrder: [],
+        workerSupervisor: null
       };
     }
 
@@ -3170,6 +3202,32 @@ export class HimalayaChatPanel {
         state.taskBoard.taskOrder.unshift(taskId);
       }
     }
+
+    function rememberTaskBoardWorker(worker) {
+      if (!worker || typeof worker !== 'object') { return; }
+      const workerId = String(worker.worker_id || worker.id || '').trim();
+      if (!workerId) { return; }
+      const previous = state.taskBoard.workers[workerId] || {};
+      const patch = {};
+      Object.keys(worker).forEach(function(key) {
+        if (worker[key] !== undefined && worker[key] !== null && worker[key] !== '') {
+          patch[key] = worker[key];
+        }
+      });
+      state.taskBoard.workers[workerId] = Object.assign({}, previous, patch, { worker_id: workerId });
+      if (state.taskBoard.workerOrder.indexOf(workerId) < 0) {
+        state.taskBoard.workerOrder.unshift(workerId);
+      }
+    }
+
+    function rememberTaskBoardWorkerSupervisor(tick) {
+      if (!tick || typeof tick !== 'object') { return; }
+      state.taskBoard.workerSupervisor = tick;
+      if (Array.isArray(tick.workers)) {
+        tick.workers.forEach(function(worker) { rememberTaskBoardWorker(worker); });
+      }
+    }
+
 
     function rememberTaskBoardRecovery(kind, event) {
       const summary = kind === 'recoverySuggestion'
@@ -3261,6 +3319,15 @@ export class HimalayaChatPanel {
         } else if (kind === 'task_cancelled') {
           const task = value.task && typeof value.task === 'object' ? value.task : value;
           if (task.task_id) { rememberTaskBoardTask(Object.assign({}, task, { status: 'cancelled' })); }
+        } else if (kind === 'worker_list' && Array.isArray(value.workers)) {
+          value.workers.forEach(function(worker) { rememberTaskBoardWorker(worker); });
+        } else if (kind === 'worker_create' || kind === 'worker_observe' || kind === 'worker_resolve_trust' || kind === 'worker_prompt' || kind === 'worker_complete' || kind === 'worker_restart' || kind === 'worker_terminate') {
+          if (value.worker && typeof value.worker === 'object') { rememberTaskBoardWorker(value.worker); }
+        } else if (kind === 'worker_ready') {
+          if (value.ready && typeof value.ready === 'object') { rememberTaskBoardWorker(value.ready); }
+        } else if (kind === 'worker_supervisor_tick') {
+          const tick = value.tick && typeof value.tick === 'object' ? value.tick : value;
+          rememberTaskBoardWorkerSupervisor(tick);
         }
         if (kind === 'recovery_event' || kind === 'recovery_action_event' || kind === 'task_recovery') {
           rememberTaskBoardRecovery(kind, value);
@@ -3299,6 +3366,55 @@ export class HimalayaChatPanel {
       '</div>';
     }
 
+    function renderTaskBoardWorker(worker) {
+      const workerId = String(worker.worker_id || 'worker');
+      const status = String(worker.status || (worker.ready ? 'ready_for_prompt' : 'unknown'));
+      const lease = worker.lease_expires_at ? 'lease ' + worker.lease_expires_at : undefined;
+      const restarts = worker.restart_count !== undefined ? 'restarts ' + worker.restart_count + '/' + (worker.max_restarts !== undefined ? worker.max_restarts : '?') : undefined;
+      const replay = worker.replay_prompt || worker.replay_prompt_ready ? 'replay armed' : undefined;
+      const meta = [workerId, lease, restarts, replay].filter(Boolean).join(' · ');
+      return '<div class="task-board-worker" data-worker-id="' + esc(workerId) + '">' +
+        '<div class="task-board-task-head"><div class="task-board-task-title" title="' + esc(workerId) + '">' + esc(workerId) + '</div>' +
+        '<span class="task-board-status status-' + esc(sanitizeDecisioningClassToken(status)) + '">' + esc(status) + '</span></div>' +
+        '<div class="task-board-meta">' + esc(meta || workerId) + '</div>' +
+      '</div>';
+    }
+
+    function renderTaskBoardWorkerSupervisor() {
+      const tick = state.taskBoard.workerSupervisor;
+      const workers = state.taskBoard.workerOrder
+        .map(function(workerId) { return state.taskBoard.workers[workerId]; })
+        .filter(Boolean)
+        .slice(0, 4);
+      if (!tick && !workers.length) {
+        return '<div class="task-board-empty">No worker events yet.</div>';
+      }
+      const status = tick ? String(tick.status || 'unknown') : 'unknown';
+      const capacity = tick && tick.capacity && typeof tick.capacity === 'object' ? tick.capacity : {};
+      const trustQueue = tick && Array.isArray(tick.trust_queue) ? tick.trust_queue : [];
+      const eventIndex = tick && Array.isArray(tick.event_index) ? tick.event_index.slice(0, 3) : [];
+      const meta = tick ? [
+        tick.active_workers !== undefined ? tick.active_workers + ' active' : undefined,
+        tick.blocked_workers !== undefined ? tick.blocked_workers + ' blocked' : undefined,
+        tick.restarted_workers !== undefined ? tick.restarted_workers + ' restarted' : undefined,
+        capacity.available_slots !== undefined ? capacity.available_slots + '/' + capacity.max_workers + ' slots free' : undefined,
+        trustQueue.length ? 'trust: ' + trustQueue.join(', ') : undefined
+      ].filter(Boolean).join(' · ') : '';
+      const events = eventIndex.map(function(entry) {
+        const event = entry && entry.event && typeof entry.event === 'object' ? entry.event : {};
+        return '<div class="task-board-meta">' + esc([entry.worker_id, event.kind, event.detail].filter(Boolean).join(' · ')) + '</div>';
+      }).join('');
+      return '<div class="task-board-supervisor">' +
+        '<div class="task-board-task-head"><div class="task-board-task-title">Worker supervisor</div>' +
+        '<span class="task-board-status status-' + esc(sanitizeDecisioningClassToken(status)) + '">' + esc(status) + '</span></div>' +
+        (meta ? '<div class="task-board-meta">' + esc(meta) + '</div>' : '') +
+        (tick && tick.message ? '<div class="task-board-meta">' + esc(String(tick.message)) + '</div>' : '') +
+        (events ? '<div style="margin-top:6px">' + events + '</div>' : '') +
+      '</div>' +
+      (workers.length ? '<div class="task-board-worker-list" style="margin-top:6px">' + workers.map(renderTaskBoardWorker).join('') + '</div>' : '');
+    }
+
+
     function renderTaskBoardRecovery() {
       const events = state.taskBoard.recoveryEvents || [];
       if (!events.length) {
@@ -3316,7 +3432,11 @@ export class HimalayaChatPanel {
           .map(function(taskId) { return state.taskBoard.tasks[taskId]; })
           .filter(Boolean)
           .slice(0, 5);
-        const hasBoardState = tasks.length > 0 || state.taskBoard.currentNode || state.taskBoard.recoveryEvents.length > 0;
+        const workers = state.taskBoard.workerOrder
+          .map(function(workerId) { return state.taskBoard.workers[workerId]; })
+          .filter(Boolean);
+        const hasWorkerState = workers.length > 0 || state.taskBoard.workerSupervisor;
+        const hasBoardState = tasks.length > 0 || state.taskBoard.currentNode || state.taskBoard.recoveryEvents.length > 0 || hasWorkerState;
         if (!hasBoardState) {
           taskBoardSurface.hidden = true;
           taskBoardSurface.innerHTML = '';
@@ -3324,13 +3444,14 @@ export class HimalayaChatPanel {
         }
         taskBoardSurface.hidden = false;
         taskBoardSurface.innerHTML = '<div class="task-board-header">' +
-          '<div><div class="task-board-title">Task Board</div><div class="task-board-subtitle">Live task status, active node, and recovery timeline from stream events.</div></div>' +
-          '<div class="decisioning-badges">' + renderDecisioningSummaryBadge(tasks.length + ' task(s)', 'demo') + '</div>' +
+          '<div><div class="task-board-title">Task Board</div><div class="task-board-subtitle">Live task status, worker health, active node, and recovery timeline from stream events.</div></div>' +
+          '<div class="decisioning-badges">' + renderDecisioningSummaryBadge(tasks.length + ' task(s)', 'demo') + (hasWorkerState ? renderDecisioningSummaryBadge(workers.length + ' worker(s)', 'demo') : '') + '</div>' +
         '</div>' +
         '<div class="task-board-grid">' +
           '<div class="task-board-panel"><div class="task-board-panel-title">Tasks</div><div class="task-board-list">' +
             (tasks.length ? tasks.map(renderTaskBoardTask).join('') : '<div class="task-board-empty">No tasks yet.</div>') +
           '</div></div>' +
+          '<div class="task-board-panel"><div class="task-board-panel-title">Workers</div>' + renderTaskBoardWorkerSupervisor() + '</div>' +
           '<div class="task-board-panel"><div class="task-board-panel-title">Current Node</div>' + renderTaskBoardNode(state.taskBoard.currentNode) + '<div class="task-board-panel-title" style="margin-top:8px;">Recovery</div>' + renderTaskBoardRecovery() + '</div>' +
         '</div>';
       } catch (e) {
@@ -3463,7 +3584,7 @@ export class HimalayaChatPanel {
     if (btnPermEl) {
       btnPermEl.addEventListener('click', function() {
         try {
-          const modes = ['read-only', 'workspace-write', 'danger-full-access'];
+          const modes = PERMISSION_MODES;
           const idx = modes.indexOf(state.permissionMode);
           state.permissionMode = modes[(idx + 1) % modes.length];
           updateModelBar();
@@ -4146,7 +4267,7 @@ function createFallbackBootstrap(): ChatBootstrap {
     trust: vscode.workspace.isTrusted || config.get<boolean>('allowUntrustedRuns', false),
     config: {
       defaultModel: config.get<string>('defaultModel', 'sonnet'),
-      defaultPermissionMode: config.get<string>('defaultPermissionMode', 'read-only'),
+      defaultPermissionMode: normalizePermissionMode(config.get<string>('defaultPermissionMode', DEFAULT_PERMISSION_MODE)),
       defaultModelBackend: config.get<string>('defaultModelBackend', 'auto'),
       ollamaBaseUrl: config.get<string>('ollamaBaseUrl', 'http://127.0.0.1:11434/v1'),
       allowUntrustedRuns: config.get<boolean>('allowUntrustedRuns', false),

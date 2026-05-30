@@ -1,3 +1,5 @@
+import { DANGEROUS_PERMISSION_MODE } from './permissionPolicy';
+
 export type ExecutionGateResult = 'allowed' | 'cancelled';
 
 export interface ExecutionGateOptions {
@@ -9,7 +11,7 @@ export interface ExecutionGateOptions {
 export async function executeWithPermissionGate(
   options: ExecutionGateOptions,
 ): Promise<ExecutionGateResult> {
-  if (options.permissionMode === 'danger-full-access') {
+  if (options.permissionMode === DANGEROUS_PERMISSION_MODE) {
     const approved = await options.confirmDangerousRun();
     if (!approved) {
       return 'cancelled';

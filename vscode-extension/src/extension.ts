@@ -5,6 +5,7 @@ import { HimalayaSidebarChatViewProvider, HimalayaSidebarViewProvider, ChatBoots
 import { readModelRoute, writeModelRoute } from './modelRoute';
 import { HimalayaSessionTreeProvider, SessionFileNode } from './sessionTree';
 import { registerHimalayaChatParticipant } from './chatParticipant';
+import { DEFAULT_PERMISSION_MODE, normalizePermissionMode } from './permissionPolicy';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel('Himalaya');
@@ -26,7 +27,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       trust: vscode.workspace.isTrusted || config.get<boolean>('allowUntrustedRuns', false),
       config: {
         defaultModel: config.get<string>('defaultModel', 'sonnet'),
-        defaultPermissionMode: config.get<string>('defaultPermissionMode', 'read-only'),
+        defaultPermissionMode: normalizePermissionMode(config.get<string>('defaultPermissionMode', DEFAULT_PERMISSION_MODE)),
         dangerousPermissionConfirmationPolicy: config.get<string>('dangerousPermissionConfirmationPolicy', 'always'),
         defaultModelBackend: config.get<string>('defaultModelBackend', 'auto'),
         ollamaBaseUrl: config.get<string>('ollamaBaseUrl', 'http://127.0.0.1:11434/v1'),
