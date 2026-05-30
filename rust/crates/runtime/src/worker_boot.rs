@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,6 +84,9 @@ pub enum WorkerEventKind {
     Running,
     Heartbeat,
     LeaseExpired,
+    WorktreeCreated,
+    ProcessStarted,
+    ProcessExited,
     Restarted,
     Finished,
     Failed,
@@ -135,6 +139,31 @@ pub struct WorkerEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerIsolationKind {
+    GitWorktree,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerIsolation {
+    pub kind: WorkerIsolationKind,
+    pub source_cwd: String,
+    pub worktree_path: String,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerProcess {
+    pub pid: u32,
+    pub command: Vec<String>,
+    pub started_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exited_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Worker {
     pub worker_id: String,
     pub cwd: String,
@@ -147,6 +176,10 @@ pub struct Worker {
     pub last_prompt: Option<String>,
     pub replay_prompt: Option<String>,
     pub last_error: Option<WorkerFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<WorkerProcess>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<WorkerIsolation>,
     #[serde(default)]
     pub heartbeat_at: u64,
     #[serde(default)]
@@ -180,6 +213,51 @@ const fn default_worker_max_restarts() -> u32 {
 #[derive(Debug, Clone, Default)]
 pub struct WorkerRegistry {
     inner: Arc<Mutex<WorkerRegistryInner>>,
+}
+
+#[derive(Debug)]
+pub struct WorkerProcessHandle {
+    pub worker: Worker,
+    pub child: Child,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerIsolationSpec {
+    GitWorktree { root: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerProcessSpec {
+    pub command: Vec<String>,
+    pub cwd: PathBuf,
+    pub trusted_roots: Vec<String>,
+    pub auto_recover_prompt_misdelivery: bool,
+    pub isolation: Option<WorkerIsolationSpec>,
+}
+
+impl WorkerProcessSpec {
+    #[must_use]
+    pub fn new(command: Vec<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            command,
+            cwd: cwd.into(),
+            trusted_roots: Vec::new(),
+            auto_recover_prompt_misdelivery: true,
+            isolation: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_trusted_roots(mut self, trusted_roots: Vec<String>) -> Self {
+        self.trusted_roots = trusted_roots;
+        self
+    }
+
+    #[must_use]
+    pub fn with_isolation(mut self, isolation: WorkerIsolationSpec) -> Self {
+        self.isolation = Some(isolation);
+        self
+    }
 }
 
 #[derive(Debug, Default)]
@@ -220,6 +298,8 @@ impl WorkerRegistry {
             last_prompt: None,
             replay_prompt: None,
             last_error: None,
+            process: None,
+            isolation: None,
             heartbeat_at: ts,
             lease_expires_at: ts + DEFAULT_WORKER_LEASE_SECS,
             restart_count: 0,
@@ -240,10 +320,176 @@ impl WorkerRegistry {
         worker
     }
 
+    pub fn spawn_process(&self, spec: WorkerProcessSpec) -> io::Result<WorkerProcessHandle> {
+        if spec.command.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker process command cannot be empty",
+            ));
+        }
+        let (effective_cwd, isolation) =
+            prepare_worker_isolation(&spec.cwd, spec.isolation.as_ref())?;
+        let mut command = Command::new(&spec.command[0]);
+        command
+            .args(&spec.command[1..])
+            .current_dir(&effective_cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                cleanup_worker_isolation(isolation.as_ref());
+                return Err(error);
+            }
+        };
+        let pid = child.id();
+        let ts = now_secs();
+        let mut trusted_roots = spec.trusted_roots.clone();
+        if isolation.is_some() {
+            trusted_roots.push(effective_cwd.to_string_lossy().to_string());
+        }
+        let mut worker = self.create(
+            &effective_cwd.to_string_lossy(),
+            &trusted_roots,
+            spec.auto_recover_prompt_misdelivery,
+        );
+        {
+            let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+            let stored = inner
+                .workers
+                .get_mut(&worker.worker_id)
+                .expect("created worker should be stored");
+            stored.process = Some(WorkerProcess {
+                pid,
+                command: spec.command.clone(),
+                started_at: ts,
+                exited_at: None,
+                exit_status: None,
+            });
+            stored.isolation = isolation;
+            stored.trust_gate_cleared = true;
+            refresh_worker_lease(stored, ts, DEFAULT_WORKER_LEASE_SECS);
+            if stored.isolation.is_some() {
+                push_event(
+                    stored,
+                    WorkerEventKind::WorktreeCreated,
+                    WorkerStatus::Spawning,
+                    Some("worker isolated in git worktree".to_string()),
+                    None,
+                );
+            }
+            push_event(
+                stored,
+                WorkerEventKind::ProcessStarted,
+                WorkerStatus::Running,
+                Some(format!("worker process started with pid {pid}")),
+                None,
+            );
+            worker = stored.clone();
+        }
+        Ok(WorkerProcessHandle { worker, child })
+    }
+
     #[must_use]
     pub fn get(&self, worker_id: &str) -> Option<Worker> {
         let inner = self.inner.lock().expect("worker registry lock poisoned");
         inner.workers.get(worker_id).cloned()
+    }
+
+    pub fn observe_process(&self, worker_id: &str, child: &mut Child) -> io::Result<Worker> {
+        match child.try_wait()? {
+            Some(status) => self
+                .record_process_exit(worker_id, status.code())
+                .map_err(io::Error::other),
+            None => self
+                .heartbeat(worker_id, DEFAULT_WORKER_LEASE_SECS)
+                .map_err(io::Error::other),
+        }
+    }
+
+    pub fn probe_process(&self, worker_id: &str) -> Result<Worker, String> {
+        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let worker = inner
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| format!("worker not found: {worker_id}"))?;
+        let Some(process) = worker.process.as_ref() else {
+            return Err(format!("worker {worker_id} has no process backend"));
+        };
+        if process.exited_at.is_some() {
+            return Ok(worker.clone());
+        }
+        let pid = process.pid;
+        if process_is_alive(pid) {
+            refresh_worker_lease(worker, now_secs(), DEFAULT_WORKER_LEASE_SECS);
+            push_event(
+                worker,
+                WorkerEventKind::Heartbeat,
+                worker.status,
+                Some(format!("worker process {pid} is alive")),
+                None,
+            );
+            return Ok(worker.clone());
+        }
+        if let Some(process) = worker.process.as_mut() {
+            process.exited_at = Some(now_secs());
+        }
+        worker.status = WorkerStatus::Finished;
+        worker.prompt_in_flight = false;
+        push_event(
+            worker,
+            WorkerEventKind::ProcessExited,
+            WorkerStatus::Finished,
+            Some("worker process is no longer running".to_string()),
+            None,
+        );
+        Ok(worker.clone())
+    }
+
+    pub fn record_process_exit(
+        &self,
+        worker_id: &str,
+        exit_status: Option<i32>,
+    ) -> Result<Worker, String> {
+        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let worker = inner
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| format!("worker not found: {worker_id}"))?;
+        let Some(process) = worker.process.as_mut() else {
+            return Err(format!("worker {worker_id} has no process backend"));
+        };
+        let ts = now_secs();
+        process.exited_at = Some(ts);
+        process.exit_status = exit_status;
+        worker.prompt_in_flight = false;
+        if exit_status == Some(0) {
+            worker.status = WorkerStatus::Finished;
+            worker.last_error = None;
+            push_event(
+                worker,
+                WorkerEventKind::ProcessExited,
+                WorkerStatus::Finished,
+                Some("worker process exited successfully".to_string()),
+                None,
+            );
+        } else {
+            worker.status = WorkerStatus::Failed;
+            worker.last_error = Some(WorkerFailure {
+                kind: WorkerFailureKind::Provider,
+                message: format!("worker process exited with status {exit_status:?}"),
+                created_at: ts,
+            });
+            push_event(
+                worker,
+                WorkerEventKind::ProcessExited,
+                WorkerStatus::Failed,
+                Some("worker process exited unsuccessfully".to_string()),
+                None,
+            );
+        }
+        Ok(worker.clone())
     }
 
     #[must_use]
@@ -680,6 +926,87 @@ pub struct WorkerReadySnapshot {
     pub last_error: Option<WorkerFailure>,
 }
 
+fn prepare_worker_isolation(
+    source_cwd: &Path,
+    isolation: Option<&WorkerIsolationSpec>,
+) -> io::Result<(PathBuf, Option<WorkerIsolation>)> {
+    match isolation {
+        None => Ok((source_cwd.to_path_buf(), None)),
+        Some(WorkerIsolationSpec::GitWorktree { root }) => {
+            create_git_worktree_isolation(source_cwd, root)
+        }
+    }
+}
+
+fn create_git_worktree_isolation(
+    source_cwd: &Path,
+    root: &Path,
+) -> io::Result<(PathBuf, Option<WorkerIsolation>)> {
+    let check = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(source_cwd)
+        .output()?;
+    if !check.status.success() || String::from_utf8_lossy(&check.stdout).trim() != "true" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker worktree isolation requires a git work tree",
+        ));
+    }
+
+    let root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        source_cwd.join(root)
+    };
+    fs::create_dir_all(&root)?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let worktree_path = root.join(format!("worker-worktree-{}-{suffix}", std::process::id()));
+    let output = Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "--detach",
+            worktree_path.to_string_lossy().as_ref(),
+            "HEAD",
+        ])
+        .current_dir(source_cwd)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to create worker git worktree: {stderr}"),
+        ));
+    }
+
+    Ok((
+        worktree_path.clone(),
+        Some(WorkerIsolation {
+            kind: WorkerIsolationKind::GitWorktree,
+            source_cwd: source_cwd.to_string_lossy().to_string(),
+            worktree_path: worktree_path.to_string_lossy().to_string(),
+            created_at: now_secs(),
+        }),
+    ))
+}
+
+fn cleanup_worker_isolation(isolation: Option<&WorkerIsolation>) {
+    let Some(isolation) = isolation else {
+        return;
+    };
+    match isolation.kind {
+        WorkerIsolationKind::GitWorktree => {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force", &isolation.worktree_path])
+                .current_dir(&isolation.source_cwd)
+                .output();
+        }
+    }
+}
+
 fn normalize_loaded_worker(mut worker: Worker) -> Worker {
     if worker.heartbeat_at == 0 {
         worker.heartbeat_at = worker.updated_at.max(worker.created_at);
@@ -815,6 +1142,8 @@ fn emit_state_file(worker: &Worker) {
         restart_count: u32,
         max_restarts: u32,
         last_restart_at: Option<u64>,
+        process: Option<&'a WorkerProcess>,
+        isolation: Option<&'a WorkerIsolation>,
         updated_at: u64,
         /// Seconds since last state transition. Himalayahip uses this to detect
         /// stalled workers without computing epoch deltas.
@@ -834,6 +1163,8 @@ fn emit_state_file(worker: &Worker) {
         restart_count: worker.restart_count,
         max_restarts: worker.max_restarts,
         last_restart_at: worker.last_restart_at,
+        process: worker.process.as_ref(),
+        isolation: worker.isolation.as_ref(),
         updated_at: worker.updated_at,
         seconds_since_update: now.saturating_sub(worker.updated_at),
     };
@@ -842,6 +1173,23 @@ fn emit_state_file(worker: &Worker) {
         let _ = std::fs::write(&tmp_path, json);
         let _ = std::fs::rename(&tmp_path, &state_path);
     }
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    process_is_alive_impl(pid)
+}
+
+#[cfg(unix)]
+fn process_is_alive_impl(pid: u32) -> bool {
+    std::path::Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(unix))]
+fn process_is_alive_impl(_pid: u32) -> bool {
+    true
 }
 
 fn path_matches_allowlist(cwd: &str, trusted_root: &str) -> bool {
@@ -1031,6 +1379,33 @@ fn cwd_matches_observed_target(expected_cwd: &str, observed_cwd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "runtime-worker-{}-{}-{nanos}",
+            label,
+            std::process::id()
+        ))
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn allowlisted_trust_prompt_auto_resolves_then_reaches_ready_state() {
@@ -1484,6 +1859,134 @@ mod tests {
         assert_eq!(
             current.last_error.expect("lease failure should exist").kind,
             WorkerFailureKind::LeaseExpired
+        );
+    }
+
+    #[test]
+    fn process_backend_spawns_heartbeats_and_records_exit() {
+        let registry = WorkerRegistry::new();
+        let spec = WorkerProcessSpec::new(
+            vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            std::env::temp_dir(),
+        );
+        let mut handle = registry
+            .spawn_process(spec)
+            .expect("worker process should spawn");
+
+        assert_eq!(handle.worker.status, WorkerStatus::Running);
+        assert!(handle.worker.process.is_some());
+        let observed = loop {
+            let worker = registry
+                .observe_process(&handle.worker.worker_id, &mut handle.child)
+                .expect("process should observe");
+            if worker.status == WorkerStatus::Finished {
+                break worker;
+            }
+        };
+
+        assert_eq!(
+            observed
+                .process
+                .as_ref()
+                .and_then(|process| process.exit_status),
+            Some(0)
+        );
+        assert!(observed
+            .events
+            .iter()
+            .any(|event| event.kind == WorkerEventKind::ProcessStarted));
+        assert!(observed
+            .events
+            .iter()
+            .any(|event| event.kind == WorkerEventKind::ProcessExited));
+    }
+
+    #[test]
+    fn process_backend_can_spawn_in_isolated_git_worktree() {
+        let root = unique_temp_dir("worker-isolated-worktree");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir should create");
+        git(&repo, &["init", "--quiet", "--initial-branch=main"]);
+        git(&repo, &["config", "user.email", "tests@example.com"]);
+        git(&repo, &["config", "user.name", "Worker Tests"]);
+        std::fs::write(repo.join("marker.txt"), "ok\n").expect("marker should write");
+        git(&repo, &["add", "marker.txt"]);
+        git(&repo, &["commit", "-m", "initial", "--quiet"]);
+
+        let registry = WorkerRegistry::new();
+        let spec = WorkerProcessSpec::new(
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "test -f marker.txt".to_string(),
+            ],
+            &repo,
+        )
+        .with_isolation(WorkerIsolationSpec::GitWorktree {
+            root: root.join("isolated"),
+        });
+        let mut handle = registry
+            .spawn_process(spec)
+            .expect("isolated worker process should spawn");
+
+        let observed = loop {
+            let worker = registry
+                .observe_process(&handle.worker.worker_id, &mut handle.child)
+                .expect("process should observe");
+            if matches!(worker.status, WorkerStatus::Finished | WorkerStatus::Failed) {
+                break worker;
+            }
+        };
+
+        assert_eq!(observed.status, WorkerStatus::Finished);
+        let isolation = observed
+            .isolation
+            .as_ref()
+            .expect("isolation metadata should exist");
+        assert_eq!(isolation.kind, WorkerIsolationKind::GitWorktree);
+        assert!(isolation.worktree_path.contains("worker-worktree-"));
+        assert_eq!(observed.cwd, isolation.worktree_path);
+        assert!(std::path::Path::new(&isolation.worktree_path)
+            .join("marker.txt")
+            .exists());
+        assert!(observed
+            .events
+            .iter()
+            .any(|event| event.kind == WorkerEventKind::WorktreeCreated));
+        cleanup_worker_isolation(observed.isolation.as_ref());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn process_backend_records_failed_exit() {
+        let registry = WorkerRegistry::new();
+        let spec = WorkerProcessSpec::new(
+            vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
+            std::env::temp_dir(),
+        );
+        let mut handle = registry
+            .spawn_process(spec)
+            .expect("worker process should spawn");
+
+        let observed = loop {
+            let worker = registry
+                .observe_process(&handle.worker.worker_id, &mut handle.child)
+                .expect("process should observe");
+            if worker.status == WorkerStatus::Failed {
+                break worker;
+            }
+        };
+
+        assert_eq!(
+            observed
+                .process
+                .as_ref()
+                .and_then(|process| process.exit_status),
+            Some(7)
+        );
+        assert_eq!(
+            observed.last_error.expect("process failure").kind,
+            WorkerFailureKind::Provider
         );
     }
 

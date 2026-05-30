@@ -240,8 +240,9 @@ pub use verifier::{
 };
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
-    WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
-    DEFAULT_WORKER_LEASE_SECS, DEFAULT_WORKER_MAX_RESTARTS,
+    WorkerIsolation, WorkerIsolationKind, WorkerIsolationSpec, WorkerProcess, WorkerProcessHandle,
+    WorkerProcessSpec, WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus,
+    WorkerTrustResolution, DEFAULT_WORKER_LEASE_SECS, DEFAULT_WORKER_MAX_RESTARTS,
 };
 pub use worker_supervisor::{
     WorkerEventIndexEntry, WorkerSupervisor, WorkerSupervisorCapacity, WorkerSupervisorStatus,

@@ -75,6 +75,7 @@ pub enum SchedulerDaemonStatus {
     Idle,
     Running,
     Blocked,
+    Stopped,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +182,49 @@ impl SchedulerDaemon {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
+    pub fn stop(&self) -> io::Result<SchedulerDaemonState> {
+        fs::create_dir_all(&self.state_dir)?;
+        let _lock = SchedulerDaemonLock::acquire(self.lock_path())?;
+        let previous_state = self.load_state().ok();
+        let now = scheduler_now_secs();
+        let state = SchedulerDaemonState {
+            version: SCHEDULER_DAEMON_STATE_VERSION,
+            status: SchedulerDaemonStatus::Stopped,
+            pid: std::process::id(),
+            started_at: previous_state
+                .as_ref()
+                .map_or(now, |state| state.started_at),
+            updated_at: now,
+            tick_count: previous_state.as_ref().map_or(0, |state| state.tick_count),
+            lock_path: self.lock_path(),
+            last_tick: previous_state.and_then(|state| state.last_tick),
+            message: "scheduler daemon stopped".to_string(),
+        };
+        self.save_state(&state)?;
+        let event = SchedulerDaemonEvent {
+            seq: state.tick_count.saturating_add(1),
+            timestamp: state.updated_at,
+            event: "stop".to_string(),
+            status: state.status,
+            selected_task_id: None,
+            message: state.message.clone(),
+        };
+        self.append_event_line(&event)?;
+        Ok(state)
+    }
+
+    pub fn load_events(&self) -> io::Result<Vec<SchedulerDaemonEvent>> {
+        let contents = fs::read_to_string(self.events_path())?;
+        contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn state_path(&self) -> PathBuf {
         self.state_dir.join("state.json")
@@ -215,14 +259,19 @@ impl SchedulerDaemon {
             selected_task_id: tick.selected_task_id.clone(),
             message: tick.message.clone(),
         };
-        let line = serde_json::to_string(&event)
+        self.append_event_line(&event)?;
+        Ok(event)
+    }
+
+    fn append_event_line(&self, event: &SchedulerDaemonEvent) -> io::Result<()> {
+        let line = serde_json::to_string(event)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.events_path())?;
         writeln!(file, "{line}")?;
-        Ok(event)
+        Ok(())
     }
 }
 
@@ -232,10 +281,13 @@ struct SchedulerDaemonLock {
 
 impl SchedulerDaemonLock {
     fn acquire(path: PathBuf) -> io::Result<Self> {
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                writeln!(file, "{}", std::process::id())?;
-                Ok(Self { path })
+        match Self::create(path.clone()) {
+            Ok(lock) => Ok(lock),
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists && lock_owner_is_stale(&path) =>
+            {
+                let _ = fs::remove_file(&path);
+                Self::create(path)
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -244,6 +296,36 @@ impl SchedulerDaemonLock {
             Err(error) => Err(error),
         }
     }
+
+    fn create(path: PathBuf) -> io::Result<Self> {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                writeln!(file, "{}", std::process::id())?;
+                Ok(Self { path })
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn lock_owner_is_stale(path: &PathBuf) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(pid) = contents.trim().parse::<u32>() else {
+        return false;
+    };
+    !process_is_alive(pid)
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    std::path::Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 impl Drop for SchedulerDaemonLock {
@@ -595,6 +677,71 @@ mod tests {
 
         let error = daemon.run_once().expect_err("existing lock should block");
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn scheduler_daemon_recovers_stale_lock_from_dead_process() {
+        let (registry, task_id) = registry_with_planned_task();
+        let scheduler = DurableTaskScheduler::new(registry, VerificationRunner::new(None));
+        let state_dir = std::env::temp_dir().join(format!(
+            "himalaya-scheduler-daemon-stale-lock-{}",
+            scheduler_now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).expect("state dir should create");
+        std::fs::write(state_dir.join("scheduler.lock"), "0").expect("stale lock should write");
+        let daemon = SchedulerDaemon::new(scheduler, &state_dir);
+
+        let run = daemon.run_once().expect("stale lock should be recovered");
+
+        assert_eq!(run.tick.selected_task_id.as_deref(), Some(task_id.as_str()));
+        assert_eq!(run.state.tick_count, 1);
+        assert!(!daemon.lock_path().exists());
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn scheduler_daemon_stop_persists_recoverable_terminal_state() {
+        let (registry, _) = registry_with_planned_task();
+        let scheduler = DurableTaskScheduler::new(registry, VerificationRunner::new(None));
+        let state_dir = std::env::temp_dir().join(format!(
+            "himalaya-scheduler-daemon-stop-{}",
+            scheduler_now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let daemon = SchedulerDaemon::new(scheduler, &state_dir);
+        let first = daemon.run_once().expect("daemon should run before stop");
+
+        let stopped = daemon.stop().expect("daemon should stop");
+
+        assert_eq!(stopped.status, SchedulerDaemonStatus::Stopped);
+        assert_eq!(stopped.tick_count, first.state.tick_count);
+        let loaded = daemon.load_state().expect("stopped state should load");
+        assert_eq!(loaded.status, SchedulerDaemonStatus::Stopped);
+        let events = daemon.load_events().expect("events should load");
+        assert!(events.iter().any(|event| event.event == "stop"));
+        assert!(!daemon.lock_path().exists());
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn scheduler_daemon_rejects_corrupt_event_log() {
+        let (registry, _) = registry_with_planned_task();
+        let scheduler = DurableTaskScheduler::new(registry, VerificationRunner::new(None));
+        let state_dir = std::env::temp_dir().join(format!(
+            "himalaya-scheduler-daemon-corrupt-events-{}",
+            scheduler_now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).expect("state dir should create");
+        std::fs::write(state_dir.join("events.jsonl"), "not-json\n")
+            .expect("corrupt event log should write");
+        let daemon = SchedulerDaemon::new(scheduler, &state_dir);
+
+        let error = daemon.load_events().expect_err("corrupt log should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         let _ = std::fs::remove_dir_all(&state_dir);
     }
 
