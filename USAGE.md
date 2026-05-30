@@ -93,6 +93,47 @@ Model aliases currently supported by the CLI:
 - `sonnet` → `Himalaya-sonnet-4-6`
 - `haiku` → `Himalaya-haiku-4-5-20251213`
 
+
+## Adaptive model routing (`modelRouting`)
+
+`Himalaya` can route different phases of a complex task to different models. The built-in balanced policy covers planning, coding, verification, and summarization; project settings can extend it with explicit routes.
+
+Add project-local routing in `.Himalaya/settings.json`:
+
+```json
+{
+  "modelRouting": {
+    "enabled": true,
+    "minFeedbackSamples": 2,
+    "switchFailureThresholdPercent": 50,
+    "routes": [
+      {
+        "phase": "verification",
+        "model": "opus",
+        "provider": "anthropic",
+        "capabilities": ["verification", "test_generation"],
+        "qualityWeight": 5,
+        "latencyWeight": 2,
+        "costWeight": 1,
+        "maxTokens": 32000
+      }
+    ]
+  }
+}
+```
+
+Useful phases are `planning`, `coding`, `verification`, `summarization`, `vision`, and `local_fast`. Route weights are relative preferences: higher `qualityWeight` favors better models, higher `latencyWeight` penalizes slow routes more strongly, and higher `costWeight` penalizes expensive routes more strongly.
+
+Adaptive routing uses persisted feedback to reduce confidence in routes with repeated failures, verification misses, recovery triggers, high latency, high token use, or high cost. Inspect the feedback loop with:
+
+```bash
+cd rust
+./target/debug/Himalaya routes feedback summary
+./target/debug/Himalaya --output-format json routes summary
+```
+
+The summary groups feedback by phase/model and includes success rate plus average latency, token, and cost metrics.
+
 ## Authentication
 
 ### API key
@@ -309,6 +350,73 @@ cd rust
 ./target/debug/Himalaya skills
 ./target/debug/Himalaya system-prompt --cwd .. --date 2026-04-04
 ```
+
+
+## Durable task scheduler daemon
+
+The task scheduler can run one tick at a time for debugging or as a bounded daemon loop for long-running task execution.
+
+```bash
+cd rust
+
+# Inspect queue and scheduler state
+./target/debug/Himalaya tasks scheduler queue
+./target/debug/Himalaya tasks scheduler status
+
+# Run foreground scheduler ticks
+./target/debug/Himalaya tasks scheduler run --once
+./target/debug/Himalaya tasks scheduler run --max-ticks 5
+
+# Start, inspect, and stop the daemon loop
+./target/debug/Himalaya tasks daemon start --max-ticks 50
+./target/debug/Himalaya tasks daemon status
+./target/debug/Himalaya tasks daemon logs --limit 50
+./target/debug/Himalaya tasks daemon stop
+```
+
+Use `daemon start --once` as a safe smoke test before allowing a longer daemon run. `daemon logs` emits the persisted daemon event stream, and `daemon status` reports the daemon state file and event log path in JSON/stream-json modes.
+
+## Worker supervisor and isolated workers
+
+Workers are durable local execution records that the scheduler and supervisor can inspect, restart, prompt, and complete. They can run directly in the current workspace or in a detached git worktree for safer parallel execution.
+
+```bash
+cd rust
+
+# Create an idle worker record for the current workspace
+./target/debug/Himalaya workers create --cwd ..
+
+# Spawn a real process-backed worker
+./target/debug/Himalaya workers spawn --cwd .. -- sh -c 'echo ready'
+
+# Spawn with a detached git worktree rooted under a custom directory
+./target/debug/Himalaya workers spawn --cwd .. --isolate-worktree --worktree-root ../.Himalaya-worker-trees -- sh -c 'pwd && git status --short'
+
+# Inspect and advance lifecycle state
+./target/debug/Himalaya workers list
+./target/debug/Himalaya workers probe <worker-id>
+./target/debug/Himalaya workers ready <worker-id>
+./target/debug/Himalaya workers prompt <worker-id> "continue the assigned task"
+./target/debug/Himalaya workers complete <worker-id> stop 1
+
+# Let the supervisor reconcile stale/running/blocked workers
+./target/debug/Himalaya workers supervise
+```
+
+`workers spawn --isolate-worktree` creates a detached worktree from `HEAD` and records `worker.isolation` metadata, including the source cwd and worktree path. The VS Code Task Board consumes worker stream events and can show process, isolation, restart, trust, prompt, and recent-event details for the selected worker.
+
+## Benchmarking routing and orchestration quality
+
+The built-in benchmark suite scores planner coverage, decomposition, scheduler readiness, MoE route coverage, adaptive routing quality, and execution harness progress.
+
+```bash
+cd rust
+./target/debug/Himalaya benchmark list
+./target/debug/Himalaya benchmark run --max-parallelism 4
+./target/debug/Himalaya --output-format json benchmark run --record
+```
+
+Recorded benchmark runs are appended under `.Himalaya/benchmarks/runs.jsonl`. The JSON summary includes `average_adaptive_routing_quality_score`; each task result includes `score.adaptive_routing_quality_score` and the route decisions used for that task.
 
 ## Session management
 
