@@ -675,7 +675,10 @@ mod tests {
                 assert_eq!(tool, "bash");
                 assert_eq!(active_mode, "prompt");
                 assert_eq!(required_mode, "danger-full-access");
-                assert_eq!(reason, "bash requires confirmation in prompt mode");
+                assert_eq!(
+                    reason,
+                    "tool 'bash' requires approval to escalate from prompt to danger-full-access"
+                );
             }
             other => panic!("expected denied result, got {other:?}"),
         }

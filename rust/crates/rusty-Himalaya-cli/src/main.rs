@@ -313,6 +313,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             command,
             output_format,
         } => run_cron_command(command, output_format)?,
+        CliAction::Routes {
+            command,
+            output_format,
+        } => run_route_command(command, output_format)?,
         CliAction::Local {
             command,
             output_format,
@@ -483,6 +487,10 @@ enum CliAction {
         command: CronCliCommand,
         output_format: CliOutputFormat,
     },
+    Routes {
+        command: RouteCliCommand,
+        output_format: CliOutputFormat,
+    },
     Local {
         command: LocalCliCommand,
         output_format: CliOutputFormat,
@@ -610,6 +618,9 @@ enum TaskCliCommand {
     Scheduler {
         command: TaskSchedulerCliCommand,
     },
+    Daemon {
+        command: TaskDaemonCliCommand,
+    },
     Resume {
         task_id: String,
         from_node: Option<String>,
@@ -659,11 +670,29 @@ enum TaskSchedulerCliCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum TaskDaemonCliCommand {
+    Start { max_ticks: usize },
+    Status,
+    Stop,
+    Logs { limit: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkerCliCommand {
     List,
     Create {
         cwd: Option<PathBuf>,
         trusted_roots: Vec<String>,
+    },
+    Spawn {
+        cwd: Option<PathBuf>,
+        trusted_roots: Vec<String>,
+        isolate_worktree: bool,
+        worktree_root: Option<PathBuf>,
+        command: Vec<String>,
+    },
+    Probe {
+        worker_id: String,
     },
     Observe {
         worker_id: String,
@@ -706,6 +735,11 @@ enum CronCliCommand {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RouteCliCommand {
+    FeedbackSummary,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalHelpTopic {
     Status,
@@ -733,6 +767,16 @@ impl CliOutputFormat {
     }
 }
 
+fn worker_spawn_command_delimiter_seen(rest: &[String]) -> bool {
+    matches!(
+        rest,
+        [command, subcommand, args @ ..]
+            if matches!(command.as_str(), "workers" | "worker")
+                && subcommand == "spawn"
+                && args.iter().any(|arg| arg == "--")
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = DEFAULT_MODEL.to_string();
@@ -749,8 +793,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut file_paths: Vec<PathBuf> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
-
     while index < args.len() {
+        if worker_spawn_command_delimiter_seen(&rest) {
+            rest.push(args[index].clone());
+            index += 1;
+            continue;
+        }
+
         match args[index].as_str() {
             "--help" | "-h" if rest.is_empty() => {
                 wants_help = true;
@@ -1095,6 +1144,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             command: parse_cron_cli_command(&rest[1..])?,
             output_format,
         }),
+        "routes" | "route" => Ok(CliAction::Routes {
+            command: parse_route_cli_command(&rest[1..])?,
+            output_format,
+        }),
         "test" | "lint" | "build" | "review" | "diagnostics" | "workspace" | "cwd" => {
             Ok(CliAction::Local {
                 command: parse_local_cli_command(&rest)?,
@@ -1247,6 +1300,25 @@ fn parse_benchmark_parallelism(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+fn parse_route_cli_command(args: &[String]) -> Result<RouteCliCommand, String> {
+    match args.split_first().map(|(command, rest)| (command.as_str(), rest)) {
+        None | Some(("feedback" | "feedback-summary" | "summary", [])) => {
+            Ok(RouteCliCommand::FeedbackSummary)
+        }
+        Some(("feedback", rest)) => match rest {
+            [subcommand] if matches!(subcommand.as_str(), "summary" | "summaries") => {
+                Ok(RouteCliCommand::FeedbackSummary)
+            }
+            _ => Err(
+                "Usage: Himalaya routes [feedback summary|feedback-summary|summary]".to_string(),
+            ),
+        },
+        Some((other, _)) => Err(format!(
+            "unknown routes command: {other}\nUsage: Himalaya routes [feedback summary|feedback-summary|summary]"
+        )),
+    }
+}
+
 fn parse_task_status(value: &str) -> Result<runtime::TaskStatus, String> {
     match value {
         "created" => Ok(runtime::TaskStatus::Created),
@@ -1278,6 +1350,9 @@ fn parse_task_cli_command(args: &[String]) -> Result<TaskCliCommand, String> {
         }),
         Some(("scheduler", rest)) => Ok(TaskCliCommand::Scheduler {
             command: parse_task_scheduler_cli_command(rest)?,
+        }),
+        Some(("daemon", rest)) => Ok(TaskCliCommand::Daemon {
+            command: parse_task_daemon_cli_command(rest)?,
         }),
         Some(("resume", [task_id])) => Ok(TaskCliCommand::Resume {
             task_id: task_id.clone(),
@@ -1345,7 +1420,7 @@ fn parse_task_cli_command(args: &[String]) -> Result<TaskCliCommand, String> {
             task_id: task_id.clone(),
         }),
         Some((other, _)) => Err(format!(
-            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
+            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
         )),
     }
 }
@@ -1413,6 +1488,55 @@ fn parse_task_scheduler_run_args(args: &[String]) -> Result<TaskSchedulerCliComm
     Ok(TaskSchedulerCliCommand::Run { max_ticks })
 }
 
+fn parse_task_daemon_cli_command(args: &[String]) -> Result<TaskDaemonCliCommand, String> {
+    match args
+        .split_first()
+        .map(|(command, rest)| (command.as_str(), rest))
+    {
+        None | Some(("status", [])) => Ok(TaskDaemonCliCommand::Status),
+        Some(("start", rest)) => parse_task_daemon_start_args(rest),
+        Some(("stop", [])) => Ok(TaskDaemonCliCommand::Stop),
+        Some(("logs", rest)) => parse_task_daemon_logs_args(rest),
+        Some((other, _)) => Err(format!(
+            "unknown tasks daemon command: {other}\nUsage: Himalaya tasks daemon [start [--once|--max-ticks N]|status|stop|logs [--limit N]]"
+        )),
+    }
+}
+
+fn parse_task_daemon_start_args(args: &[String]) -> Result<TaskDaemonCliCommand, String> {
+    let scheduler_command = parse_task_scheduler_run_args(args)?;
+    let TaskSchedulerCliCommand::Run { max_ticks } = scheduler_command else {
+        unreachable!("scheduler run parser only returns run command");
+    };
+    Ok(TaskDaemonCliCommand::Start { max_ticks })
+}
+
+fn parse_task_daemon_logs_args(args: &[String]) -> Result<TaskDaemonCliCommand, String> {
+    let mut limit = 20_usize;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "tasks daemon logs --limit requires a value".to_string())?;
+                limit = parse_positive_usize("--limit", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--limit=") => {
+                limit = parse_positive_usize("--limit", &value[8..])?;
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown tasks daemon logs argument: {other}\nUsage: Himalaya tasks daemon logs [--limit N]"
+                ));
+            }
+        }
+    }
+    Ok(TaskDaemonCliCommand::Logs { limit })
+}
+
 fn parse_positive_usize(name: &str, value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -1430,46 +1554,23 @@ fn parse_worker_cli_command(args: &[String]) -> Result<WorkerCliCommand, String>
     {
         None | Some(("list", [])) => Ok(WorkerCliCommand::List),
         Some(("create", rest)) => {
-            let mut cwd = None;
-            let mut trusted_roots = Vec::new();
-            let mut index = 0;
-            while index < rest.len() {
-                match rest[index].as_str() {
-                    "--cwd" => {
-                        let value = rest
-                            .get(index + 1)
-                            .ok_or_else(|| "workers create --cwd requires a path".to_string())?;
-                        cwd = Some(PathBuf::from(value));
-                        index += 2;
-                    }
-                    value if value.starts_with("--cwd=") => {
-                        cwd = Some(PathBuf::from(&value[6..]));
-                        index += 1;
-                    }
-                    "--trusted-root" => {
-                        let value = rest.get(index + 1).ok_or_else(|| {
-                            "workers create --trusted-root requires a path".to_string()
-                        })?;
-                        trusted_roots.push(value.clone());
-                        index += 2;
-                    }
-                    value if value.starts_with("--trusted-root=") => {
-                        trusted_roots.push(value[15..].to_string());
-                        index += 1;
-                    }
-                    value if !value.starts_with('-') && cwd.is_none() => {
-                        cwd = Some(PathBuf::from(value));
-                        index += 1;
-                    }
-                    other => {
-                        return Err(format!(
-                            "unknown workers create argument: {other}\nUsage: Himalaya workers create [--cwd PATH] [--trusted-root PATH]"
-                        ));
-                    }
-                }
-            }
+            let (cwd, trusted_roots) = parse_worker_cwd_and_trust_args(rest, "create")?;
             Ok(WorkerCliCommand::Create { cwd, trusted_roots })
         }
+        Some(("spawn", rest)) => {
+            let (cwd, trusted_roots, isolate_worktree, worktree_root, command) =
+                parse_worker_spawn_args(rest)?;
+            Ok(WorkerCliCommand::Spawn {
+                cwd,
+                trusted_roots,
+                isolate_worktree,
+                worktree_root,
+                command,
+            })
+        }
+        Some(("probe", [worker_id])) => Ok(WorkerCliCommand::Probe {
+            worker_id: worker_id.clone(),
+        }),
         Some(("observe", [worker_id, screen @ ..])) if !screen.is_empty() => {
             Ok(WorkerCliCommand::Observe {
                 worker_id: worker_id.clone(),
@@ -1517,9 +1618,136 @@ fn parse_worker_cli_command(args: &[String]) -> Result<WorkerCliCommand, String>
         }),
         Some(("supervise" | "tick", [])) => Ok(WorkerCliCommand::Supervise),
         Some((other, _)) => Err(format!(
-            "unknown workers command: {other}\nUsage: Himalaya workers [list|create|observe <worker-id> <screen>|ready <worker-id>|resolve-trust <worker-id>|prompt <worker-id> [prompt]|complete <worker-id> [finish-reason] [tokens-output]|restart <worker-id>|terminate <worker-id>|supervise]"
+            "unknown workers command: {other}\nUsage: Himalaya workers [list|create|spawn [--cwd PATH] [--trusted-root PATH] [--isolate-worktree] [--worktree-root PATH] -- COMMAND...|probe <worker-id>|observe <worker-id> <screen>|ready <worker-id>|resolve-trust <worker-id>|prompt <worker-id> [prompt]|complete <worker-id> [finish-reason] [tokens-output]|restart <worker-id>|terminate <worker-id>|supervise]"
         )),
     }
+}
+
+fn parse_worker_cwd_and_trust_args(
+    args: &[String],
+    command_name: &str,
+) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    let mut cwd = None;
+    let mut trusted_roots = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--cwd" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("workers {command_name} --cwd requires a path"))?;
+                cwd = Some(PathBuf::from(value));
+                index += 2;
+            }
+            value if value.starts_with("--cwd=") => {
+                cwd = Some(PathBuf::from(&value[6..]));
+                index += 1;
+            }
+            "--trusted-root" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    format!("workers {command_name} --trusted-root requires a path")
+                })?;
+                trusted_roots.push(value.clone());
+                index += 2;
+            }
+            value if value.starts_with("--trusted-root=") => {
+                trusted_roots.push(value[15..].to_string());
+                index += 1;
+            }
+            value if !value.starts_with('-') && cwd.is_none() => {
+                cwd = Some(PathBuf::from(value));
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown workers {command_name} argument: {other}\nUsage: Himalaya workers {command_name} [--cwd PATH] [--trusted-root PATH]"
+                ));
+            }
+        }
+    }
+    Ok((cwd, trusted_roots))
+}
+
+fn parse_worker_spawn_args(
+    args: &[String],
+) -> Result<
+    (
+        Option<PathBuf>,
+        Vec<String>,
+        bool,
+        Option<PathBuf>,
+        Vec<String>,
+    ),
+    String,
+> {
+    let mut cwd = None;
+    let mut trusted_roots = Vec::new();
+    let mut isolate_worktree = false;
+    let mut worktree_root = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--" => {
+                let command = args[index + 1..].to_vec();
+                if command.is_empty() {
+                    return Err("workers spawn requires a command after --".to_string());
+                }
+                return Ok((cwd, trusted_roots, isolate_worktree, worktree_root, command));
+            }
+            "--cwd" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "workers spawn --cwd requires a path".to_string())?;
+                cwd = Some(PathBuf::from(value));
+                index += 2;
+            }
+            value if value.starts_with("--cwd=") => {
+                cwd = Some(PathBuf::from(&value[6..]));
+                index += 1;
+            }
+            "--trusted-root" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "workers spawn --trusted-root requires a path".to_string())?;
+                trusted_roots.push(value.clone());
+                index += 2;
+            }
+            value if value.starts_with("--trusted-root=") => {
+                trusted_roots.push(value[15..].to_string());
+                index += 1;
+            }
+            "--isolate-worktree" => {
+                isolate_worktree = true;
+                index += 1;
+            }
+            "--worktree-root" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "workers spawn --worktree-root requires a path".to_string())?;
+                worktree_root = Some(PathBuf::from(value));
+                isolate_worktree = true;
+                index += 2;
+            }
+            value if value.starts_with("--worktree-root=") => {
+                worktree_root = Some(PathBuf::from(&value[16..]));
+                isolate_worktree = true;
+                index += 1;
+            }
+            value if !value.starts_with('-') => {
+                let command = args[index..].to_vec();
+                if command.is_empty() {
+                    return Err("workers spawn requires a command".to_string());
+                }
+                return Ok((cwd, trusted_roots, isolate_worktree, worktree_root, command));
+            }
+            other => {
+                return Err(format!(
+                    "unknown workers spawn argument: {other}\nUsage: Himalaya workers spawn [--cwd PATH] [--trusted-root PATH] [--isolate-worktree] [--worktree-root PATH] -- COMMAND..."
+                ));
+            }
+        }
+    }
+    Err("workers spawn requires a command".to_string())
 }
 
 fn parse_cron_cli_command(args: &[String]) -> Result<CronCliCommand, String> {
@@ -3166,12 +3394,17 @@ fn render_benchmark_run_text(value: &Value) -> String {
         .as_f64()
         .unwrap_or_default()
         * 100.0;
+    let adaptive_routing = summary["average_adaptive_routing_quality_score"]
+        .as_f64()
+        .unwrap_or_default()
+        * 100.0;
     let parallel = summary["parallel_plans"].as_u64().unwrap_or_default();
     let review = summary["review_or_deny_tasks"].as_u64().unwrap_or_default();
     let mut lines = vec![
         format!("Benchmark run: {total_tasks} task(s)"),
         format!("Average score: {average:.0}%"),
         format!("Capability coverage: {coverage:.0}%"),
+        format!("Adaptive routing quality: {adaptive_routing:.0}%"),
         format!("Parallel plans: {parallel}"),
         format!("Review/deny tasks: {review}"),
     ];
@@ -6911,6 +7144,9 @@ fn run_task_command(
         TaskCliCommand::Scheduler { command } => {
             run_task_scheduler_command(command, output_format)?;
         }
+        TaskCliCommand::Daemon { command } => {
+            run_task_daemon_command(command, output_format)?;
+        }
         TaskCliCommand::Execute { task_id, from_node } => {
             let registry = load_task_registry()?;
             let worker_registry = load_worker_registry()?;
@@ -7367,6 +7603,71 @@ fn print_worker_output(
     Ok(())
 }
 
+fn print_route_output(
+    value: Value,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match output_format {
+        CliOutputFormat::StreamJson => print_stream_json_event(value),
+        CliOutputFormat::Json => print_task_json(value)?,
+        CliOutputFormat::Text => println!("{}", render_route_feedback_summary_text(&value)),
+    }
+    Ok(())
+}
+
+fn render_route_feedback_summary_text(value: &Value) -> String {
+    let feedback_count = value["feedback_count"].as_u64().unwrap_or(0);
+    let summaries = value["summaries"].as_array().cloned().unwrap_or_default();
+    if summaries.is_empty() {
+        return format!("Route feedback summary\n  Feedback entries  {feedback_count}\n  Routes            none");
+    }
+    let mut lines = vec![format!(
+        "Route feedback summary\n  Feedback entries  {feedback_count}\n  Routes            {}",
+        summaries.len()
+    )];
+    for summary in summaries {
+        let phase = summary["phase"].as_str().unwrap_or("unknown");
+        let model = summary["model"].as_str().unwrap_or("unknown");
+        let total = summary["total"].as_u64().unwrap_or(0);
+        let failures = summary["failures"].as_u64().unwrap_or(0);
+        let success_rate = summary["success_rate"].as_f64().unwrap_or(0.0) * 100.0;
+        let latency = summary["avg_latency_ms"]
+            .as_f64()
+            .map_or("n/a".to_string(), |value| format!("{value:.0}ms"));
+        let tokens = summary["avg_tokens"]
+            .as_f64()
+            .map_or("n/a".to_string(), |value| format!("{value:.0}"));
+        let cost = summary["avg_cost_usd"]
+            .as_f64()
+            .map_or("n/a".to_string(), |value| format!("${value:.4}"));
+        lines.push(format!(
+            "  - {phase}/{model}: total={total}, failures={failures}, success={success_rate:.0}%, avg_latency={latency}, avg_tokens={tokens}, avg_cost={cost}"
+        ));
+    }
+    lines.join("\n")
+}
+
+fn run_route_command(
+    command: RouteCliCommand,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        RouteCliCommand::FeedbackSummary => {
+            let store = load_route_feedback_store()?;
+            print_route_output(
+                json!({
+                    "type": "route_feedback_summary",
+                    "feedback_count": store.feedback().len(),
+                    "summaries": store.summaries(),
+                    "feedback_path": route_feedback_dir()?.join("feedback.json"),
+                }),
+                output_format,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn run_worker_command(
     command: WorkerCliCommand,
     output_format: CliOutputFormat,
@@ -7403,6 +7704,49 @@ fn run_worker_command(
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_worker_output(
                         json!({"type":"worker_create","worker":worker}),
+                        output_format,
+                    )?;
+                }
+            }
+        }
+        WorkerCliCommand::Spawn {
+            cwd,
+            trusted_roots,
+            isolate_worktree,
+            worktree_root,
+            command,
+        } => {
+            let registry = load_worker_registry()?;
+            let cwd = cwd.unwrap_or(env::current_dir()?);
+            let mut spec = runtime::WorkerProcessSpec::new(command, cwd.clone())
+                .with_trusted_roots(trusted_roots);
+            if isolate_worktree {
+                let root = worktree_root
+                    .unwrap_or_else(|| cwd.join(".Himalaya").join("workers").join("worktrees"));
+                spec = spec.with_isolation(runtime::WorkerIsolationSpec::GitWorktree { root });
+            }
+            let handle = registry.spawn_process(spec)?;
+            let worker = handle.worker;
+            save_worker_registry(&registry)?;
+            match output_format {
+                CliOutputFormat::Text => println!("spawned worker {}", worker.worker_id),
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_worker_output(
+                        json!({"type":"worker_spawn","worker":worker}),
+                        output_format,
+                    )?;
+                }
+            }
+        }
+        WorkerCliCommand::Probe { worker_id } => {
+            let registry = load_worker_registry()?;
+            let worker = registry.probe_process(&worker_id)?;
+            save_worker_registry(&registry)?;
+            match output_format {
+                CliOutputFormat::Text => println!("{}", worker.status),
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_worker_output(
+                        json!({"type":"worker_probe","worker":worker}),
                         output_format,
                     )?;
                 }
@@ -7890,6 +8234,139 @@ fn run_task_scheduler_command(
                             "type":"task_scheduler_daemon_status",
                             "state":state,
                             "state_path":daemon.state_path(),
+                            "events_path":daemon.events_path(),
+                        }),
+                        output_format,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_task_daemon_command(
+    command: TaskDaemonCliCommand,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = load_task_registry()?;
+    let worker_registry = load_worker_registry()?;
+    let runner = runtime::VerificationRunner::new(Some(env::current_dir()?));
+    let scheduler = runtime::DurableTaskScheduler::with_workers(
+        registry.clone(),
+        runner,
+        worker_registry.clone(),
+    );
+    let daemon = runtime::SchedulerDaemon::new(scheduler, scheduler_state_dir()?);
+    match command {
+        TaskDaemonCliCommand::Start { max_ticks } => {
+            let mut runs = Vec::new();
+            for _ in 0..max_ticks {
+                let run = daemon.run_once()?;
+                let idle = run.tick.status == runtime::DurableSchedulerStatus::Idle;
+                runs.push(run);
+                save_task_registry(&registry)?;
+                save_worker_registry(&worker_registry)?;
+                if idle {
+                    break;
+                }
+            }
+            let state = runs.last().map(|run| run.state.clone());
+            match output_format {
+                CliOutputFormat::Text => {
+                    if let Some(state) = &state {
+                        println!(
+                            "daemon {:?}: {} ({} tick(s))",
+                            state.status, state.message, state.tick_count
+                        );
+                    } else {
+                        println!("daemon did not run");
+                    }
+                }
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(
+                        json!({
+                            "type":"task_scheduler_daemon_run",
+                            "command":"start",
+                            "runs":runs,
+                            "state":state,
+                            "state_path":daemon.state_path(),
+                            "events_path":daemon.events_path(),
+                        }),
+                        output_format,
+                    )?;
+                }
+            }
+        }
+        TaskDaemonCliCommand::Status => {
+            let state = daemon.load_state().ok();
+            match output_format {
+                CliOutputFormat::Text => {
+                    if let Some(state) = &state {
+                        println!(
+                            "daemon {:?}: {} ({} tick(s))",
+                            state.status, state.message, state.tick_count
+                        );
+                    } else {
+                        println!("daemon has not run");
+                    }
+                }
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(
+                        json!({
+                            "type":"task_scheduler_daemon_status",
+                            "state":state,
+                            "state_path":daemon.state_path(),
+                            "events_path":daemon.events_path(),
+                        }),
+                        output_format,
+                    )?;
+                }
+            }
+        }
+        TaskDaemonCliCommand::Stop => {
+            let state = daemon.stop()?;
+            match output_format {
+                CliOutputFormat::Text => println!(
+                    "daemon {:?}: {} ({} tick(s))",
+                    state.status, state.message, state.tick_count
+                ),
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(
+                        json!({
+                            "type":"task_scheduler_daemon_status",
+                            "command":"stop",
+                            "state":state,
+                            "state_path":daemon.state_path(),
+                            "events_path":daemon.events_path(),
+                        }),
+                        output_format,
+                    )?;
+                }
+            }
+        }
+        TaskDaemonCliCommand::Logs { limit } => {
+            let events = daemon.load_events().unwrap_or_default();
+            let start = events.len().saturating_sub(limit);
+            let events = events.into_iter().skip(start).collect::<Vec<_>>();
+            match output_format {
+                CliOutputFormat::Text => {
+                    if events.is_empty() {
+                        println!("No daemon events.");
+                    } else {
+                        for event in events {
+                            println!(
+                                "{}\t{}\t{:?}\t{}",
+                                event.seq, event.event, event.status, event.message
+                            );
+                        }
+                    }
+                }
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(
+                        json!({
+                            "type":"task_scheduler_daemon_logs",
+                            "events":events,
                             "events_path":daemon.events_path(),
                         }),
                         output_format,
@@ -11939,19 +12416,24 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Himalaya tasks [list|show <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|resume <task-id> [prompt]|execute <task-id>|verify <task-id>|recover <task-id>|cancel <task-id>]"
+        "  Himalaya tasks [list|show <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [prompt]|execute <task-id>|verify <task-id>|recover <task-id>|cancel <task-id>]"
     )?;
     writeln!(
         out,
-        "      Inspect, resume, execute, verify, recover, or cancel durable long-running tasks"
+        "      Inspect, resume, execute, verify, recover, schedule, daemonize, or cancel durable long-running tasks"
     )?;
     writeln!(
         out,
-        "  Himalaya workers [list|create|observe|ready|resolve-trust|prompt|complete|restart|terminate|supervise]"
+        "  Himalaya workers [list|create|spawn [--cwd PATH] [--trusted-root PATH] [--isolate-worktree] [--worktree-root PATH] -- COMMAND...|probe <worker-id>|observe|ready|resolve-trust|prompt|complete|restart|terminate|supervise]"
     )?;
     writeln!(
         out,
         "      Supervise local worker lifecycle state and durable scheduler ticks"
+    )?;
+    writeln!(out, "  Himalaya routes [feedback summary|summary]")?;
+    writeln!(
+        out,
+        "      Summarize adaptive model route feedback by phase and model"
     )?;
     writeln!(
         out,
@@ -12107,8 +12589,9 @@ mod tests {
         load_files_as_content_blocks, maturity_matrix_value, merge_prompt_with_stdin,
         normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
         parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
-        parse_task_cli_command, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
+        parse_route_cli_command, parse_task_cli_command, parse_worker_cli_command,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_memory_report,
         render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
@@ -12117,9 +12600,9 @@ mod tests {
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
         CliOutputFormat, CliToolExecutor, CronCliCommand, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, TaskCliCommand, TaskPacketCliCommand,
-        TaskSchedulerCliCommand, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STREAM_PROTOCOL_VERSION,
-        STUB_COMMANDS,
+        PromptHistoryEntry, RouteCliCommand, SlashCommand, StatusUsage, TaskCliCommand,
+        TaskDaemonCliCommand, TaskPacketCliCommand, TaskSchedulerCliCommand, WorkerCliCommand,
+        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STREAM_PROTOCOL_VERSION, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -13299,6 +13782,101 @@ mod tests {
                 command: TaskSchedulerCliCommand::Queue,
             }
         );
+        assert_eq!(
+            parse_task_cli_command(&[
+                "daemon".to_string(),
+                "start".to_string(),
+                "--max-ticks".to_string(),
+                "3".to_string(),
+            ])
+            .expect("tasks daemon start should parse"),
+            TaskCliCommand::Daemon {
+                command: TaskDaemonCliCommand::Start { max_ticks: 3 },
+            }
+        );
+        assert_eq!(
+            parse_task_cli_command(&[
+                "daemon".to_string(),
+                "logs".to_string(),
+                "--limit=5".to_string(),
+            ])
+            .expect("tasks daemon logs should parse"),
+            TaskCliCommand::Daemon {
+                command: TaskDaemonCliCommand::Logs { limit: 5 },
+            }
+        );
+        assert_eq!(
+            parse_task_cli_command(&["daemon".to_string(), "stop".to_string()])
+                .expect("tasks daemon stop should parse"),
+            TaskCliCommand::Daemon {
+                command: TaskDaemonCliCommand::Stop,
+            }
+        );
+        assert_eq!(
+            parse_route_cli_command(&["feedback".to_string(), "summary".to_string()])
+                .expect("routes feedback summary should parse"),
+            RouteCliCommand::FeedbackSummary
+        );
+        assert_eq!(
+            parse_args(&["routes".to_string(), "summary".to_string()])
+                .expect("routes summary should parse"),
+            CliAction::Routes {
+                command: RouteCliCommand::FeedbackSummary,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_worker_cli_command(&[
+                "spawn".to_string(),
+                "--cwd".to_string(),
+                "/tmp/work".to_string(),
+                "--trusted-root=/tmp/work".to_string(),
+                "--isolate-worktree".to_string(),
+                "--worktree-root".to_string(),
+                "/tmp/isolated".to_string(),
+                "--".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "exit 0".to_string(),
+            ])
+            .expect("workers spawn should parse"),
+            WorkerCliCommand::Spawn {
+                cwd: Some(PathBuf::from("/tmp/work")),
+                trusted_roots: vec!["/tmp/work".to_string()],
+                isolate_worktree: true,
+                worktree_root: Some(PathBuf::from("/tmp/isolated")),
+                command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_worker_cli_command(&["probe".to_string(), "worker-1".to_string()])
+                .expect("workers probe should parse"),
+            WorkerCliCommand::Probe {
+                worker_id: "worker-1".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "workers".to_string(),
+                "spawn".to_string(),
+                "--".to_string(),
+                "tool".to_string(),
+                "--help".to_string(),
+            ])
+            .expect("workers spawn command flags should be forwarded"),
+            CliAction::Workers {
+                command: WorkerCliCommand::Spawn {
+                    cwd: None,
+                    trusted_roots: Vec::new(),
+                    isolate_worktree: false,
+                    worktree_root: None,
+                    command: vec!["tool".to_string(), "--help".to_string()],
+                },
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert!(parse_worker_cli_command(&["spawn".to_string()]).is_err());
+        assert!(parse_worker_cli_command(&["probe".to_string()]).is_err());
         assert!(
             parse_task_cli_command(&["scheduler".to_string(), "unknown".to_string(),]).is_err()
         );

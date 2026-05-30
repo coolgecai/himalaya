@@ -50,11 +50,15 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "task_scheduler_queue",
         "task_scheduler_daemon_run",
         "task_scheduler_daemon_status",
+        "task_scheduler_daemon_logs",
+        "route_feedback_summary",
         "benchmark_suite",
         "benchmark_task",
         "benchmark_run",
         "worker_list",
         "worker_create",
+        "worker_spawn",
+        "worker_probe",
         "worker_observe",
         "worker_ready",
         "worker_resolve_trust",
@@ -123,6 +127,52 @@ fn stream_json_schema_covers_known_event_types() {
         })
         .collect::<BTreeSet<_>>();
     assert_eq!(branch_types, expected_event_types);
+}
+
+#[test]
+fn golden_stream_json_transcript_matches_contract() {
+    let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .join("protocol/stream-json-v1.golden.ndjson");
+    let events = parse_stream_json_stdout(
+        fs::read(&golden_path)
+            .expect("golden stream transcript should be readable")
+            .as_slice(),
+    );
+
+    assert_all_events_are_versioned(&events);
+
+    let event_types = events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(event_types.first(), Some(&"session_meta"));
+    assert_eq!(event_types.last(), Some(&"done"));
+    for required in [
+        "reasoning_step",
+        "tool_use",
+        "tool_result",
+        "decisioning_event",
+        "plan_execution_event",
+        "task_ledger_event",
+        "model_route_event",
+        "team_execution_event",
+        "recovery_event",
+        "recovery_action_event",
+        "task_execution_event",
+        "task_scheduler_daemon_logs",
+        "route_feedback_summary",
+        "benchmark_run",
+        "worker_spawn",
+        "worker_supervisor_tick",
+        "permission_request",
+        "recovery_suggestion",
+    ] {
+        assert!(
+            event_types.contains(&required),
+            "golden transcript should include {required}"
+        );
+    }
 }
 
 #[test]
@@ -1052,6 +1102,23 @@ fn assert_stream_event_schema(event: &Value) {
             assert_non_empty_string(&event["state_path"]);
             assert_non_empty_string(&event["events_path"]);
         }
+        "task_scheduler_daemon_logs" => {
+            assert!(
+                event["events"].is_array(),
+                "task_scheduler_daemon_logs requires events array: {event:?}"
+            );
+            assert_non_empty_string(&event["events_path"]);
+        }
+        "route_feedback_summary" => {
+            assert!(
+                event["summaries"].is_array(),
+                "route_feedback_summary requires summaries array: {event:?}"
+            );
+            assert!(
+                event["feedback_count"].as_u64().is_some(),
+                "route_feedback_summary requires feedback_count: {event:?}"
+            );
+        }
         "benchmark_suite" => {
             assert_non_empty_string(&event["suite_id"]);
             assert_non_empty_string(&event["version"]);
@@ -1073,6 +1140,8 @@ fn assert_stream_event_schema(event: &Value) {
             "worker_list requires workers array: {event:?}"
         ),
         "worker_create"
+        | "worker_spawn"
+        | "worker_probe"
         | "worker_observe"
         | "worker_resolve_trust"
         | "worker_prompt"

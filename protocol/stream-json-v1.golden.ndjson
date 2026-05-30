@@ -1,0 +1,34 @@
+{"type":"session_meta","session_id":"golden-session","session_path":"/tmp/golden-session.jsonl","model":"sonnet","protocol_version":1}
+{"type":"message_start","protocol_version":1}
+{"type":"reasoning_step","reasoning_step":{"step_type":"analysis","content":"plan golden replay"},"protocol_version":1}
+{"type":"text_delta","text":"Golden ","protocol_version":1}
+{"type":"tool_use","id":"toolu_golden","name":"read_file","input":{"path":"fixture.txt"},"protocol_version":1}
+{"type":"tool_result","id":"toolu_golden","name":"read_file","output":"fixture ok","is_error":false,"protocol_version":1}
+{"type":"decisioning_event","decisioning_event":{"kind":"task_decomposition","title":"Task decomposition","summary":"Split work","task_id":"task-golden"},"protocol_version":1}
+{"type":"plan_execution_event","plan_execution_event":{"seq":1,"task_id":"task-golden","node_id":"node-golden","kind":"node_started","status":"running","message":"started"},"protocol_version":1}
+{"type":"task_ledger_event","task_ledger_event":{"seq":2,"task_id":"task-golden","event":"status","status":"running","message":"working","timestamp":123},"protocol_version":1}
+{"type":"model_route_event","model_route_event":{"phase":"coding","model":"sonnet","provider":"anthropic","reason":"golden route","confidence":0.8},"protocol_version":1}
+{"type":"team_execution_event","team_execution_event":{"seq":3,"team_id":"team-golden","task_id":"task-golden","role":"coder","kind":"worker_assigned","message":"assigned"},"protocol_version":1}
+{"type":"recovery_event","recovery_event":{"recovery_attempted":{"scenario":"compile_failure","result":{"recovered":{"steps_taken":1}}}},"protocol_version":1}
+{"type":"recovery_action_event","recovery_action_event":{"task_id":"task-golden","results":[{"executed":true,"blocked":false,"reason":"retry scheduled"}]},"protocol_version":1}
+{"type":"task_execution_event","task_execution_event":{"task_id":"task-golden","steps":[{"task_id":"task-golden","node_id":"node-golden","kind":"resume_node","message":"resumed"}],"completed":false,"blocked":false,"message":"running"},"protocol_version":1}
+{"type":"task_list","tasks":[{"task_id":"task-golden","status":"running"}],"protocol_version":1}
+{"type":"task_show","task":{"task_id":"task-golden","status":"running"},"ledger":[],"protocol_version":1}
+{"type":"task_packet_create","task":{"task_id":"task-golden"},"ledger":[],"verification_handoff":{},"protocol_version":1}
+{"type":"task_scheduler_tick","tick":{"status":"running","selected_task_id":"task-golden","queue":[]},"protocol_version":1}
+{"type":"task_scheduler_queue","queue":[{"task_id":"task-golden","status":"running","task_status":"running"}],"protocol_version":1}
+{"type":"task_scheduler_daemon_run","runs":[],"state":null,"protocol_version":1}
+{"type":"task_scheduler_daemon_status","state":null,"state_path":"/tmp/golden-state.json","events_path":"/tmp/golden-events.jsonl","protocol_version":1}
+{"type":"task_scheduler_daemon_logs","events":[],"events_path":"/tmp/golden-events.jsonl","protocol_version":1}
+{"type":"route_feedback_summary","summaries":[{"phase":"coding","model":"sonnet","total":2,"failures":0,"recovery_triggered":0,"success_rate":1,"avg_latency_ms":1200,"avg_tokens":3000,"avg_cost_usd":0.02}],"feedback_count":2,"feedback_path":"/tmp/golden-feedback.json","protocol_version":1}
+{"type":"benchmark_suite","suite_id":"complex-coding-agent-v1","version":"2026.05","tasks":[{"id":"task-golden","title":"Golden task"}],"protocol_version":1}
+{"type":"benchmark_task","task":{"id":"task-golden","title":"Golden task"},"protocol_version":1}
+{"type":"benchmark_run","run":{"summary":{"total_tasks":1,"passed_tasks":1}},"protocol_version":1}
+{"type":"worker_list","workers":[{"worker_id":"worker-golden","status":"running"}],"protocol_version":1}
+{"type":"worker_spawn","worker":{"worker_id":"worker-golden","status":"running","process":{"pid":123,"command":["sh","-c","sleep 1"],"started_at":123},"isolation":{"kind":"git_worktree","source_cwd":"/repo","worktree_path":"/repo/.claude/worktrees/worker-golden","created_at":123}},"protocol_version":1}
+{"type":"worker_ready","ready":{"worker_id":"worker-golden","ready":true},"protocol_version":1}
+{"type":"worker_supervisor_tick","tick":{"status":"running","active_workers":1,"blocked_workers":0,"restarted_workers":0,"trust_queue":[],"capacity":{"max_workers":4,"active_workers":1,"available_slots":3},"workers":[{"worker_id":"worker-golden","status":"running","process":{"pid":123},"isolation":{"kind":"git_worktree","worktree_path":"/repo/.claude/worktrees/worker-golden"}}],"event_index":[]},"protocol_version":1}
+{"type":"permission_request","tool":"write_file","input":{"path":"generated.txt"},"current_mode":"read-only","required_mode":"workspace-write","reason":"requires workspace-write","protocol_version":1}
+{"type":"recovery_suggestion","source_event":"permission_denial","failure_class":"trust_gate","tool":"write_file","reason":"requires permission","action":"retry_with_danger_full_access","suggestion":"Retry with full access","protocol_version":1}
+{"type":"text_delta","text":"replay","protocol_version":1}
+{"type":"done","iterations":1,"protocol_version":1}

@@ -139,6 +139,12 @@
           "$ref": "#/$defs/taskSchedulerDaemonStatusEvent"
         },
         {
+          "$ref": "#/$defs/taskSchedulerDaemonLogsEvent"
+        },
+        {
+          "$ref": "#/$defs/routeFeedbackSummaryEvent"
+        },
+        {
           "$ref": "#/$defs/benchmarkSuiteEvent"
         },
         {
@@ -207,11 +213,15 @@
         "task_scheduler_queue",
         "task_scheduler_daemon_run",
         "task_scheduler_daemon_status",
+        "task_scheduler_daemon_logs",
+        "route_feedback_summary",
         "benchmark_suite",
         "benchmark_task",
         "benchmark_run",
         "worker_list",
         "worker_create",
+        "worker_spawn",
+        "worker_probe",
         "worker_observe",
         "worker_ready",
         "worker_resolve_trust",
@@ -1077,6 +1087,34 @@
         }
       ]
     },
+    "routeFeedbackSummaryEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "summaries",
+            "feedback_count"
+          ],
+          "properties": {
+            "type": {
+              "const": "route_feedback_summary"
+            },
+            "summaries": {
+              "type": "array"
+            },
+            "feedback_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "feedback_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
     "benchmarkSuiteEvent": {
       "allOf": [
         {
@@ -1178,6 +1216,8 @@
             "type": {
               "enum": [
                 "worker_create",
+                "worker_spawn",
+                "worker_probe",
                 "worker_observe",
                 "worker_resolve_trust",
                 "worker_prompt",
@@ -1303,6 +1343,30 @@
             },
             "state_path": {
               "type": "string"
+            },
+            "events_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "taskSchedulerDaemonLogsEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "events",
+            "events_path"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_scheduler_daemon_logs"
+            },
+            "events": {
+              "type": "array"
             },
             "events_path": {
               "type": "string"

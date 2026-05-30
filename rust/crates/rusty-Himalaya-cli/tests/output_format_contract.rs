@@ -63,9 +63,21 @@ fn benchmark_commands_emit_suite_and_record_runs() {
             > 0
     );
     assert!(
+        run["run"]["summary"]["average_adaptive_routing_quality_score"]
+            .as_f64()
+            .expect("average adaptive routing quality score")
+            > 0.75
+    );
+    assert!(
         run["run"]["results"][0]["score"]["execution_score"]
             .as_f64()
             .expect("execution score")
+            > 0.0
+    );
+    assert!(
+        run["run"]["results"][0]["score"]["adaptive_routing_quality_score"]
+            .as_f64()
+            .expect("adaptive routing quality score")
             > 0.0
     );
     assert!(root.join(".Himalaya/benchmarks/runs.jsonl").exists());
@@ -344,25 +356,131 @@ fn task_scheduler_tick_persists_durable_status() {
             "--output-format",
             "json",
             "tasks",
-            "scheduler",
-            "run",
+            "daemon",
+            "start",
             "--once",
         ],
     );
     assert_eq!(daemon["type"], "task_scheduler_daemon_run");
+    assert_eq!(daemon["command"], "start");
     assert!(daemon["runs"].as_array().expect("daemon runs array").len() >= 1);
     assert_eq!(daemon["state"]["tick_count"], 1);
+    assert!(daemon["state_path"]
+        .as_str()
+        .expect("state path")
+        .contains(".Himalaya/scheduler/state.json"));
 
     let daemon_status = assert_json_command(
         &root,
-        &["--output-format", "json", "tasks", "scheduler", "status"],
+        &["--output-format", "json", "tasks", "daemon", "status"],
     );
     assert_eq!(daemon_status["type"], "task_scheduler_daemon_status");
     assert_eq!(daemon_status["state"]["tick_count"], 1);
+
+    let daemon_logs = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "daemon",
+            "logs",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(daemon_logs["type"], "task_scheduler_daemon_logs");
+    assert_eq!(
+        daemon_logs["events"]
+            .as_array()
+            .expect("events array")
+            .len(),
+        1
+    );
+
+    let daemon_stop = assert_json_command(
+        &root,
+        &["--output-format", "json", "tasks", "daemon", "stop"],
+    );
+    assert_eq!(daemon_stop["type"], "task_scheduler_daemon_status");
+    assert_eq!(daemon_stop["command"], "stop");
+    assert_eq!(daemon_stop["state"]["status"], "stopped");
     assert!(root.join(".Himalaya/scheduler/state.json").exists());
     assert!(root.join(".Himalaya/scheduler/events.jsonl").exists());
     assert!(root.join(".Himalaya/tasks/tasks.json").exists());
     assert!(root.join(".Himalaya/tasks/events.jsonl").exists());
+}
+
+#[test]
+fn route_feedback_summary_emits_metric_summaries() {
+    let root = unique_temp_dir("route-feedback-summary-json");
+    fs::create_dir_all(root.join(".Himalaya/routes")).expect("route feedback dir should exist");
+    fs::write(
+        root.join(".Himalaya/routes/feedback.json"),
+        r#"{
+  "feedback": [
+    {
+      "task_id": "task-1",
+      "route": {
+        "phase": "coding",
+        "model": "sonnet",
+        "provider": null,
+        "reason": "test",
+        "confidence": 0.8,
+        "fallback_model": null
+      },
+      "succeeded": true,
+      "latency_ms": 1000,
+      "input_tokens": 1500,
+      "output_tokens": 500,
+      "cost_usd": 0.01,
+      "verification_passed": true,
+      "recovery_triggered": false,
+      "timestamp": 1,
+      "note": null
+    },
+    {
+      "task_id": "task-2",
+      "route": {
+        "phase": "coding",
+        "model": "sonnet",
+        "provider": null,
+        "reason": "test",
+        "confidence": 0.8,
+        "fallback_model": null
+      },
+      "succeeded": false,
+      "latency_ms": 3000,
+      "input_tokens": 2500,
+      "output_tokens": 1500,
+      "cost_usd": 0.03,
+      "verification_passed": false,
+      "recovery_triggered": true,
+      "timestamp": 2,
+      "note": "failed"
+    }
+  ]
+}
+"#,
+    )
+    .expect("feedback should write");
+
+    let summary = assert_json_command(
+        &root,
+        &["--output-format", "json", "routes", "feedback", "summary"],
+    );
+
+    assert_eq!(summary["type"], "route_feedback_summary");
+    assert_eq!(summary["feedback_count"], 2);
+    let route = &summary["summaries"][0];
+    assert_eq!(route["phase"], "coding");
+    assert_eq!(route["model"], "sonnet");
+    assert_eq!(route["total"], 2);
+    assert_eq!(route["failures"], 1);
+    assert_eq!(route["recovery_triggered"], 1);
+    assert_eq!(route["avg_latency_ms"], 2000.0);
+    assert_eq!(route["avg_tokens"], 3000.0);
+    assert_eq!(route["avg_cost_usd"], 0.02);
 }
 
 #[test]
@@ -459,6 +577,67 @@ fn worker_supervisor_commands_persist_worker_state() {
     assert!(root.join(".Himalaya/workers/workers.json").exists());
 }
 
+#[test]
+fn worker_process_commands_persist_process_metadata() {
+    let root = unique_temp_dir("worker-process-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+    git(&root, &["init", "--quiet", "--initial-branch=main"]);
+    git(&root, &["config", "user.email", "tests@example.com"]);
+    git(&root, &["config", "user.name", "Worker Process Tests"]);
+    fs::write(root.join("marker.txt"), "ok\n").expect("marker should write");
+    git(&root, &["add", "marker.txt"]);
+    git(&root, &["commit", "-m", "initial", "--quiet"]);
+
+    let spawned = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "workers",
+            "spawn",
+            "--cwd",
+            root.to_str().expect("root should be utf8"),
+            "--isolate-worktree",
+            "--worktree-root",
+            root.join("isolated")
+                .to_str()
+                .expect("worktree root should be utf8"),
+            "--",
+            "sh",
+            "-c",
+            "test -f marker.txt",
+        ],
+    );
+    assert_eq!(spawned["type"], "worker_spawn");
+    assert_eq!(spawned["worker"]["status"], "running");
+    assert!(spawned["worker"]["process"]["pid"].as_u64().is_some());
+    assert_eq!(spawned["worker"]["process"]["command"][0], "sh");
+    assert_eq!(spawned["worker"]["isolation"]["kind"], "git_worktree");
+    assert!(spawned["worker"]["isolation"]["worktree_path"]
+        .as_str()
+        .expect("worktree path")
+        .contains("worker-worktree-"));
+    assert_eq!(
+        spawned["worker"]["cwd"],
+        spawned["worker"]["isolation"]["worktree_path"]
+    );
+    let worker_id = spawned["worker"]["worker_id"]
+        .as_str()
+        .expect("worker id")
+        .to_string();
+
+    let probed = assert_json_command(
+        &root,
+        &["--output-format", "json", "workers", "probe", &worker_id],
+    );
+    assert_eq!(probed["type"], "worker_probe");
+    assert!(matches!(
+        probed["worker"]["status"].as_str(),
+        Some("finished" | "running")
+    ));
+    assert!(probed["worker"]["process"].is_object());
+    assert!(root.join(".Himalaya/workers/workers.json").exists());
+}
 #[test]
 fn agents_command_emits_structured_agent_entries_when_requested() {
     let root = unique_temp_dir("agents-json-populated");
@@ -787,6 +966,21 @@ fn run_Himalaya(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Out
         command.env(key, value);
     }
     command.output().expect("Himalaya should launch")
+}
+
+fn git(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git should run");
+    assert!(
+        output.status.success(),
+        "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn write_upstream_fixture(root: &Path) -> PathBuf {
