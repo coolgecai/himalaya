@@ -19,6 +19,9 @@ pub struct RouteFeedbackSummary {
     pub failures: usize,
     pub recovery_triggered: usize,
     pub success_rate: f32,
+    pub avg_latency_ms: Option<f32>,
+    pub avg_tokens: Option<f32>,
+    pub avg_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,6 +69,9 @@ impl RouteFeedbackStore {
                 && entry.route.provider == feedback.route.provider
                 && entry.succeeded == feedback.succeeded
                 && entry.latency_ms == feedback.latency_ms
+                && entry.input_tokens == feedback.input_tokens
+                && entry.output_tokens == feedback.output_tokens
+                && entry.cost_usd == feedback.cost_usd
                 && entry.verification_passed == feedback.verification_passed
                 && entry.recovery_triggered == feedback.recovery_triggered
                 && entry.note == feedback.note
@@ -106,6 +112,18 @@ impl RouteFeedbackStore {
                 .iter()
                 .filter(|candidate| candidate.recovery_triggered)
                 .count();
+            let avg_latency_ms = average_f32(
+                related
+                    .iter()
+                    .filter_map(|candidate| candidate.latency_ms.map(|value| value as f32)),
+            );
+            let avg_tokens = average_f32(
+                related
+                    .iter()
+                    .filter_map(|candidate| candidate.total_tokens().map(|value| value as f32)),
+            );
+            let avg_cost_usd =
+                average_f64(related.iter().filter_map(|candidate| candidate.cost_usd));
             summaries.push(RouteFeedbackSummary {
                 phase: entry.route.phase,
                 model: entry.route.model.clone(),
@@ -117,10 +135,33 @@ impl RouteFeedbackStore {
                 } else {
                     (total - failures) as f32 / total as f32
                 },
+                avg_latency_ms,
+                avg_tokens,
+                avg_cost_usd,
             });
         }
         summaries
     }
+}
+
+fn average_f32(values: impl Iterator<Item = f32>) -> Option<f32> {
+    let mut total = 0.0;
+    let mut count = 0_u32;
+    for value in values {
+        total += value;
+        count = count.saturating_add(1);
+    }
+    (count > 0).then_some(total / count as f32)
+}
+
+fn average_f64(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut total = 0.0;
+    let mut count = 0_u32;
+    for value in values {
+        total += value;
+        count = count.saturating_add(1);
+    }
+    (count > 0).then_some(total / f64::from(count))
 }
 
 #[cfg(test)]
@@ -138,12 +179,9 @@ mod tests {
             confidence: Some(0.8),
             fallback_model: Some("sonnet".to_string()),
         };
-        let feedback = ModelRouteFeedback::pending("task-1", route, 7).with_outcome(
-            false,
-            Some(false),
-            true,
-            Some("failed".to_string()),
-        );
+        let feedback = ModelRouteFeedback::pending("task-1", route, 7)
+            .with_metrics(Some(900), Some(1_000), Some(200), Some(0.02))
+            .with_outcome(false, Some(false), true, Some("failed".to_string()));
         let mut store = RouteFeedbackStore::new();
         store.record(feedback.clone());
         store.record(feedback);
@@ -195,13 +233,19 @@ mod tests {
         };
         let store = RouteFeedbackStore::from_feedback(vec![
             ModelRouteFeedback::pending("task-1", route.clone(), 1)
+                .with_metrics(Some(1_000), Some(1_500), Some(500), Some(0.01))
                 .with_outcome(true, None, false, None),
-            ModelRouteFeedback::pending("task-2", route, 2).with_outcome(false, None, true, None),
+            ModelRouteFeedback::pending("task-2", route, 2)
+                .with_metrics(Some(3_000), Some(2_500), Some(1_500), Some(0.03))
+                .with_outcome(false, None, true, None),
         ]);
         let summary = store.summaries().pop().expect("summary");
 
         assert_eq!(summary.total, 2);
         assert_eq!(summary.failures, 1);
         assert_eq!(summary.recovery_triggered, 1);
+        assert_eq!(summary.avg_latency_ms, Some(2_000.0));
+        assert_eq!(summary.avg_tokens, Some(3_000.0));
+        assert_eq!(summary.avg_cost_usd, Some(0.02));
     }
 }

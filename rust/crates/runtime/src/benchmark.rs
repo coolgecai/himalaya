@@ -40,6 +40,7 @@ pub struct BenchmarkScore {
     pub decomposition_score: f32,
     pub scheduler_score: f32,
     pub moe_route_score: f32,
+    pub adaptive_routing_quality_score: f32,
     pub execution_score: f32,
     pub total: f32,
 }
@@ -79,6 +80,7 @@ pub struct BenchmarkSummary {
     pub total_tasks: usize,
     pub average_total_score: f32,
     pub average_capability_coverage: f32,
+    pub average_adaptive_routing_quality_score: f32,
     pub parallel_plans: usize,
     pub review_or_deny_tasks: usize,
     pub total_plan_steps: usize,
@@ -313,7 +315,7 @@ fn run_benchmark_task(
         snapshot.plan.steps.len(),
         scheduler_ready_nodes,
         scheduler_total_nodes,
-        route_decisions.len(),
+        &route_decisions,
         &harness,
     );
 
@@ -625,7 +627,7 @@ fn score_benchmark_task(
     plan_steps: usize,
     ready_nodes: usize,
     total_nodes: usize,
-    route_count: usize,
+    route_decisions: &[ModelRouteDecision],
     harness: &BenchmarkExecutionHarnessResult,
 ) -> BenchmarkScore {
     let capability_coverage = capability_coverage(&spec.expected_capabilities, selected_tools);
@@ -636,8 +638,11 @@ fn score_benchmark_task(
     } else {
         0.0
     };
-    let expected_routes = benchmark_route_phases(spec).len().max(1);
-    let moe_route_score = (route_count as f32 / expected_routes as f32).clamp(0.0, 1.0);
+    let expected_phases = benchmark_route_phases(spec);
+    let expected_routes = expected_phases.len().max(1);
+    let moe_route_score = (route_decisions.len() as f32 / expected_routes as f32).clamp(0.0, 1.0);
+    let adaptive_routing_quality_score =
+        adaptive_routing_quality_score(&expected_phases, route_decisions);
     let execution_score = if harness.completed {
         1.0
     } else if harness.worker_dispatches > 0 && !harness.blocked {
@@ -650,16 +655,70 @@ fn score_benchmark_task(
     let total = capability_coverage * 0.25
         + decomposition_score * 0.20
         + scheduler_score * 0.20
-        + moe_route_score * 0.15
+        + moe_route_score * 0.10
+        + adaptive_routing_quality_score * 0.05
         + execution_score * 0.20;
     BenchmarkScore {
         capability_coverage,
         decomposition_score,
         scheduler_score,
         moe_route_score,
+        adaptive_routing_quality_score,
         execution_score,
         total,
     }
+}
+
+fn adaptive_routing_quality_score(
+    expected_phases: &[ModelRoutePhase],
+    route_decisions: &[ModelRouteDecision],
+) -> f32 {
+    if expected_phases.is_empty() {
+        return 1.0;
+    }
+
+    let phase_coverage = expected_phases
+        .iter()
+        .filter(|phase| {
+            route_decisions
+                .iter()
+                .any(|decision| decision.phase == **phase)
+        })
+        .count() as f32
+        / expected_phases.len() as f32;
+    let confidence_score = average_route_confidence(route_decisions);
+    let explainability_score = if route_decisions
+        .iter()
+        .all(|decision| !decision.reason.trim().is_empty())
+    {
+        1.0
+    } else {
+        0.0
+    };
+    let adaptive_evidence_score = if route_decisions.iter().any(|decision| {
+        decision.fallback_model.is_some() || decision.reason.contains("adaptive route selected")
+    }) {
+        1.0
+    } else {
+        0.75
+    };
+
+    (phase_coverage * 0.45
+        + confidence_score * 0.30
+        + explainability_score * 0.15
+        + adaptive_evidence_score * 0.10)
+        .clamp(0.0, 1.0)
+}
+
+fn average_route_confidence(route_decisions: &[ModelRouteDecision]) -> f32 {
+    if route_decisions.is_empty() {
+        return 0.0;
+    }
+    route_decisions
+        .iter()
+        .map(|decision| decision.confidence.unwrap_or(0.5).clamp(0.0, 1.0))
+        .sum::<f32>()
+        / route_decisions.len() as f32
 }
 
 fn capability_coverage(expected: &[String], selected_tools: &[Tool]) -> f32 {
@@ -687,6 +746,11 @@ fn summarize_results(results: &[BenchmarkTaskResult]) -> BenchmarkSummary {
         average_capability_coverage: results
             .iter()
             .map(|result| result.score.capability_coverage)
+            .sum::<f32>()
+            / denominator,
+        average_adaptive_routing_quality_score: results
+            .iter()
+            .map(|result| result.score.adaptive_routing_quality_score)
             .sum::<f32>()
             / denominator,
         parallel_plans: results
@@ -779,6 +843,11 @@ mod tests {
             .results
             .iter()
             .all(|result| result.score.execution_score > 0.0));
+        assert!(run.summary.average_adaptive_routing_quality_score > 0.75);
+        assert!(run
+            .results
+            .iter()
+            .all(|result| result.score.adaptive_routing_quality_score > 0.0));
         assert!(run
             .results
             .iter()
@@ -787,5 +856,39 @@ mod tests {
             .results
             .iter()
             .all(|result| !result.route_decisions.is_empty()));
+    }
+
+    #[test]
+    fn adaptive_routing_quality_rewards_confident_explainable_routes() {
+        let phases = vec![ModelRoutePhase::Planning, ModelRoutePhase::Verification];
+        let strong = vec![
+            ModelRouteDecision {
+                phase: ModelRoutePhase::Planning,
+                model: "sonnet".to_string(),
+                provider: Some("anthropic".to_string()),
+                reason: "default planning route".to_string(),
+                confidence: Some(0.9),
+                fallback_model: None,
+            },
+            ModelRouteDecision {
+                phase: ModelRoutePhase::Verification,
+                model: "opus".to_string(),
+                provider: Some("anthropic".to_string()),
+                reason: "adaptive route selected from route feedback".to_string(),
+                confidence: Some(0.8),
+                fallback_model: Some("sonnet".to_string()),
+            },
+        ];
+        let weak = vec![ModelRouteDecision {
+            phase: ModelRoutePhase::Planning,
+            model: "sonnet".to_string(),
+            provider: None,
+            reason: String::new(),
+            confidence: Some(0.2),
+            fallback_model: None,
+        }];
+
+        assert!(adaptive_routing_quality_score(&phases, &strong) > 0.85);
+        assert!(adaptive_routing_quality_score(&phases, &weak) < 0.55);
     }
 }

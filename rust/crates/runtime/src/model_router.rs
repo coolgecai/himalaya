@@ -173,6 +173,9 @@ pub struct ModelRouteFeedback {
     pub route: ModelRouteDecision,
     pub succeeded: Option<bool>,
     pub latency_ms: Option<u32>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
     pub verification_passed: Option<bool>,
     pub recovery_triggered: bool,
     pub timestamp: u64,
@@ -187,6 +190,9 @@ impl ModelRouteFeedback {
             route,
             succeeded: None,
             latency_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
             verification_passed: None,
             recovery_triggered: false,
             timestamp,
@@ -207,6 +213,31 @@ impl ModelRouteFeedback {
         self.recovery_triggered = recovery_triggered;
         self.note = note;
         self
+    }
+
+    #[must_use]
+    pub fn with_metrics(
+        mut self,
+        latency_ms: Option<u32>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cost_usd: Option<f64>,
+    ) -> Self {
+        self.latency_ms = latency_ms;
+        self.input_tokens = input_tokens;
+        self.output_tokens = output_tokens;
+        self.cost_usd = cost_usd;
+        self
+    }
+
+    #[must_use]
+    pub fn total_tokens(&self) -> Option<u64> {
+        match (self.input_tokens, self.output_tokens) {
+            (Some(input), Some(output)) => Some(input.saturating_add(output)),
+            (Some(input), None) => Some(input),
+            (None, Some(output)) => Some(output),
+            (None, None) => None,
+        }
     }
 }
 
@@ -346,6 +377,9 @@ impl ModelRouter {
 struct RouteFeedbackStats {
     total: usize,
     failures: usize,
+    avg_latency_ms: Option<f32>,
+    avg_tokens: Option<f32>,
+    avg_cost_usd: Option<f32>,
 }
 
 impl RouteFeedbackStats {
@@ -362,9 +396,27 @@ impl RouteFeedbackStats {
             .iter()
             .filter(|entry| entry.succeeded == Some(false) || entry.recovery_triggered)
             .count();
+        let avg_latency_ms = average_metric(
+            related
+                .iter()
+                .filter_map(|entry| entry.latency_ms.map(|value| value as f32)),
+        );
+        let avg_tokens = average_metric(
+            related
+                .iter()
+                .filter_map(|entry| entry.total_tokens().map(|value| value as f32)),
+        );
+        let avg_cost_usd = average_metric(
+            related
+                .iter()
+                .filter_map(|entry| entry.cost_usd.map(|value| value as f32)),
+        );
         Self {
             total: related.len(),
             failures,
+            avg_latency_ms,
+            avg_tokens,
+            avg_cost_usd,
         }
     }
 
@@ -375,6 +427,19 @@ impl RouteFeedbackStats {
             self.failures as f32 / self.total as f32
         }
     }
+
+    fn efficiency_factor(self, route: &ModelRoute) -> f32 {
+        let latency_factor = self.avg_latency_ms.map_or(1.0, |latency| {
+            metric_penalty(latency, 1_000.0, route.latency_weight)
+        });
+        let token_factor = self.avg_tokens.map_or(1.0, |tokens| {
+            metric_penalty(tokens, 4_000.0, route.cost_weight)
+        });
+        let cost_factor = self
+            .avg_cost_usd
+            .map_or(1.0, |cost| metric_penalty(cost, 0.05, route.cost_weight));
+        (latency_factor * token_factor * cost_factor).clamp(0.25, 1.25)
+    }
 }
 
 fn route_weight_score(route: &ModelRoute) -> f32 {
@@ -383,8 +448,26 @@ fn route_weight_score(route: &ModelRoute) -> f32 {
         + f32::from(route.cost_weight)
 }
 
+fn average_metric(values: impl Iterator<Item = f32>) -> Option<f32> {
+    let mut total = 0.0;
+    let mut count = 0_u32;
+    for value in values {
+        total += value;
+        count = count.saturating_add(1);
+    }
+    (count > 0).then_some(total / count as f32)
+}
+
+fn metric_penalty(value: f32, target: f32, weight: u8) -> f32 {
+    let weight = f32::from(weight).clamp(1.0, 5.0) / 5.0;
+    let over_target = (value / target).max(1.0) - 1.0;
+    (1.0 / (1.0 + over_target * weight)).clamp(0.35, 1.0)
+}
+
 fn adaptive_route_score(route: &ModelRoute, stats: &RouteFeedbackStats) -> f32 {
-    route_weight_score(route) * (1.0 - stats.failure_rate()).clamp(0.1, 1.0)
+    route_weight_score(route)
+        * (1.0 - stats.failure_rate()).clamp(0.1, 1.0)
+        * stats.efficiency_factor(route)
 }
 
 #[cfg(test)]
@@ -434,5 +517,42 @@ mod tests {
         assert_eq!(decision.fallback_model, Some("sonnet".to_string()));
         assert!(decision.reason.contains("adaptive route selected"));
         assert!(decision.reason.contains("route feedback"));
+    }
+
+    #[test]
+    fn adaptive_score_penalizes_expensive_slow_routes() {
+        let fast_route = ModelRoute::new(ModelRoutePhase::Coding, "fast").with_weights(5, 5, 3);
+        let slow_route = ModelRoute::new(ModelRoutePhase::Coding, "slow").with_weights(5, 5, 3);
+        let fast_decision = ModelRouteDecision {
+            phase: ModelRoutePhase::Coding,
+            model: "fast".to_string(),
+            provider: None,
+            reason: "test".to_string(),
+            confidence: None,
+            fallback_model: None,
+        };
+        let slow_decision = ModelRouteDecision {
+            phase: ModelRoutePhase::Coding,
+            model: "slow".to_string(),
+            provider: None,
+            reason: "test".to_string(),
+            confidence: None,
+            fallback_model: None,
+        };
+        let feedback = vec![
+            ModelRouteFeedback::pending("task-1", fast_decision, 1)
+                .with_metrics(Some(500), Some(800), Some(200), Some(0.01))
+                .with_outcome(true, Some(true), false, None),
+            ModelRouteFeedback::pending("task-2", slow_decision, 2)
+                .with_metrics(Some(5_000), Some(8_000), Some(4_000), Some(0.25))
+                .with_outcome(true, Some(true), false, None),
+        ];
+        let fast_stats = RouteFeedbackStats::for_route(ModelRoutePhase::Coding, "fast", &feedback);
+        let slow_stats = RouteFeedbackStats::for_route(ModelRoutePhase::Coding, "slow", &feedback);
+
+        assert!(
+            adaptive_route_score(&fast_route, &fast_stats)
+                > adaptive_route_score(&slow_route, &slow_stats)
+        );
     }
 }
