@@ -60,6 +60,7 @@ pub enum WorkerFailureKind {
     PromptDelivery,
     Protocol,
     Provider,
+    LeaseExpired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +81,8 @@ pub enum WorkerEventKind {
     PromptReplayArmed,
     PromptAccepted,
     Running,
+    Heartbeat,
+    LeaseExpired,
     Restarted,
     Finished,
     Failed,
@@ -144,6 +147,16 @@ pub struct Worker {
     pub last_prompt: Option<String>,
     pub replay_prompt: Option<String>,
     pub last_error: Option<WorkerFailure>,
+    #[serde(default)]
+    pub heartbeat_at: u64,
+    #[serde(default)]
+    pub lease_expires_at: u64,
+    #[serde(default)]
+    pub restart_count: u32,
+    #[serde(default = "default_worker_max_restarts")]
+    pub max_restarts: u32,
+    #[serde(default)]
+    pub last_restart_at: Option<u64>,
     pub created_at: u64,
     pub updated_at: u64,
     pub events: Vec<WorkerEvent>,
@@ -157,6 +170,12 @@ struct WorkerRegistrySnapshot {
 }
 
 const WORKER_REGISTRY_SNAPSHOT_VERSION: u32 = 1;
+pub const DEFAULT_WORKER_LEASE_SECS: u64 = 120;
+pub const DEFAULT_WORKER_MAX_RESTARTS: u32 = 2;
+
+const fn default_worker_max_restarts() -> u32 {
+    DEFAULT_WORKER_MAX_RESTARTS
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct WorkerRegistry {
@@ -201,6 +220,11 @@ impl WorkerRegistry {
             last_prompt: None,
             replay_prompt: None,
             last_error: None,
+            heartbeat_at: ts,
+            lease_expires_at: ts + DEFAULT_WORKER_LEASE_SECS,
+            restart_count: 0,
+            max_restarts: DEFAULT_WORKER_MAX_RESTARTS,
+            last_restart_at: None,
             created_at: ts,
             updated_at: ts,
             events: Vec::new(),
@@ -250,7 +274,10 @@ impl WorkerRegistry {
         let workers = snapshot
             .workers
             .into_iter()
-            .map(|worker| (worker.worker_id.clone(), worker))
+            .map(|worker| {
+                let worker = normalize_loaded_worker(worker);
+                (worker.worker_id.clone(), worker)
+            })
             .collect();
         Ok(Self {
             inner: Arc::new(Mutex::new(WorkerRegistryInner {
@@ -266,6 +293,7 @@ impl WorkerRegistry {
             .workers
             .get_mut(worker_id)
             .ok_or_else(|| format!("worker not found: {worker_id}"))?;
+        refresh_worker_lease(worker, now_secs(), DEFAULT_WORKER_LEASE_SECS);
         let lowered = screen_text.to_ascii_lowercase();
 
         if !worker.trust_gate_cleared && detect_trust_prompt(&lowered) {
@@ -406,6 +434,57 @@ impl WorkerRegistry {
         Ok(worker.clone())
     }
 
+    pub fn heartbeat(&self, worker_id: &str, lease_secs: u64) -> Result<Worker, String> {
+        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let worker = inner
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| format!("worker not found: {worker_id}"))?;
+        if is_terminal(worker.status) {
+            return Err(format!(
+                "worker {worker_id} cannot heartbeat after terminal status: {}",
+                worker.status
+            ));
+        }
+        refresh_worker_lease(worker, now_secs(), lease_secs);
+        push_event(
+            worker,
+            WorkerEventKind::Heartbeat,
+            worker.status,
+            Some(format!("worker heartbeat; lease extended by {lease_secs}s")),
+            None,
+        );
+        Ok(worker.clone())
+    }
+
+    #[must_use]
+    pub fn restart_stale_workers(&self, now: u64, lease_secs: u64) -> Vec<Worker> {
+        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        inner
+            .workers
+            .values_mut()
+            .filter_map(|worker| restart_stale_worker(worker, now, lease_secs))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn restart_stale_workers_now(&self, lease_secs: u64) -> Vec<Worker> {
+        self.restart_stale_workers(now_secs(), lease_secs)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_lease_for_test(&self, worker_id: &str) -> Result<Worker, String> {
+        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let worker = inner
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| format!("worker not found: {worker_id}"))?;
+        let now = now_secs();
+        worker.heartbeat_at = now.saturating_sub(DEFAULT_WORKER_LEASE_SECS + 1);
+        worker.lease_expires_at = now.saturating_sub(1);
+        Ok(worker.clone())
+    }
+
     pub fn resolve_trust(&self, worker_id: &str) -> Result<Worker, String> {
         let mut inner = self.inner.lock().expect("worker registry lock poisoned");
         let worker = inner
@@ -457,6 +536,7 @@ impl WorkerRegistry {
             .or_else(|| worker.replay_prompt.clone())
             .ok_or_else(|| format!("worker {worker_id} has no prompt to send or replay"))?;
 
+        refresh_worker_lease(worker, now_secs(), DEFAULT_WORKER_LEASE_SECS);
         worker.prompt_delivery_attempts += 1;
         worker.prompt_in_flight = true;
         worker.last_prompt = Some(next_prompt.clone());
@@ -600,8 +680,87 @@ pub struct WorkerReadySnapshot {
     pub last_error: Option<WorkerFailure>,
 }
 
-fn prompt_misdelivery_is_relevant(worker: &Worker) -> bool {
-    worker.prompt_in_flight && worker.last_prompt.is_some()
+fn normalize_loaded_worker(mut worker: Worker) -> Worker {
+    if worker.heartbeat_at == 0 {
+        worker.heartbeat_at = worker.updated_at.max(worker.created_at);
+    }
+    if worker.lease_expires_at == 0 {
+        worker.lease_expires_at = worker.heartbeat_at + DEFAULT_WORKER_LEASE_SECS;
+    }
+    if worker.max_restarts == 0 {
+        worker.max_restarts = DEFAULT_WORKER_MAX_RESTARTS;
+    }
+    worker
+}
+
+fn refresh_worker_lease(worker: &mut Worker, now: u64, lease_secs: u64) {
+    worker.heartbeat_at = now;
+    worker.lease_expires_at = now + lease_secs;
+}
+
+fn is_terminal(status: WorkerStatus) -> bool {
+    matches!(status, WorkerStatus::Finished | WorkerStatus::Failed)
+}
+
+fn restart_stale_worker(worker: &mut Worker, now: u64, lease_secs: u64) -> Option<Worker> {
+    if is_terminal(worker.status) || worker.status == WorkerStatus::TrustRequired {
+        return None;
+    }
+    if worker.lease_expires_at == 0 || now <= worker.lease_expires_at {
+        return None;
+    }
+
+    let stale_message = format!(
+        "worker lease expired at {}; last heartbeat at {}",
+        worker.lease_expires_at, worker.heartbeat_at
+    );
+    worker.last_error = Some(WorkerFailure {
+        kind: WorkerFailureKind::LeaseExpired,
+        message: stale_message.clone(),
+        created_at: now,
+    });
+    worker.prompt_in_flight = false;
+
+    if worker.restart_count >= worker.max_restarts {
+        push_event(
+            worker,
+            WorkerEventKind::LeaseExpired,
+            WorkerStatus::Failed,
+            Some(format!("{stale_message}; restart budget exhausted")),
+            None,
+        );
+        return Some(worker.clone());
+    }
+
+    worker.last_error = None;
+    worker.restart_count += 1;
+    worker.last_restart_at = Some(now);
+    worker.replay_prompt = worker
+        .last_prompt
+        .clone()
+        .or_else(|| worker.replay_prompt.clone());
+    worker.status = WorkerStatus::Spawning;
+    worker.trust_gate_cleared = false;
+    worker.prompt_delivery_attempts = 0;
+    refresh_worker_lease(worker, now, lease_secs);
+    push_event(
+        worker,
+        WorkerEventKind::LeaseExpired,
+        WorkerStatus::Failed,
+        Some(stale_message),
+        None,
+    );
+    push_event(
+        worker,
+        WorkerEventKind::Restarted,
+        WorkerStatus::Spawning,
+        Some(format!(
+            "stale worker restarted (attempt {})",
+            worker.restart_count
+        )),
+        None,
+    );
+    Some(worker.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -651,6 +810,11 @@ fn emit_state_file(worker: &Worker) {
         trust_gate_cleared: bool,
         prompt_in_flight: bool,
         last_event: Option<&'a WorkerEvent>,
+        heartbeat_at: u64,
+        lease_expires_at: u64,
+        restart_count: u32,
+        max_restarts: u32,
+        last_restart_at: Option<u64>,
         updated_at: u64,
         /// Seconds since last state transition. Himalayahip uses this to detect
         /// stalled workers without computing epoch deltas.
@@ -665,6 +829,11 @@ fn emit_state_file(worker: &Worker) {
         trust_gate_cleared: worker.trust_gate_cleared,
         prompt_in_flight: worker.prompt_in_flight,
         last_event: worker.events.last(),
+        heartbeat_at: worker.heartbeat_at,
+        lease_expires_at: worker.lease_expires_at,
+        restart_count: worker.restart_count,
+        max_restarts: worker.max_restarts,
+        last_restart_at: worker.last_restart_at,
         updated_at: worker.updated_at,
         seconds_since_update: now.saturating_sub(worker.updated_at),
     };
@@ -797,6 +966,10 @@ fn detect_prompt_misdelivery(
         target: WorkerPromptTarget::Shell,
         observed_cwd: None,
     })
+}
+
+fn prompt_misdelivery_is_relevant(worker: &Worker) -> bool {
+    worker.prompt_in_flight && worker.last_prompt.is_some()
 }
 
 fn prompt_preview(prompt: &str) -> String {
@@ -1238,6 +1411,79 @@ mod tests {
         assert_eq!(
             value["last_event"]["kind"].as_str(),
             Some("prompt_accepted")
+        );
+    }
+
+    #[test]
+    fn heartbeat_extends_worker_lease() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-heartbeat", &[], true);
+        let original_lease = worker.lease_expires_at;
+
+        let heartbeat = registry
+            .heartbeat(&worker.worker_id, DEFAULT_WORKER_LEASE_SECS + 10)
+            .expect("heartbeat should succeed");
+
+        assert!(heartbeat.heartbeat_at >= worker.heartbeat_at);
+        assert!(heartbeat.lease_expires_at >= original_lease);
+        assert!(heartbeat
+            .events
+            .iter()
+            .any(|event| event.kind == WorkerEventKind::Heartbeat));
+    }
+
+    #[test]
+    fn stale_worker_restarts_with_prompt_replay_until_budget_exhausted() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-stale", &[], true);
+        registry
+            .observe(&worker.worker_id, "Ready for input\n>")
+            .expect("ready observe should succeed");
+        let accepted = registry
+            .send_prompt(&worker.worker_id, Some("Finish stale node"))
+            .expect("prompt send should succeed");
+
+        let restarted = registry.restart_stale_workers(accepted.lease_expires_at + 1, 30);
+
+        assert_eq!(restarted.len(), 1);
+        assert_eq!(restarted[0].status, WorkerStatus::Spawning);
+        assert_eq!(restarted[0].restart_count, 1);
+        assert_eq!(
+            restarted[0].replay_prompt.as_deref(),
+            Some("Finish stale node")
+        );
+        assert!(restarted[0]
+            .events
+            .iter()
+            .any(|event| event.kind == WorkerEventKind::LeaseExpired));
+        assert!(restarted[0]
+            .events
+            .iter()
+            .any(|event| event.kind == WorkerEventKind::Restarted));
+    }
+
+    #[test]
+    fn stale_worker_fails_after_restart_budget_exhausted() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-stale-budget", &[], true);
+        registry
+            .observe(&worker.worker_id, "Ready for input\n>")
+            .expect("ready observe should succeed");
+        let mut current = registry
+            .send_prompt(&worker.worker_id, Some("Finish stale node"))
+            .expect("prompt send should succeed");
+
+        for _ in 0..=DEFAULT_WORKER_MAX_RESTARTS {
+            current = registry
+                .restart_stale_workers(current.lease_expires_at + 1, 30)
+                .pop()
+                .expect("stale worker should be updated");
+        }
+
+        assert_eq!(current.status, WorkerStatus::Failed);
+        assert_eq!(
+            current.last_error.expect("lease failure should exist").kind,
+            WorkerFailureKind::LeaseExpired
         );
     }
 

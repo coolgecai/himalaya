@@ -4,7 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::json::JsonValue;
+use crate::permissions::PermissionMode;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
+use crate::{MoERoutingPolicy, ModelCapability, ModelRoute, ModelRoutePhase};
 
 /// Schema name advertised by generated settings files.
 pub const Himalaya_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
@@ -25,7 +27,23 @@ pub enum ResolvedPermissionMode {
     DangerFullAccess,
 }
 
-/// A discovered config file and the scope it contributes to.
+impl ResolvedPermissionMode {
+    #[must_use]
+    pub fn as_permission_mode(self) -> PermissionMode {
+        match self {
+            Self::ReadOnly => PermissionMode::ReadOnly,
+            Self::WorkspaceWrite => PermissionMode::WorkspaceWrite,
+            Self::DangerFullAccess => PermissionMode::DangerFullAccess,
+        }
+    }
+}
+
+impl From<ResolvedPermissionMode> for PermissionMode {
+    fn from(mode: ResolvedPermissionMode) -> Self {
+        mode.as_permission_mode()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigEntry {
     pub source: ConfigSource,
@@ -65,7 +83,75 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     decisioning: DecisioningConfig,
+    model_routing: ModelRoutingConfig,
     trusted_roots: Vec<String>,
+}
+
+/// Configurable adaptive model routing policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRoutingConfig {
+    enabled: bool,
+    min_feedback_samples: usize,
+    switch_failure_threshold_percent: u8,
+    routes: Vec<ModelRoute>,
+}
+
+impl Default for ModelRoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_feedback_samples: 2,
+            switch_failure_threshold_percent: 50,
+            routes: Vec::new(),
+        }
+    }
+}
+
+impl ModelRoutingConfig {
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_min_feedback_samples(mut self, samples: usize) -> Self {
+        self.min_feedback_samples = samples.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_switch_failure_threshold_percent(mut self, percent: u8) -> Self {
+        self.switch_failure_threshold_percent = percent.min(100);
+        self
+    }
+
+    #[must_use]
+    pub fn with_routes(mut self, routes: Vec<ModelRoute>) -> Self {
+        self.routes = routes;
+        self
+    }
+
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn routes(&self) -> &[ModelRoute] {
+        &self.routes
+    }
+
+    #[must_use]
+    pub fn to_policy(&self, default_model: &str) -> MoERoutingPolicy {
+        let mut policy = MoERoutingPolicy::balanced(default_model).with_adaptive(
+            self.enabled,
+            self.min_feedback_samples,
+            self.switch_failure_threshold_percent,
+        );
+        policy.routes.extend(self.routes.clone());
+        policy
+    }
 }
 
 /// Feature flags and thresholds for the phase-2 decisioning skeleton.
@@ -379,6 +465,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             decisioning: parse_optional_decisioning_config(&merged_value)?,
+            model_routing: parse_optional_model_routing_config(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
         };
 
@@ -476,6 +563,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn model_routing(&self) -> &ModelRoutingConfig {
+        &self.feature_config.model_routing
+    }
+
+    #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
@@ -553,6 +645,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn decisioning(&self) -> &DecisioningConfig {
         &self.decisioning
+    }
+
+    #[must_use]
+    pub fn model_routing(&self) -> &ModelRoutingConfig {
+        &self.model_routing
     }
 
     #[must_use]
@@ -1122,12 +1219,12 @@ fn parse_permission_mode_label(
     mode: &str,
     context: &str,
 ) -> Result<ResolvedPermissionMode, ConfigError> {
-    match mode {
-        "default" | "plan" | "read-only" => Ok(ResolvedPermissionMode::ReadOnly),
-        "acceptEdits" | "auto" | "workspace-write" => Ok(ResolvedPermissionMode::WorkspaceWrite),
-        "dontAsk" | "danger-full-access" => Ok(ResolvedPermissionMode::DangerFullAccess),
-        other => Err(ConfigError::Parse(format!(
-            "{context}: unsupported permission mode {other}"
+    match PermissionMode::parse_public(mode) {
+        Some(PermissionMode::ReadOnly) => Ok(ResolvedPermissionMode::ReadOnly),
+        Some(PermissionMode::WorkspaceWrite) => Ok(ResolvedPermissionMode::WorkspaceWrite),
+        Some(PermissionMode::DangerFullAccess) => Ok(ResolvedPermissionMode::DangerFullAccess),
+        Some(_) | None => Err(ConfigError::Parse(format!(
+            "{context}: unsupported permission mode {mode}"
         ))),
     }
 }
@@ -1255,6 +1352,128 @@ fn parse_decisioning_safety_policy_config(
     }
 
     Ok(policy)
+}
+
+fn parse_optional_model_routing_config(
+    root: &JsonValue,
+) -> Result<ModelRoutingConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(ModelRoutingConfig::default());
+    };
+    let Some(value) = object.get("modelRouting") else {
+        return Ok(ModelRoutingConfig::default());
+    };
+    let routing = expect_object(value, "merged settings.modelRouting")?;
+    let mut config = ModelRoutingConfig::default();
+
+    if let Some(enabled) = optional_bool(routing, "enabled", "merged settings.modelRouting")? {
+        config = config.with_enabled(enabled);
+    }
+    if let Some(samples) = optional_u32(
+        routing,
+        "minFeedbackSamples",
+        "merged settings.modelRouting",
+    )? {
+        config = config.with_min_feedback_samples(samples as usize);
+    }
+    if let Some(threshold) = optional_u16(
+        routing,
+        "switchFailureThresholdPercent",
+        "merged settings.modelRouting",
+    )? {
+        config = config.with_switch_failure_threshold_percent(threshold.min(100) as u8);
+    }
+    if let Some(routes_value) = routing.get("routes") {
+        let Some(routes) = routes_value.as_array() else {
+            return Err(ConfigError::Parse(
+                "merged settings.modelRouting: field routes must be an array".to_string(),
+            ));
+        };
+        let parsed_routes = routes
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                parse_model_route_config(
+                    value,
+                    &format!("merged settings.modelRouting.routes[{index}]"),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        config = config.with_routes(parsed_routes);
+    }
+
+    Ok(config)
+}
+
+fn parse_model_route_config(value: &JsonValue, context: &str) -> Result<ModelRoute, ConfigError> {
+    let object = expect_object(value, context)?;
+    let phase = parse_model_route_phase(expect_string(object, "phase", context)?, context)?;
+    let model = expect_string(object, "model", context)?.to_string();
+    let provider = optional_string(object, "provider", context)?.map(str::to_string);
+    let capabilities = optional_model_capabilities(object, "capabilities", context)?;
+    let mut route = ModelRoute::new(phase, model).with_capabilities(capabilities);
+    if let Some(provider) = provider {
+        route = route.with_provider(provider);
+    }
+    if let Some(max_tokens) = optional_u32(object, "maxTokens", context)? {
+        route.max_tokens = Some(max_tokens);
+    }
+    let cost_weight =
+        optional_u16(object, "costWeight", context)?.unwrap_or(u16::from(route.cost_weight));
+    let latency_weight =
+        optional_u16(object, "latencyWeight", context)?.unwrap_or(u16::from(route.latency_weight));
+    let quality_weight =
+        optional_u16(object, "qualityWeight", context)?.unwrap_or(u16::from(route.quality_weight));
+    route = route.with_weights(
+        cost_weight as u8,
+        latency_weight as u8,
+        quality_weight as u8,
+    );
+    Ok(route)
+}
+
+fn optional_model_capabilities(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Vec<ModelCapability>, ConfigError> {
+    optional_string_array(object, key, context)?
+        .unwrap_or_default()
+        .iter()
+        .map(|value| parse_model_capability(value, context))
+        .collect()
+}
+
+fn parse_model_route_phase(value: &str, context: &str) -> Result<ModelRoutePhase, ConfigError> {
+    match value {
+        "planning" => Ok(ModelRoutePhase::Planning),
+        "coding" => Ok(ModelRoutePhase::Coding),
+        "verification" => Ok(ModelRoutePhase::Verification),
+        "summarization" => Ok(ModelRoutePhase::Summarization),
+        "vision" => Ok(ModelRoutePhase::Vision),
+        "local_fast" | "localFast" => Ok(ModelRoutePhase::LocalFast),
+        other => Err(ConfigError::Parse(format!(
+            "{context}: unsupported model route phase {other}"
+        ))),
+    }
+}
+
+fn parse_model_capability(value: &str, context: &str) -> Result<ModelCapability, ConfigError> {
+    match value {
+        "planning" => Ok(ModelCapability::Planning),
+        "coding" => Ok(ModelCapability::Coding),
+        "refactor" => Ok(ModelCapability::Refactor),
+        "test_generation" | "testGeneration" => Ok(ModelCapability::TestGeneration),
+        "verification" => Ok(ModelCapability::Verification),
+        "summarization" => Ok(ModelCapability::Summarization),
+        "vision" => Ok(ModelCapability::Vision),
+        "local_fast" | "localFast" => Ok(ModelCapability::LocalFast),
+        "cheap" => Ok(ModelCapability::Cheap),
+        "long_context" | "longContext" => Ok(ModelCapability::LongContext),
+        other => Err(ConfigError::Parse(format!(
+            "{context}: unsupported model capability {other}"
+        ))),
+    }
 }
 
 fn parse_optional_provider_fallbacks(
@@ -1620,6 +1839,7 @@ mod tests {
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
+    use crate::ModelRoutePhase;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1734,6 +1954,51 @@ mod tests {
         assert_eq!(loaded.permission_rules().ask(), &["Edit".to_string()]);
         assert!(loaded.mcp().get("home").is_some());
         assert!(loaded.mcp().get("project").is_some());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_model_routing_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".Himalaya");
+        fs::create_dir_all(cwd.join(".Himalaya")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".Himalaya").join("settings.json"),
+            r#"{
+              "modelRouting": {
+                "enabled": true,
+                "minFeedbackSamples": 1,
+                "switchFailureThresholdPercent": 40,
+                "routes": [
+                  {
+                    "phase": "verification",
+                    "model": "opus",
+                    "provider": "anthropic",
+                    "capabilities": ["verification", "test_generation"],
+                    "qualityWeight": 8,
+                    "latencyWeight": 2,
+                    "costWeight": 1
+                  }
+                ]
+              }
+            }"#,
+        )
+        .expect("write routing settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let routing = loaded.model_routing();
+
+        assert!(routing.enabled());
+        assert_eq!(routing.routes().len(), 1);
+        assert_eq!(routing.routes()[0].role, ModelRoutePhase::Verification);
+        assert_eq!(routing.routes()[0].model, "opus");
+        assert_eq!(routing.routes()[0].quality_weight, 8);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

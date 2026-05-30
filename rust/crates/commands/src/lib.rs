@@ -7,9 +7,20 @@ use std::path::{Path, PathBuf};
 use plugins::{PluginError, PluginManager, PluginSummary};
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
-    ScopedMcpServerConfig, Session,
+    PermissionMode, ScopedMcpServerConfig, Session,
 };
 use serde_json::{json, Value};
+
+const PERMISSIONS_ARGUMENT_HINT: &str = "[read-only|workspace-write|danger-full-access]";
+
+fn public_permission_labels() -> String {
+    let labels = PermissionMode::public_labels();
+    match labels.as_slice() {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [head @ .., last] => format!("{}, or {last}", head.join(", ")),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandManifestEntry {
@@ -96,7 +107,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "permissions",
         aliases: &[],
         summary: "Show or switch the active permission mode",
-        argument_hint: Some("[read-only|workspace-write|danger-full-access]"),
+        argument_hint: Some(PERMISSIONS_ARGUMENT_HINT),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -283,7 +294,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Run a code review on current changes",
         argument_hint: Some("[scope]"),
-        resume_supported: false,
+        resume_supported: true,
     },
     SlashCommandSpec {
         name: "tasks",
@@ -752,21 +763,21 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Run tests for the current project",
         argument_hint: Some("[filter]"),
-        resume_supported: false,
+        resume_supported: true,
     },
     SlashCommandSpec {
         name: "lint",
         aliases: &[],
         summary: "Run linting for the current project",
         argument_hint: Some("[filter]"),
-        resume_supported: false,
+        resume_supported: true,
     },
     SlashCommandSpec {
         name: "build",
         aliases: &[],
         summary: "Build the current project",
         argument_hint: Some("[target]"),
-        resume_supported: false,
+        resume_supported: true,
     },
     SlashCommandSpec {
         name: "run",
@@ -1196,6 +1207,16 @@ pub enum SlashCommand {
     AddDir {
         path: Option<String>,
     },
+    LocalCommand {
+        name: String,
+        args: Option<String>,
+    },
+    Workspace {
+        path: Option<String>,
+    },
+    Diagnostics {
+        path: Option<String>,
+    },
     History {
         count: Option<String>,
     },
@@ -1281,6 +1302,12 @@ impl SlashCommand {
             Self::PrivacySettings => "/privacy-settings",
             Self::Plan { .. } => "/plan",
             Self::Review { .. } => "/review",
+            Self::LocalCommand { name, .. } => match name.as_str() {
+                "test" => "/test",
+                "lint" => "/lint",
+                "build" => "/build",
+                _ => "/unknown",
+            },
             Self::Tasks { .. } => "/tasks",
             Self::Cron { .. } => "/cron",
             Self::Benchmark { .. } => "/benchmark",
@@ -1299,7 +1326,8 @@ impl SlashCommand {
             Self::Tag { .. } => "/tag",
             Self::OutputStyle { .. } => "/output-style",
             Self::AddDir { .. } => "/add-dir",
-            Self::Unknown(_) => "/unknown",
+            Self::Workspace { .. } => "/workspace",
+            Self::Diagnostics { .. } => "/diagnostics",
             Self::Sandbox => "/sandbox",
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
@@ -1496,6 +1524,10 @@ pub fn validate_slash_command_input(
         }
         "plan" => SlashCommand::Plan { mode: remainder },
         "review" => SlashCommand::Review { scope: remainder },
+        "test" | "lint" | "build" => SlashCommand::LocalCommand {
+            name: command.to_string(),
+            args: remainder,
+        },
         "tasks" => SlashCommand::Tasks { args: remainder },
         "cron" => SlashCommand::Cron { args: remainder },
         "benchmark" => SlashCommand::Benchmark { args: remainder },
@@ -1514,6 +1546,8 @@ pub fn validate_slash_command_input(
         "tag" => SlashCommand::Tag { label: remainder },
         "output-style" => SlashCommand::OutputStyle { style: remainder },
         "add-dir" => SlashCommand::AddDir { path: remainder },
+        "workspace" | "cwd" => SlashCommand::Workspace { path: remainder },
+        "diagnostics" => SlashCommand::Diagnostics { path: remainder },
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
         },
@@ -1553,24 +1587,18 @@ fn require_remainder(
 }
 
 fn parse_permissions_mode(args: &[&str]) -> Result<Option<String>, SlashCommandParseError> {
-    let mode = optional_single_arg(
-        "permissions",
-        args,
-        "[read-only|workspace-write|danger-full-access]",
-    )?;
+    let mode = optional_single_arg("permissions", args, PERMISSIONS_ARGUMENT_HINT)?;
     if let Some(mode) = mode {
-        if matches!(
-            mode.as_str(),
-            "read-only" | "workspace-write" | "danger-full-access"
-        ) {
+        if PermissionMode::parse_public(&mode).is_some() {
             return Ok(Some(mode));
         }
         return Err(command_error(
             &format!(
-                "Unsupported /permissions mode '{mode}'. Use read-only, workspace-write, or danger-full-access."
+                "Unsupported /permissions mode '{mode}'. Use {}.",
+                public_permission_labels()
             ),
             "permissions",
-            "/permissions [read-only|workspace-write|danger-full-access]",
+            &format!("/permissions {PERMISSIONS_ARGUMENT_HINT}"),
         ));
     }
 
@@ -4072,6 +4100,7 @@ pub fn handle_slash_command(
         | SlashCommand::PrivacySettings
         | SlashCommand::Plan { .. }
         | SlashCommand::Review { .. }
+        | SlashCommand::LocalCommand { .. }
         | SlashCommand::Tasks { .. }
         | SlashCommand::Cron { .. }
         | SlashCommand::Benchmark { .. }
@@ -4090,6 +4119,8 @@ pub fn handle_slash_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
+        | SlashCommand::Workspace { .. }
+        | SlashCommand::Diagnostics { .. }
         | SlashCommand::History { .. }
         | SlashCommand::Unknown(_) => None,
     }
@@ -4397,10 +4428,40 @@ mod tests {
             }))
         );
         assert_eq!(
-            SlashCommand::parse("/session fork incident-review"),
-            Ok(Some(SlashCommand::Session {
-                action: Some("fork".to_string()),
-                target: Some("incident-review".to_string())
+            SlashCommand::parse("/test parser"),
+            Ok(Some(SlashCommand::LocalCommand {
+                name: "test".to_string(),
+                args: Some("parser".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/lint"),
+            Ok(Some(SlashCommand::LocalCommand {
+                name: "lint".to_string(),
+                args: None
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/build release"),
+            Ok(Some(SlashCommand::LocalCommand {
+                name: "build".to_string(),
+                args: Some("release".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/workspace src"),
+            Ok(Some(SlashCommand::Workspace {
+                path: Some("src".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/cwd"),
+            Ok(Some(SlashCommand::Workspace { path: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/diagnostics rust/src/main.rs"),
+            Ok(Some(SlashCommand::Diagnostics {
+                path: Some("rust/src/main.rs".to_string())
             }))
         );
     }

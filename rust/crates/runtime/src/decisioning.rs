@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::DecisioningSafetyPolicyConfig;
 use crate::conversation::ChainOfThought;
+use crate::{config::DecisioningSafetyPolicyConfig, PermissionMode};
 
 /// A concrete tool candidate considered by the decisioning skeleton.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -727,14 +727,12 @@ impl Default for SafetyPolicy {
 }
 
 fn permission_mode_risk_penalty(mode: &str) -> Option<(f32, &'static str)> {
-    match mode {
-        "read-only" => Some((0.0, "Read-only mode keeps the action constrained.")),
-        "workspace-write" => Some((0.03, "Workspace-write mode can modify local files.")),
-        "prompt" => Some((0.05, "Prompt mode may require extra approval.")),
-        "danger-full-access" => Some((0.12, "Danger-full-access mode broadens execution scope.")),
-        "allow" => Some((0.15, "Allow mode bypasses normal permission barriers.")),
-        _ => Some((0.04, "Unrecognized permission mode requires review.")),
-    }
+    PermissionMode::parse_alias(mode)
+        .map(PermissionMode::risk_signal)
+        .or(Some((
+            0.04,
+            "Unrecognized permission mode requires review.",
+        )))
 }
 
 fn capability_risk_signal(capability: &str) -> Option<(f32, &'static str)> {

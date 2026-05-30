@@ -374,12 +374,8 @@ fn normalize_tool_name(value: &str) -> String {
 }
 
 fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
-    match value {
-        "read-only" => Ok(PermissionMode::ReadOnly),
-        "workspace-write" => Ok(PermissionMode::WorkspaceWrite),
-        "danger-full-access" => Ok(PermissionMode::DangerFullAccess),
-        other => Err(format!("unsupported plugin permission: {other}")),
-    }
+    PermissionMode::parse_public(value)
+        .ok_or_else(|| format!("unsupported plugin permission: {value}"))
 }
 
 #[must_use]
@@ -5026,7 +5022,7 @@ fn supported_config_setting(setting: &str) -> Option<ConfigSettingSpec> {
             scope: ConfigScope::Settings,
             kind: ConfigKind::String,
             path: &["permissions", "defaultMode"],
-            options: Some(&["default", "plan", "acceptEdits", "dontAsk", "auto"]),
+            options: None,
         },
         "language" => ConfigSettingSpec {
             scope: ConfigScope::Settings,
@@ -5061,6 +5057,18 @@ fn normalize_config_value(spec: ConfigSettingSpec, value: ConfigValue) -> Result
         (ConfigKind::String, ConfigValue::Bool(value)) => Value::String(value.to_string()),
         (ConfigKind::String, ConfigValue::Number(value)) => json!(value),
     };
+
+    if spec.path == ["permissions", "defaultMode"] {
+        let Some(as_str) = normalized.as_str() else {
+            return Err(String::from("setting requires a string value"));
+        };
+        if PermissionMode::parse_public(as_str).is_none() {
+            return Err(format!(
+                "Invalid value \"{as_str}\". Options: {}",
+                PermissionMode::public_labels().join(", ")
+            ));
+        }
+    }
 
     if let Some(options) = spec.options {
         let Some(as_str) = normalized.as_str() else {

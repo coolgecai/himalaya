@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -5,9 +6,124 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn known_stream_event_types() -> BTreeSet<String> {
+    [
+        "text_delta",
+        "tool_use",
+        "tool_result",
+        "done",
+        "session_meta",
+        "message_start",
+        "message_stop",
+        "command_match",
+        "tool_match",
+        "permission_denial",
+        "permission_request",
+        "reasoning_step",
+        "decisioning_event",
+        "plan_execution_event",
+        "task_ledger_event",
+        "model_route_event",
+        "team_execution_event",
+        "recovery_event",
+        "recovery_action_event",
+        "task_execution_event",
+        "local_command",
+        "recovery_suggestion",
+        "task_list",
+        "task_show",
+        "task_execution",
+        "task_recovery",
+        "task_verification",
+        "task_node_retry",
+        "task_node_verification",
+        "task_compacted",
+        "task_cancelled",
+        "task_packet_create",
+        "task_packet_run",
+        "task_packet_status",
+        "task_scheduler_tick",
+        "task_scheduler_queue",
+        "task_scheduler_daemon_run",
+        "task_scheduler_daemon_status",
+        "benchmark_suite",
+        "benchmark_task",
+        "benchmark_run",
+        "worker_list",
+        "worker_create",
+        "worker_observe",
+        "worker_ready",
+        "worker_resolve_trust",
+        "worker_prompt",
+        "worker_complete",
+        "worker_restart",
+        "worker_terminate",
+        "worker_supervisor_tick",
+        "error",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+#[test]
+fn stream_json_schema_covers_known_event_types() {
+    let schema_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .join("protocol/stream-json-v1.schema.json");
+    let schema: Value = serde_json::from_str(
+        &fs::read_to_string(&schema_path).expect("stream-json schema should be readable"),
+    )
+    .expect("stream-json schema should parse");
+
+    assert_eq!(schema["properties"]["protocol_version"]["const"], 1);
+
+    let schema_event_types = schema["$defs"]["eventType"]["enum"]
+        .as_array()
+        .expect("schema eventType enum should exist")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("event type should be string")
+                .to_string()
+        })
+        .collect::<BTreeSet<_>>();
+    let expected_event_types = known_stream_event_types();
+    assert_eq!(schema_event_types, expected_event_types);
+
+    let branch_types = schema["allOf"][0]["oneOf"]
+        .as_array()
+        .expect("schema should define event branches")
+        .iter()
+        .flat_map(|branch| {
+            let ref_name = branch["$ref"]
+                .as_str()
+                .expect("branch should be a definition ref")
+                .trim_start_matches("#/$defs/");
+            let type_schema = &schema["$defs"][ref_name]["allOf"][1]["properties"]["type"];
+            if let Some(value) = type_schema["const"].as_str() {
+                return vec![value.to_string()];
+            }
+            type_schema["enum"]
+                .as_array()
+                .expect("branch type should use const or enum")
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .expect("branch enum type should be string")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(branch_types, expected_event_types);
+}
 
 #[test]
 fn stream_json_text_events_include_protocol_version() {
@@ -77,6 +193,59 @@ fn stream_json_tool_events_match_contract() {
     assert_eq!(tool_result["name"], "read_file");
     assert!(tool_result["output"].as_str().is_some());
     assert_eq!(tool_result["is_error"], false);
+    assert!(events.iter().any(|event| event["type"] == "done"));
+}
+
+#[test]
+fn stream_json_mcp_stdio_lifecycle_tool_roundtrip_matches_contract() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-mcp-lifecycle"));
+    workspace.create();
+    let fixture_path = workspace.root.join("fixture-mcp.py");
+    write_mcp_server_fixture(&fixture_path);
+    write_mcp_settings(&workspace, &fixture_path);
+
+    let prompt = format!("{SCENARIO_PREFIX}mcp_tool_roundtrip");
+    let events = run_stream_json_prompt(
+        &workspace,
+        server.base_url().as_str(),
+        &prompt,
+        "workspace-write",
+        Some("mcp__alpha__echo"),
+    );
+
+    assert_all_events_are_versioned(&events);
+    let tool_use = events
+        .iter()
+        .find(|event| event["type"] == "tool_use")
+        .expect("mcp tool_use event should be present");
+    assert_eq!(tool_use["name"], "mcp__alpha__echo");
+    assert_eq!(tool_use["input"]["text"], "hello from mcp lifecycle");
+
+    let tool_result = events
+        .iter()
+        .find(|event| event["type"] == "tool_result")
+        .expect("mcp tool_result event should be present");
+    assert_eq!(tool_result["name"], "mcp__alpha__echo");
+    assert_eq!(tool_result["is_error"], false);
+    let output = tool_result["output"]
+        .as_str()
+        .expect("output should be text");
+    assert!(output.contains("structuredContent"), "output: {output}");
+    assert!(
+        output.contains("hello from mcp lifecycle"),
+        "output: {output}"
+    );
+
+    assert!(events.iter().any(|event| {
+        event["type"] == "text_delta"
+            && event["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("mcp tool completed: hello from mcp lifecycle"))
+    }));
     assert!(events.iter().any(|event| event["type"] == "done"));
 }
 
@@ -465,6 +634,82 @@ fn stream_json_packet_verification_failure_emits_recovery_event() {
     }));
 }
 
+#[test]
+fn stream_json_model_routing_config_switches_after_feedback() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-adaptive-routing"));
+    workspace.create();
+    fs::write(
+        workspace.config_home.join("settings.json"),
+        serde_json::to_string(&json!({
+            "modelRouting": {
+                "enabled": true,
+                "minFeedbackSamples": 1,
+                "switchFailureThresholdPercent": 50,
+                "routes": [
+                    {
+                        "phase": "verification",
+                        "model": "Himalaya-opus-4-6",
+                        "provider": "anthropic",
+                        "capabilities": ["verification"],
+                        "qualityWeight": 4
+                    }
+                ]
+            }
+        }))
+        .expect("settings should serialize"),
+    )
+    .expect("routing settings should write");
+    fs::create_dir_all(workspace.root.join(".Himalaya/routes"))
+        .expect("route feedback dir should exist");
+    fs::write(
+        workspace.root.join(".Himalaya/routes/feedback.json"),
+        serde_json::to_string(&json!({
+            "feedback": [
+                {
+                    "task_id": "task-1",
+                    "route": {
+                        "phase": "verification",
+                        "model": "Himalaya-sonnet-4-6",
+                        "provider": null,
+                        "reason": "test",
+                        "confidence": 0.8,
+                        "fallback_model": "Himalaya-sonnet-4-6"
+                    },
+                    "succeeded": false,
+                    "latency_ms": null,
+                    "verification_passed": false,
+                    "recovery_triggered": true,
+                    "timestamp": 1,
+                    "note": "failed"
+                }
+            ]
+        }))
+        .expect("feedback should serialize"),
+    )
+    .expect("route feedback should write");
+
+    let events = run_stream_json_case(
+        &workspace,
+        server.base_url().as_str(),
+        "streaming_text",
+        None,
+    );
+
+    assert_all_events_are_versioned(&events);
+    assert!(events.iter().any(|event| {
+        event["model_route_event"]["phase"] == "verification"
+            && event["model_route_event"]["model"] == "Himalaya-opus-4-6"
+            && event["model_route_event"]["fallback_model"] == "Himalaya-sonnet-4-6"
+            && event["model_route_event"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("adaptive route selected"))
+    }));
+}
+
 fn run_stream_json_case(
     workspace: &HarnessWorkspace,
     base_url: &str,
@@ -494,7 +739,7 @@ fn run_stream_json_prompt(
         .env("PATH", "/usr/bin:/bin")
         .args([
             "--model",
-            "sonnet",
+            "Himalaya-sonnet-4-6",
             "--permission-mode",
             permission_mode,
             "--output-format",
@@ -789,6 +1034,24 @@ fn assert_stream_event_schema(event: &Value) {
             event["queue"].is_array(),
             "task_scheduler_queue requires queue array: {event:?}"
         ),
+        "task_scheduler_daemon_run" => {
+            assert!(
+                event["runs"].is_array(),
+                "task_scheduler_daemon_run requires runs array: {event:?}"
+            );
+            assert!(
+                event.get("state").is_some(),
+                "task_scheduler_daemon_run requires state field: {event:?}"
+            );
+        }
+        "task_scheduler_daemon_status" => {
+            assert!(
+                event.get("state").is_some(),
+                "task_scheduler_daemon_status requires state field: {event:?}"
+            );
+            assert_non_empty_string(&event["state_path"]);
+            assert_non_empty_string(&event["events_path"]);
+        }
         "benchmark_suite" => {
             assert_non_empty_string(&event["suite_id"]);
             assert_non_empty_string(&event["version"]);
@@ -813,6 +1076,7 @@ fn assert_stream_event_schema(event: &Value) {
         | "worker_observe"
         | "worker_resolve_trust"
         | "worker_prompt"
+        | "worker_complete"
         | "worker_restart"
         | "worker_terminate" => assert!(
             event["worker"].is_object(),
@@ -892,6 +1156,68 @@ impl HarnessWorkspace {
         fs::create_dir_all(&self.config_home).expect("config home should exist");
         fs::create_dir_all(&self.home).expect("home should exist");
     }
+}
+
+fn write_mcp_server_fixture(script_path: &PathBuf) {
+    let script = [
+        "#!/usr/bin/env python3",
+        "import json, sys",
+        "",
+        "def read_message():",
+        "    header = b''",
+        r"    while not header.endswith(b'\r\n\r\n'):",
+        "        chunk = sys.stdin.buffer.read(1)",
+        "        if not chunk:",
+        "            return None",
+        "        header += chunk",
+        "    length = 0",
+        r"    for line in header.decode().split('\r\n'):",
+        r"        if line.lower().startswith('content-length:'):",
+        "            length = int(line.split(':', 1)[1].strip())",
+        "    payload = sys.stdin.buffer.read(length)",
+        "    return json.loads(payload.decode())",
+        "",
+        "def send_message(message):",
+        "    payload = json.dumps(message).encode()",
+        r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+        "    sys.stdout.buffer.flush()",
+        "",
+        "while True:",
+        "    request = read_message()",
+        "    if request is None:",
+        "        break",
+        "    method = request['method']",
+        "    if method == 'initialize':",
+        "        send_message({'jsonrpc':'2.0','id':request['id'],'result':{'protocolVersion':'2024-11-05','capabilities':{'tools':{},'resources':{}},'serverInfo':{'name':'alpha-fixture','version':'1.0.0'}}})",
+        "    elif method == 'tools/list':",
+        "        send_message({'jsonrpc':'2.0','id':request['id'],'result':{'tools':[{'name':'echo','description':'Echo text','inputSchema':{'type':'object','properties':{'text':{'type':'string'}},'required':['text']}}]}})",
+        "    elif method == 'resources/list':",
+        "        send_message({'jsonrpc':'2.0','id':request['id'],'result':{'resources':[]}})",
+        "    elif method == 'tools/call':",
+        "        args = request['params'].get('arguments') or {}",
+        "        text = args.get('text', '')",
+        "        send_message({'jsonrpc':'2.0','id':request['id'],'result':{'content':[{'type':'text','text':'echo: ' + text}], 'structuredContent':{'echoed': text}, 'isError': False}})",
+        "    else:",
+        "        send_message({'jsonrpc':'2.0','id':request.get('id'),'result':{}})",
+    ]
+    .join("\n");
+    fs::write(script_path, script).expect("mcp fixture should write");
+}
+
+fn write_mcp_settings(workspace: &HarnessWorkspace, fixture_path: &PathBuf) {
+    let settings = json!({
+        "mcpServers": {
+            "alpha": {
+                "command": "python3",
+                "args": [fixture_path]
+            }
+        }
+    });
+    fs::write(
+        workspace.config_home.join("settings.json"),
+        serde_json::to_string(&settings).expect("settings should serialize"),
+    )
+    .expect("mcp settings should write");
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

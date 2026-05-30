@@ -3,9 +3,10 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    build_plan_dag, DecisioningEngine, ExecutionMode, MoERoutingPolicy, ModelRouteDecision,
-    ModelRoutePhase, ModelRouter, PlanExecution, ReasoningContext, SafetyOutcome, SafetyPolicy,
-    Task, TaskPlanner, Tool, ToolSelector,
+    build_plan_dag, DecisioningEngine, DurableSchedulerStatus, DurableTaskScheduler, ExecutionMode,
+    MoERoutingPolicy, ModelRouteDecision, ModelRoutePhase, ModelRouter, PlanExecution,
+    ReasoningContext, SafetyOutcome, SafetyPolicy, Task, TaskPlanner, TaskRegistry, Tool,
+    ToolSelector, VerificationRunner, WorkerRegistry, WorkerStatus,
 };
 
 pub const COMPLEX_CODING_BENCHMARK_SUITE_ID: &str = "complex-coding-agent-v1";
@@ -39,7 +40,21 @@ pub struct BenchmarkScore {
     pub decomposition_score: f32,
     pub scheduler_score: f32,
     pub moe_route_score: f32,
+    pub execution_score: f32,
     pub total: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkExecutionHarnessResult {
+    pub task_registry_id: String,
+    pub scheduler_ticks: usize,
+    pub worker_dispatches: usize,
+    pub worker_completions: usize,
+    pub final_scheduler_status: DurableSchedulerStatus,
+    pub final_task_status: String,
+    pub completed: bool,
+    pub blocked: bool,
+    pub messages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,6 +70,7 @@ pub struct BenchmarkTaskResult {
     pub scheduler_ready_nodes: usize,
     pub scheduler_total_nodes: usize,
     pub route_decisions: Vec<ModelRouteDecision>,
+    pub harness: BenchmarkExecutionHarnessResult,
     pub score: BenchmarkScore,
 }
 
@@ -66,6 +82,10 @@ pub struct BenchmarkSummary {
     pub parallel_plans: usize,
     pub review_or_deny_tasks: usize,
     pub total_plan_steps: usize,
+    pub completed_harness_tasks: usize,
+    pub blocked_harness_tasks: usize,
+    pub total_scheduler_ticks: usize,
+    pub total_worker_dispatches: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -269,6 +289,9 @@ fn run_benchmark_task(
     let snapshot = engine.analyze(&task);
     let dag = build_plan_dag(&snapshot.task, &snapshot.plan, &snapshot.selected_tools);
     let execution = PlanExecution::new(&dag);
+    let scheduler_ready_nodes = execution.ready_nodes().len();
+    let scheduler_total_nodes = execution.nodes.len();
+    let harness = run_benchmark_execution_harness(spec, &dag, execution.clone(), max_parallelism);
     let route_decisions = benchmark_route_phases(spec)
         .into_iter()
         .map(|phase| router.select(phase))
@@ -288,9 +311,10 @@ fn run_benchmark_task(
         spec,
         &snapshot.selected_tools,
         snapshot.plan.steps.len(),
-        execution.ready_nodes().len(),
-        execution.nodes.len(),
+        scheduler_ready_nodes,
+        scheduler_total_nodes,
         route_decisions.len(),
+        &harness,
     );
 
     BenchmarkTaskResult {
@@ -302,13 +326,133 @@ fn run_benchmark_task(
         execution_mode: execution_mode_label(&snapshot.plan.execution_mode).to_string(),
         risk_score: snapshot.risk.score,
         risk_level: risk_level_label(&snapshot.risk.outcome).to_string(),
-        scheduler_ready_nodes: execution.ready_nodes().len(),
-        scheduler_total_nodes: execution.nodes.len(),
+        scheduler_ready_nodes,
+        scheduler_total_nodes,
         route_decisions,
+        harness,
         score,
     }
 }
 
+fn run_benchmark_execution_harness(
+    spec: &BenchmarkTaskSpec,
+    dag: &crate::PlanDag,
+    execution: PlanExecution,
+    max_parallelism: usize,
+) -> BenchmarkExecutionHarnessResult {
+    let registry = TaskRegistry::new();
+    let workers = WorkerRegistry::new();
+    let task = registry.create(&spec.objective, Some(&spec.scope));
+    let mut executable_dag = dag.clone();
+    executable_dag.task_id = task.task_id.clone();
+    executable_dag.root_id = task.task_id.clone();
+    for node in &mut executable_dag.nodes {
+        if node.id == spec.id {
+            node.id = task.task_id.clone();
+        }
+    }
+    for edge in &mut executable_dag.edges {
+        if edge.from == spec.id {
+            edge.from = task.task_id.clone();
+        }
+        if edge.to == spec.id {
+            edge.to = task.task_id.clone();
+        }
+    }
+    let executable_execution = PlanExecution::new(&executable_dag);
+    if let Err(error) = registry.record_plan(&task.task_id, executable_dag, executable_execution) {
+        return BenchmarkExecutionHarnessResult {
+            task_registry_id: task.task_id,
+            scheduler_ticks: 0,
+            worker_dispatches: 0,
+            worker_completions: 0,
+            final_scheduler_status: DurableSchedulerStatus::Blocked,
+            final_task_status: "blocked".to_string(),
+            completed: false,
+            blocked: true,
+            messages: vec![error],
+        };
+    }
+    let scheduler = DurableTaskScheduler::with_workers(
+        registry.clone(),
+        VerificationRunner::new(None),
+        workers.clone(),
+    );
+    let mut scheduler_ticks = 0;
+    let mut worker_dispatches = 0;
+    let mut worker_completions = 0;
+    let mut final_scheduler_status = DurableSchedulerStatus::Pending;
+    let mut messages = vec![format!(
+        "benchmark harness seeded {} plan node(s)",
+        execution.nodes.len()
+    )];
+    let max_ticks = max_parallelism
+        .saturating_mul(spec.complexity as usize)
+        .max(8)
+        + 8;
+
+    for _ in 0..max_ticks {
+        match scheduler.tick() {
+            Ok(tick) => {
+                scheduler_ticks += 1;
+                final_scheduler_status = tick.status;
+                messages.push(tick.message.clone());
+                if let Some(outcome) = tick.outcome.as_ref() {
+                    worker_dispatches += outcome
+                        .steps
+                        .iter()
+                        .filter(|step| step.kind == crate::TaskExecutionStepKind::DispatchWorker)
+                        .count();
+                }
+                complete_running_benchmark_workers(&workers, &mut worker_completions);
+                if matches!(
+                    final_scheduler_status,
+                    DurableSchedulerStatus::Completed
+                        | DurableSchedulerStatus::Blocked
+                        | DurableSchedulerStatus::Idle
+                ) {
+                    break;
+                }
+            }
+            Err(error) => {
+                messages.push(error);
+                final_scheduler_status = DurableSchedulerStatus::Blocked;
+                break;
+            }
+        }
+    }
+
+    let final_task_status = registry
+        .get(&task.task_id)
+        .map_or_else(|| "missing".to_string(), |task| task.status.to_string());
+    BenchmarkExecutionHarnessResult {
+        task_registry_id: task.task_id,
+        scheduler_ticks,
+        worker_dispatches,
+        worker_completions,
+        final_scheduler_status,
+        final_task_status,
+        completed: final_scheduler_status == DurableSchedulerStatus::Completed,
+        blocked: final_scheduler_status == DurableSchedulerStatus::Blocked,
+        messages,
+    }
+}
+
+fn complete_running_benchmark_workers(workers: &WorkerRegistry, worker_completions: &mut usize) {
+    for worker in workers.list() {
+        if matches!(
+            worker.status,
+            WorkerStatus::PromptAccepted | WorkerStatus::Running
+        ) {
+            if workers
+                .observe_completion(&worker.worker_id, "stop", 1)
+                .is_ok()
+            {
+                *worker_completions += 1;
+            }
+        }
+    }
+}
 fn benchmark_task(
     id: &str,
     title: &str,
@@ -482,6 +626,7 @@ fn score_benchmark_task(
     ready_nodes: usize,
     total_nodes: usize,
     route_count: usize,
+    harness: &BenchmarkExecutionHarnessResult,
 ) -> BenchmarkScore {
     let capability_coverage = capability_coverage(&spec.expected_capabilities, selected_tools);
     let expected_steps = usize::from(spec.complexity.clamp(2, 5));
@@ -493,15 +638,26 @@ fn score_benchmark_task(
     };
     let expected_routes = benchmark_route_phases(spec).len().max(1);
     let moe_route_score = (route_count as f32 / expected_routes as f32).clamp(0.0, 1.0);
-    let total = capability_coverage * 0.35
-        + decomposition_score * 0.25
+    let execution_score = if harness.completed {
+        1.0
+    } else if harness.worker_dispatches > 0 && !harness.blocked {
+        0.65
+    } else if harness.scheduler_ticks > 0 {
+        0.35
+    } else {
+        0.0
+    };
+    let total = capability_coverage * 0.25
+        + decomposition_score * 0.20
         + scheduler_score * 0.20
-        + moe_route_score * 0.20;
+        + moe_route_score * 0.15
+        + execution_score * 0.20;
     BenchmarkScore {
         capability_coverage,
         decomposition_score,
         scheduler_score,
         moe_route_score,
+        execution_score,
         total,
     }
 }
@@ -542,6 +698,22 @@ fn summarize_results(results: &[BenchmarkTaskResult]) -> BenchmarkSummary {
             .filter(|result| result.risk_level != "low")
             .count(),
         total_plan_steps: results.iter().map(|result| result.plan_steps).sum(),
+        completed_harness_tasks: results
+            .iter()
+            .filter(|result| result.harness.completed)
+            .count(),
+        blocked_harness_tasks: results
+            .iter()
+            .filter(|result| result.harness.blocked)
+            .count(),
+        total_scheduler_ticks: results
+            .iter()
+            .map(|result| result.harness.scheduler_ticks)
+            .sum(),
+        total_worker_dispatches: results
+            .iter()
+            .map(|result| result.harness.worker_dispatches)
+            .sum(),
     }
 }
 
@@ -591,6 +763,22 @@ mod tests {
         assert_eq!(run.results.len(), 10);
         assert!(run.summary.average_total_score > 0.50);
         assert!(run.summary.total_plan_steps >= 30);
+        assert_eq!(run.summary.completed_harness_tasks, 10);
+        assert_eq!(run.summary.blocked_harness_tasks, 0);
+        assert!(run.summary.total_scheduler_ticks >= 10);
+        assert!(run.summary.total_worker_dispatches >= 10);
+        assert!(run
+            .results
+            .iter()
+            .all(|result| result.harness.scheduler_ticks > 0));
+        assert!(run
+            .results
+            .iter()
+            .all(|result| result.harness.worker_dispatches > 0));
+        assert!(run
+            .results
+            .iter()
+            .all(|result| result.score.execution_score > 0.0));
         assert!(run
             .results
             .iter()

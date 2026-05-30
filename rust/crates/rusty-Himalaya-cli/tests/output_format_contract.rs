@@ -49,6 +49,25 @@ fn benchmark_commands_emit_suite_and_record_runs() {
             .expect("average score")
             > 0.5
     );
+    assert_eq!(run["run"]["summary"]["completed_harness_tasks"], 10);
+    assert!(
+        run["run"]["summary"]["total_scheduler_ticks"]
+            .as_u64()
+            .expect("scheduler tick count")
+            >= 10
+    );
+    assert!(
+        run["run"]["results"][0]["harness"]["worker_dispatches"]
+            .as_u64()
+            .expect("worker dispatch count")
+            > 0
+    );
+    assert!(
+        run["run"]["results"][0]["score"]["execution_score"]
+            .as_f64()
+            .expect("execution score")
+            > 0.0
+    );
     assert!(root.join(".Himalaya/benchmarks/runs.jsonl").exists());
 }
 
@@ -168,6 +187,14 @@ fn task_packet_commands_persist_structured_tasks() {
     assert_eq!(created["type"], "task_packet_create");
     assert_eq!(created["task"]["prompt"], "Fix the parser regression");
     assert_eq!(created["task"]["status"], "created");
+    assert!(created["task"]["plan"].is_object());
+    assert!(created["task"]["plan"]["dag"].is_object());
+    assert!(created["task"]["plan"]["execution"].is_object());
+    assert!(created["event_log"]
+        .as_array()
+        .expect("created event log")
+        .iter()
+        .any(|entry| entry["event"] == "plan_recorded"));
     assert!(created["event_log"]
         .as_array()
         .expect("created event log")
@@ -206,7 +233,7 @@ fn task_packet_commands_persist_structured_tasks() {
             .lines()
             .filter(|line| !line.trim().is_empty())
             .count(),
-        1
+        2
     );
 
     let running = assert_json_command(
@@ -233,7 +260,7 @@ fn task_packet_commands_persist_structured_tasks() {
             .lines()
             .filter(|line| !line.trim().is_empty())
             .count(),
-        3
+        5
     );
 }
 
@@ -289,15 +316,51 @@ fn task_scheduler_tick_persists_durable_status() {
     );
     assert_eq!(tick["type"], "task_scheduler_tick");
     assert_eq!(tick["tick"]["selected_task_id"], task_id);
-    assert_eq!(tick["tick"]["status"], "blocked");
-    assert_eq!(tick["tick"]["task"]["status"], "blocked");
-    assert_eq!(tick["tick"]["outcome"]["blocked"], true);
+    assert_eq!(tick["tick"]["status"], "running");
+    assert_eq!(tick["tick"]["task"]["status"], "running");
+    assert_eq!(tick["tick"]["outcome"]["blocked"], false);
+    assert!(tick["tick"]["outcome"]["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .any(|step| step["kind"] == "dispatch_worker"));
+    assert!(root.join(".Himalaya/workers/workers.json").exists());
 
     let second_tick = assert_json_command(
         &root,
         &["--output-format", "json", "tasks", "scheduler", "tick"],
     );
-    assert_eq!(second_tick["tick"]["status"], "idle");
+    assert_eq!(second_tick["tick"]["status"], "running");
+    assert_eq!(second_tick["tick"]["task"]["status"], "running");
+    assert!(second_tick["tick"]["outcome"]["steps"]
+        .as_array()
+        .expect("second tick steps array")
+        .iter()
+        .any(|step| step["kind"] == "await_worker"));
+
+    let daemon = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "scheduler",
+            "run",
+            "--once",
+        ],
+    );
+    assert_eq!(daemon["type"], "task_scheduler_daemon_run");
+    assert!(daemon["runs"].as_array().expect("daemon runs array").len() >= 1);
+    assert_eq!(daemon["state"]["tick_count"], 1);
+
+    let daemon_status = assert_json_command(
+        &root,
+        &["--output-format", "json", "tasks", "scheduler", "status"],
+    );
+    assert_eq!(daemon_status["type"], "task_scheduler_daemon_status");
+    assert_eq!(daemon_status["state"]["tick_count"], 1);
+    assert!(root.join(".Himalaya/scheduler/state.json").exists());
+    assert!(root.join(".Himalaya/scheduler/events.jsonl").exists());
     assert!(root.join(".Himalaya/tasks/tasks.json").exists());
     assert!(root.join(".Himalaya/tasks/events.jsonl").exists());
 }
@@ -373,6 +436,26 @@ fn worker_supervisor_commands_persist_worker_state() {
     assert_eq!(supervise["type"], "worker_supervisor_tick");
     assert_eq!(supervise["tick"]["status"], "running");
     assert_eq!(supervise["tick"]["active_workers"], 1);
+
+    let completed = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "workers",
+            "complete",
+            &worker_id,
+            "stop",
+            "12",
+        ],
+    );
+    assert_eq!(completed["type"], "worker_complete");
+    assert_eq!(completed["worker"]["status"], "finished");
+
+    let supervise_after_completion =
+        assert_json_command(&root, &["--output-format", "json", "workers", "supervise"]);
+    assert_eq!(supervise_after_completion["tick"]["status"], "idle");
+    assert_eq!(supervise_after_completion["tick"]["active_workers"], 0);
     assert!(root.join(".Himalaya/workers/workers.json").exists());
 }
 
@@ -605,6 +688,42 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
     assert_eq!(skills["action"], "list");
     assert!(skills["summary"]["total"].is_number());
     assert!(skills["skills"].is_array());
+}
+
+#[test]
+fn local_commands_emit_structured_json_when_requested() {
+    let root = unique_temp_dir("local-command-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let workspace = assert_json_command(&root, &["--output-format", "json", "workspace"]);
+    assert_eq!(workspace["type"], "local_command");
+    assert_eq!(workspace["command"], "workspace");
+    assert_eq!(workspace["status"], "ok");
+    assert_eq!(workspace["summary"], "workspace context loaded");
+    assert!(workspace["workspace"]["changed_files"].is_number());
+
+    let test = assert_json_command(&root, &["--output-format", "json", "test", "parser"]);
+    assert_eq!(test["type"], "local_command");
+    assert_eq!(test["command"], "test");
+    assert_eq!(test["status"], "skipped");
+    assert_eq!(test["request"]["argument"], "parser");
+    assert!(test["execution"].is_null());
+    assert!(test["summary"]
+        .as_str()
+        .expect("summary")
+        .contains("no test command detected"));
+}
+
+#[test]
+fn direct_slash_local_command_emits_stream_json_event() {
+    let root = unique_temp_dir("local-command-stream-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let workspace = assert_json_command(&root, &["--output-format", "stream-json", "/workspace"]);
+    assert_eq!(workspace["type"], "local_command");
+    assert_eq!(workspace["protocol_version"], 1);
+    assert_eq!(workspace["command"], "workspace");
+    assert_eq!(workspace["status"], "ok");
 }
 
 #[test]

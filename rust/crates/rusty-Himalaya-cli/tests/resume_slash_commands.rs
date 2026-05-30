@@ -229,6 +229,41 @@ fn resume_latest_restores_the_most_recent_managed_session() {
 }
 
 #[test]
+fn resumed_workspace_command_emits_local_command_json() {
+    let temp_dir = unique_temp_dir("resume-workspace-local-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    Session::new()
+        .save_to_path(&session_path)
+        .expect("session should persist");
+
+    let output = run_Himalaya(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/workspace",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: Value =
+        serde_json::from_str(stdout.trim()).expect("workspace output should be json");
+    assert_eq!(parsed["type"], "local_command");
+    assert_eq!(parsed["command"], "workspace");
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["summary"], "workspace context loaded");
+}
+
+#[test]
 fn resumed_status_command_emits_structured_json_when_requested() {
     // given
     let temp_dir = unique_temp_dir("resume-status-json");

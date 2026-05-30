@@ -92,6 +92,7 @@ enum FieldType {
     Bool,
     Object,
     StringArray,
+    Array,
     Number,
 }
 
@@ -102,6 +103,7 @@ impl FieldType {
             Self::Bool => "a boolean",
             Self::Object => "an object",
             Self::StringArray => "an array of strings",
+            Self::Array => "an array",
             Self::Number => "a number",
         }
     }
@@ -114,6 +116,7 @@ impl FieldType {
             Self::StringArray => value
                 .as_array()
                 .is_some_and(|arr| arr.iter().all(|v| v.as_str().is_some())),
+            Self::Array => value.as_array().is_some(),
             Self::Number => value.as_i64().is_some(),
         }
     }
@@ -195,6 +198,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "decisioning",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "modelRouting",
         expected: FieldType::Object,
     },
     FieldSpec {
@@ -376,6 +383,60 @@ const DECISIONING_SAFETY_POLICY_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "lowConfidencePenaltyPercent",
+        expected: FieldType::Number,
+    },
+];
+
+const MODEL_ROUTING_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "enabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "minFeedbackSamples",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "switchFailureThresholdPercent",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "routes",
+        expected: FieldType::Array,
+    },
+];
+
+const MODEL_ROUTING_ROUTE_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "phase",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "model",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "provider",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "capabilities",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "maxTokens",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "costWeight",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "latencyWeight",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "qualityWeight",
         expected: FieldType::Number,
     },
 ];
@@ -590,6 +651,28 @@ pub fn validate_config_file(
                 source,
                 &path_display,
             ));
+        }
+    }
+    if let Some(model_routing) = object.get("modelRouting").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            model_routing,
+            MODEL_ROUTING_FIELDS,
+            "modelRouting",
+            source,
+            &path_display,
+        ));
+        if let Some(routes) = model_routing.get("routes").and_then(JsonValue::as_array) {
+            for (index, route) in routes.iter().enumerate() {
+                if let Some(route) = route.as_object() {
+                    result.merge(validate_object_keys(
+                        route,
+                        MODEL_ROUTING_ROUTE_FIELDS,
+                        &format!("modelRouting.routes[{index}]"),
+                        source,
+                        &path_display,
+                    ));
+                }
+            }
         }
     }
 

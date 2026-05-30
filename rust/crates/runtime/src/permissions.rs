@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::config::RuntimePermissionRuleConfig;
 
 /// Permission level assigned to a tool invocation or runtime session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionMode {
     ReadOnly,
     WorkspaceWrite,
@@ -14,7 +14,21 @@ pub enum PermissionMode {
     Allow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionModeParseError;
+
+impl std::fmt::Display for PermissionModeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unsupported permission mode")
+    }
+}
+
+impl std::error::Error for PermissionModeParseError {}
+
 impl PermissionMode {
+    pub const PUBLIC_MODES: [Self; 3] =
+        [Self::ReadOnly, Self::WorkspaceWrite, Self::DangerFullAccess];
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -24,6 +38,81 @@ impl PermissionMode {
             Self::Prompt => "prompt",
             Self::Allow => "allow",
         }
+    }
+
+    #[must_use]
+    pub fn public_modes() -> &'static [Self] {
+        &Self::PUBLIC_MODES
+    }
+
+    #[must_use]
+    pub fn public_labels() -> Vec<&'static str> {
+        Self::public_modes()
+            .iter()
+            .map(|mode| mode.as_str())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn parse_public(value: &str) -> Option<Self> {
+        Self::parse_alias(value).filter(|mode| mode.is_public())
+    }
+
+    #[must_use]
+    pub fn parse_alias(value: &str) -> Option<Self> {
+        match value.trim() {
+            "default" | "plan" | "read-only" => Some(Self::ReadOnly),
+            "acceptEdits" | "auto" | "workspace-write" => Some(Self::WorkspaceWrite),
+            "dontAsk" | "danger-full-access" => Some(Self::DangerFullAccess),
+            "prompt" => Some(Self::Prompt),
+            "allow" => Some(Self::Allow),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_public(self) -> bool {
+        matches!(
+            self,
+            Self::ReadOnly | Self::WorkspaceWrite | Self::DangerFullAccess
+        )
+    }
+
+    #[must_use]
+    pub fn satisfies(self, required: Self) -> bool {
+        self == Self::Allow
+            || self
+                .level()
+                .is_some_and(|level| required.level().is_some_and(|required| level >= required))
+    }
+
+    #[must_use]
+    pub fn risk_signal(self) -> (f32, &'static str) {
+        match self {
+            Self::ReadOnly => (0.0, "Read-only mode keeps the action constrained."),
+            Self::WorkspaceWrite => (0.03, "Workspace-write mode can modify local files."),
+            Self::Prompt => (0.05, "Prompt mode may require extra approval."),
+            Self::DangerFullAccess => (0.12, "Danger-full-access mode broadens execution scope."),
+            Self::Allow => (0.15, "Allow mode bypasses normal permission barriers."),
+        }
+    }
+
+    fn level(self) -> Option<u8> {
+        match self {
+            Self::ReadOnly => Some(0),
+            Self::WorkspaceWrite => Some(1),
+            Self::DangerFullAccess => Some(2),
+            Self::Prompt => None,
+            Self::Allow => Some(u8::MAX),
+        }
+    }
+}
+
+impl std::str::FromStr for PermissionMode {
+    type Err = PermissionModeParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse_alias(value).ok_or(PermissionModeParseError)
     }
 }
 
@@ -233,10 +322,7 @@ impl PermissionPolicy {
                         prompter,
                     );
                 }
-                if allow_rule.is_some()
-                    || current_mode == PermissionMode::Allow
-                    || current_mode >= required_mode
-                {
+                if allow_rule.is_some() || current_mode.satisfies(required_mode) {
                     return PermissionOutcome::Allow;
                 }
             }
@@ -258,10 +344,7 @@ impl PermissionPolicy {
             );
         }
 
-        if allow_rule.is_some()
-            || current_mode == PermissionMode::Allow
-            || current_mode >= required_mode
-        {
+        if allow_rule.is_some() || current_mode.satisfies(required_mode) {
             return PermissionOutcome::Allow;
         }
 
@@ -525,6 +608,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn permission_mode_parses_public_aliases_from_single_source() {
+        assert_eq!(
+            PermissionMode::parse_public("read-only"),
+            Some(PermissionMode::ReadOnly)
+        );
+        assert_eq!(
+            PermissionMode::parse_public("plan"),
+            Some(PermissionMode::ReadOnly)
+        );
+        assert_eq!(
+            PermissionMode::parse_public("workspace-write"),
+            Some(PermissionMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            PermissionMode::parse_public("acceptEdits"),
+            Some(PermissionMode::WorkspaceWrite)
+        );
+        assert_eq!(
+            PermissionMode::parse_public("danger-full-access"),
+            Some(PermissionMode::DangerFullAccess)
+        );
+        assert_eq!(
+            PermissionMode::parse_public("dontAsk"),
+            Some(PermissionMode::DangerFullAccess)
+        );
+        assert_eq!(PermissionMode::parse_public("prompt"), None);
+        assert_eq!(PermissionMode::parse_public("allow"), None);
+    }
+
+    #[test]
+    fn permission_mode_satisfies_uses_explicit_lattice() {
+        assert!(PermissionMode::WorkspaceWrite.satisfies(PermissionMode::ReadOnly));
+        assert!(PermissionMode::DangerFullAccess.satisfies(PermissionMode::WorkspaceWrite));
+        assert!(PermissionMode::Allow.satisfies(PermissionMode::DangerFullAccess));
+        assert!(!PermissionMode::ReadOnly.satisfies(PermissionMode::WorkspaceWrite));
+        assert!(!PermissionMode::Prompt.satisfies(PermissionMode::ReadOnly));
     }
 
     #[test]

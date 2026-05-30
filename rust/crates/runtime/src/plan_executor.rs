@@ -62,6 +62,8 @@ pub struct PlanNodeExecution {
     pub failure_class: Option<String>,
     pub retry_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_gate: Option<NodeVerificationGate>,
 }
 
@@ -103,6 +105,7 @@ impl PlanExecution {
                     failure_class: None,
                     retry_count: 0,
                     verification_gate: None,
+                    worker_id: None,
                 },
             );
             if status == PlanNodeStatus::Ready {
@@ -185,6 +188,7 @@ impl PlanExecution {
         node.status = PlanNodeStatus::Ready;
         node.retry_count = node.retry_count.saturating_add(1);
         node.failure_class = None;
+        node.worker_id = None;
         self.reset_skipped_dependents(dag, node_id);
         self.push_event(
             node_id,
@@ -244,6 +248,7 @@ impl PlanExecution {
             }
             if !passed {
                 node.status = PlanNodeStatus::Failed;
+                node.worker_id = None;
                 node.failure_class = Some("node_verification".to_string());
             }
             node.status
@@ -282,6 +287,41 @@ impl PlanExecution {
         Ok(())
     }
 
+    pub fn assign_worker(
+        &mut self,
+        node_id: &str,
+        worker_id: impl Into<String>,
+    ) -> Result<(), String> {
+        let worker_id = worker_id.into();
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| format!("plan node not found: {node_id}"))?;
+        if node.status != PlanNodeStatus::Running {
+            return Err(format!(
+                "plan node {node_id} cannot bind worker from status {:?}",
+                node.status
+            ));
+        }
+        node.worker_id = Some(worker_id.clone());
+        self.push_event(
+            node_id,
+            PlanExecutionEventKind::NodeStarted,
+            PlanNodeStatus::Running,
+            Some(format!("worker assigned: {worker_id}")),
+        );
+        Ok(())
+    }
+
+    pub fn clear_worker(&mut self, node_id: &str) -> Result<(), String> {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| format!("plan node not found: {node_id}"))?;
+        node.worker_id = None;
+        Ok(())
+    }
+
     pub fn succeed_node(
         &mut self,
         dag: &PlanDag,
@@ -299,6 +339,7 @@ impl PlanExecution {
             ));
         }
         node.status = PlanNodeStatus::Succeeded;
+        node.worker_id = None;
         node.output_summary = output_summary.clone();
         self.push_event(
             node_id,
@@ -322,6 +363,7 @@ impl PlanExecution {
             .get_mut(node_id)
             .ok_or_else(|| format!("plan node not found: {node_id}"))?;
         node.status = PlanNodeStatus::Failed;
+        node.worker_id = None;
         node.failure_class = Some(failure_class.clone());
         self.push_event(
             node_id,

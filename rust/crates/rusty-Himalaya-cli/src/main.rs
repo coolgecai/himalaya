@@ -52,8 +52,7 @@ use runtime::{
     ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
     MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
     PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ReasoningStep,
-    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker,
+    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -314,6 +313,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             command,
             output_format,
         } => run_cron_command(command, output_format)?,
+        CliAction::Local {
+            command,
+            output_format,
+        } => run_local_command(command, output_format)?,
         CliAction::PrintSystemPrompt {
             cwd,
             date,
@@ -480,6 +483,10 @@ enum CliAction {
         command: CronCliCommand,
         output_format: CliOutputFormat,
     },
+    Local {
+        command: LocalCliCommand,
+        output_format: CliOutputFormat,
+    },
     PrintSystemPrompt {
         cwd: PathBuf,
         date: String,
@@ -580,6 +587,16 @@ enum BenchmarkCliCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalCliCommand {
+    Test { filter: Option<String> },
+    Lint { filter: Option<String> },
+    Build { target: Option<String> },
+    Review { scope: Option<String> },
+    Diagnostics { path: Option<String> },
+    Workspace { path: Option<PathBuf> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TaskCliCommand {
     List {
         status: Option<runtime::TaskStatus>,
@@ -637,6 +654,8 @@ enum TaskPacketCliCommand {
 enum TaskSchedulerCliCommand {
     Tick,
     Queue,
+    Run { max_ticks: usize },
+    Status,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -659,6 +678,11 @@ enum WorkerCliCommand {
     Prompt {
         worker_id: String,
         prompt: Option<String>,
+    },
+    Complete {
+        worker_id: String,
+        finish_reason: String,
+        tokens_output: u64,
     },
     Restart {
         worker_id: String,
@@ -1071,6 +1095,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             command: parse_cron_cli_command(&rest[1..])?,
             output_format,
         }),
+        "test" | "lint" | "build" | "review" | "diagnostics" | "workspace" | "cwd" => {
+            Ok(CliAction::Local {
+                command: parse_local_cli_command(&rest)?,
+                output_format,
+            })
+        }
         "workers" | "worker" => Ok(CliAction::Workers {
             command: parse_worker_cli_command(&rest[1..])?,
             output_format,
@@ -1122,6 +1152,34 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allow_broad_cwd,
             file_paths: file_paths.clone(),
         }),
+    }
+}
+
+fn parse_local_cli_command(args: &[String]) -> Result<LocalCliCommand, String> {
+    let Some((command, rest)) = args.split_first() else {
+        return Err("local command is missing".to_string());
+    };
+    parse_local_cli_command_from_parts(command, join_optional_args(rest).as_deref())
+}
+
+fn parse_local_cli_command_from_parts(
+    command: &str,
+    args: Option<&str>,
+) -> Result<LocalCliCommand, String> {
+    let value = args.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    });
+    match command {
+        "test" => Ok(LocalCliCommand::Test { filter: value }),
+        "lint" => Ok(LocalCliCommand::Lint { filter: value }),
+        "build" => Ok(LocalCliCommand::Build { target: value }),
+        "review" => Ok(LocalCliCommand::Review { scope: value }),
+        "diagnostics" => Ok(LocalCliCommand::Diagnostics { path: value }),
+        "workspace" | "cwd" => Ok(LocalCliCommand::Workspace {
+            path: value.map(PathBuf::from),
+        }),
+        other => Err(format!("unknown local command: {other}")),
     }
 }
 
@@ -1317,10 +1375,52 @@ fn parse_task_scheduler_cli_command(args: &[String]) -> Result<TaskSchedulerCliC
     {
         None | Some(("tick", [])) => Ok(TaskSchedulerCliCommand::Tick),
         Some(("queue", [])) => Ok(TaskSchedulerCliCommand::Queue),
+        Some(("status", [])) => Ok(TaskSchedulerCliCommand::Status),
+        Some(("run", rest)) => parse_task_scheduler_run_args(rest),
         Some((other, _)) => Err(format!(
-            "unknown tasks scheduler command: {other}\nUsage: Himalaya tasks scheduler [tick|queue]"
+            "unknown tasks scheduler command: {other}\nUsage: Himalaya tasks scheduler [tick|queue|run [--once|--max-ticks N]|status]"
         )),
     }
+}
+
+fn parse_task_scheduler_run_args(args: &[String]) -> Result<TaskSchedulerCliCommand, String> {
+    let mut max_ticks = 1_usize;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--once" => {
+                max_ticks = 1;
+                index += 1;
+            }
+            "--max-ticks" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "tasks scheduler run --max-ticks requires a value".to_string()
+                })?;
+                max_ticks = parse_positive_usize("--max-ticks", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--max-ticks=") => {
+                max_ticks = parse_positive_usize("--max-ticks", &value[12..])?;
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown tasks scheduler run argument: {other}\nUsage: Himalaya tasks scheduler run [--once|--max-ticks N]"
+                ));
+            }
+        }
+    }
+    Ok(TaskSchedulerCliCommand::Run { max_ticks })
+}
+
+fn parse_positive_usize(name: &str, value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {name} value: {value}"))?;
+    if parsed == 0 {
+        return Err(format!("{name} must be greater than 0"));
+    }
+    Ok(parsed)
 }
 
 fn parse_worker_cli_command(args: &[String]) -> Result<WorkerCliCommand, String> {
@@ -1376,6 +1476,10 @@ fn parse_worker_cli_command(args: &[String]) -> Result<WorkerCliCommand, String>
                 screen_text: screen.join(" "),
             })
         }
+        Some(("complete" | "finish", [_, _, _, _, ..])) => Err(
+            "workers complete accepts at most: <worker-id> [finish-reason] [tokens-output]"
+                .to_string(),
+        ),
         Some(("ready", [worker_id])) => Ok(WorkerCliCommand::Ready {
             worker_id: worker_id.clone(),
         }),
@@ -1386,6 +1490,25 @@ fn parse_worker_cli_command(args: &[String]) -> Result<WorkerCliCommand, String>
             worker_id: worker_id.clone(),
             prompt: (!prompt.is_empty()).then(|| prompt.join(" ")),
         }),
+        Some(("complete" | "finish", [worker_id])) => Ok(WorkerCliCommand::Complete {
+            worker_id: worker_id.clone(),
+            finish_reason: "stop".to_string(),
+            tokens_output: 1,
+        }),
+        Some(("complete" | "finish", [worker_id, finish_reason])) => Ok(WorkerCliCommand::Complete {
+            worker_id: worker_id.clone(),
+            finish_reason: finish_reason.clone(),
+            tokens_output: 1,
+        }),
+        Some(("complete" | "finish", [worker_id, finish_reason, tokens_output])) => {
+            Ok(WorkerCliCommand::Complete {
+                worker_id: worker_id.clone(),
+                finish_reason: finish_reason.clone(),
+                tokens_output: tokens_output.parse::<u64>().map_err(|_| {
+                    format!("workers complete tokens-output must be an integer: {tokens_output}")
+                })?,
+            })
+        }
         Some(("restart", [worker_id])) => Ok(WorkerCliCommand::Restart {
             worker_id: worker_id.clone(),
         }),
@@ -1394,7 +1517,7 @@ fn parse_worker_cli_command(args: &[String]) -> Result<WorkerCliCommand, String>
         }),
         Some(("supervise" | "tick", [])) => Ok(WorkerCliCommand::Supervise),
         Some((other, _)) => Err(format!(
-            "unknown workers command: {other}\nUsage: Himalaya workers [list|create|observe <worker-id> <screen>|ready <worker-id>|resolve-trust <worker-id>|prompt <worker-id> [prompt]|restart <worker-id>|terminate <worker-id>|supervise]"
+            "unknown workers command: {other}\nUsage: Himalaya workers [list|create|observe <worker-id> <screen>|ready <worker-id>|resolve-trust <worker-id>|prompt <worker-id> [prompt]|complete <worker-id> [finish-reason] [tokens-output]|restart <worker-id>|terminate <worker-id>|supervise]"
         )),
     }
 }
@@ -1478,6 +1601,13 @@ fn parse_single_word_command_alias(
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
+        "test" | "lint" | "build" | "review" | "diagnostics" | "workspace" | "cwd" => {
+            Some(Ok(CliAction::Local {
+                command: parse_local_cli_command(rest)
+                    .expect("single-word local command should parse"),
+                output_format,
+            }))
+        }
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -1610,6 +1740,24 @@ fn parse_direct_slash_cli_action(
             command: parse_benchmark_cli_command(&split_slash_remainder(args.as_deref()))?,
             output_format,
             model: model.clone(),
+        }),
+        Ok(Some(SlashCommand::LocalCommand { name, args })) => Ok(CliAction::Local {
+            command: parse_local_cli_command_from_parts(&name, args.as_deref())?,
+            output_format,
+        }),
+        Ok(Some(SlashCommand::Review { scope })) => Ok(CliAction::Local {
+            command: LocalCliCommand::Review { scope },
+            output_format,
+        }),
+        Ok(Some(SlashCommand::Workspace { path })) => Ok(CliAction::Local {
+            command: LocalCliCommand::Workspace {
+                path: path.map(PathBuf::from),
+            },
+            output_format,
+        }),
+        Ok(Some(SlashCommand::Diagnostics { path })) => Ok(CliAction::Local {
+            command: LocalCliCommand::Diagnostics { path },
+            output_format,
         }),
         Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
         Ok(Some(command)) => Err({
@@ -1804,38 +1952,24 @@ fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
 }
 
 fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
-    normalize_permission_mode(value)
-        .ok_or_else(|| {
-            format!(
-                "unsupported permission mode '{value}'. Use read-only, workspace-write, or danger-full-access."
-            )
-        })
-        .map(permission_mode_from_label)
+    PermissionMode::parse_public(value).ok_or_else(|| {
+        format!(
+            "unsupported permission mode '{value}'. Use {}.",
+            PermissionMode::public_labels().join(", ")
+        )
+    })
 }
 
 fn permission_mode_from_label(mode: &str) -> PermissionMode {
-    match mode {
-        "read-only" => PermissionMode::ReadOnly,
-        "workspace-write" => PermissionMode::WorkspaceWrite,
-        "danger-full-access" => PermissionMode::DangerFullAccess,
-        other => panic!("unsupported permission mode label: {other}"),
-    }
-}
-
-fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode {
-    match mode {
-        ResolvedPermissionMode::ReadOnly => PermissionMode::ReadOnly,
-        ResolvedPermissionMode::WorkspaceWrite => PermissionMode::WorkspaceWrite,
-        ResolvedPermissionMode::DangerFullAccess => PermissionMode::DangerFullAccess,
-    }
+    PermissionMode::parse_public(mode)
+        .unwrap_or_else(|| panic!("unsupported permission mode label: {mode}"))
 }
 
 fn default_permission_mode() -> PermissionMode {
     env::var("RUSTY_Himalaya_PERMISSION_MODE")
         .ok()
         .as_deref()
-        .and_then(normalize_permission_mode)
-        .map(permission_mode_from_label)
+        .and_then(PermissionMode::parse_public)
         .or_else(config_permission_mode_for_current_dir)
         .unwrap_or(PermissionMode::ReadOnly)
 }
@@ -1847,7 +1981,7 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
         .load()
         .ok()?
         .permission_mode()
-        .map(permission_mode_from_resolved)
+        .map(PermissionMode::from)
 }
 
 fn config_model_for_current_dir() -> Option<String> {
@@ -3744,34 +3878,40 @@ fn format_model_switch_report(previous: &str, next: &str, message_count: usize) 
     )
 }
 
+fn public_permission_labels_for_sentence() -> String {
+    let labels = PermissionMode::public_labels();
+    match labels.as_slice() {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [head @ .., last] => format!("{}, or {last}", head.join(", ")),
+    }
+}
+
 fn format_permissions_report(mode: &str) -> String {
-    let modes = [
-        ("read-only", "Read/search tools only", mode == "read-only"),
-        (
-            "workspace-write",
-            "Edit files inside the workspace",
-            mode == "workspace-write",
-        ),
-        (
-            "danger-full-access",
-            "Unrestricted tool access",
-            mode == "danger-full-access",
-        ),
-    ]
-    .into_iter()
-    .map(|(name, description, is_current)| {
-        let marker = if is_current {
-            "● current"
-        } else {
-            "○ available"
-        };
-        format!("  {name:<18} {marker:<11} {description}")
-    })
-    .collect::<Vec<_>>()
-    .join(
-        "
+    let modes = PermissionMode::public_modes()
+        .iter()
+        .map(|candidate| {
+            let name = candidate.as_str();
+            let description = match candidate {
+                PermissionMode::ReadOnly => "Read/search tools only",
+                PermissionMode::WorkspaceWrite => "Edit files inside the workspace",
+                PermissionMode::DangerFullAccess => "Unrestricted tool access",
+                PermissionMode::Prompt | PermissionMode::Allow => {
+                    unreachable!("public modes exclude internal aliases")
+                }
+            };
+            let marker = if name == mode {
+                "● current"
+            } else {
+                "○ available"
+            };
+            format!("  {name:<18} {marker:<11} {description}")
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
 ",
-    );
+        );
 
     format!(
         "Permissions
@@ -4232,6 +4372,43 @@ fn run_resume_command(
                 })),
             })
         }
+        SlashCommand::LocalCommand { name, args } => {
+            let value =
+                local_command_value(parse_local_cli_command_from_parts(name, args.as_deref())?)?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(render_local_command_text(&value)),
+                json: Some(value),
+            })
+        }
+        SlashCommand::Review { scope } => {
+            let value = local_command_value(LocalCliCommand::Review {
+                scope: scope.clone(),
+            })?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(render_local_command_text(&value)),
+                json: Some(value),
+            })
+        }
+        SlashCommand::Workspace { path } => {
+            let value = local_command_value(LocalCliCommand::Workspace {
+                path: path.as_ref().map(PathBuf::from),
+            })?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(render_local_command_text(&value)),
+                json: Some(value),
+            })
+        }
+        SlashCommand::Diagnostics { path } => {
+            let value = local_command_value(LocalCliCommand::Diagnostics { path: path.clone() })?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(render_local_command_text(&value)),
+                json: Some(value),
+            })
+        }
         SlashCommand::Plan { mode } => {
             let prompt = mode.clone().unwrap_or_default();
             if prompt.trim().is_empty() {
@@ -4410,7 +4587,6 @@ fn run_resume_command(
         | SlashCommand::SecurityReview
         | SlashCommand::Keybindings
         | SlashCommand::PrivacySettings
-        | SlashCommand::Review { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
         | SlashCommand::Usage { .. }
@@ -5728,6 +5904,30 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
+            SlashCommand::LocalCommand { name, args } => {
+                run_local_command(
+                    parse_local_cli_command_from_parts(&name, args.as_deref())?,
+                    CliOutputFormat::Text,
+                )?;
+                false
+            }
+            SlashCommand::Review { scope } => {
+                run_local_command(LocalCliCommand::Review { scope }, CliOutputFormat::Text)?;
+                false
+            }
+            SlashCommand::Workspace { path } => {
+                run_local_command(
+                    LocalCliCommand::Workspace {
+                        path: path.map(PathBuf::from),
+                    },
+                    CliOutputFormat::Text,
+                )?;
+                false
+            }
+            SlashCommand::Diagnostics { path } => {
+                run_local_command(LocalCliCommand::Diagnostics { path }, CliOutputFormat::Text)?;
+                false
+            }
             SlashCommand::History { count } => {
                 self.print_prompt_history(count.as_deref());
                 false
@@ -5788,7 +5988,6 @@ impl LiveCli {
             | SlashCommand::SecurityReview
             | SlashCommand::Keybindings
             | SlashCommand::PrivacySettings
-            | SlashCommand::Review { .. }
             | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
             | SlashCommand::Usage { .. }
@@ -5968,7 +6167,8 @@ impl LiveCli {
 
         let normalized = normalize_permission_mode(&mode).ok_or_else(|| {
             format!(
-                "unsupported permission mode '{mode}'. Use read-only, workspace-write, or danger-full-access."
+                "unsupported permission mode '{mode}'. Use {}.",
+                public_permission_labels_for_sentence()
             )
         })?;
 
@@ -6713,11 +6913,17 @@ fn run_task_command(
         }
         TaskCliCommand::Execute { task_id, from_node } => {
             let registry = load_task_registry()?;
+            let worker_registry = load_worker_registry()?;
             let runner = runtime::VerificationRunner::new(Some(env::current_dir()?));
-            let engine = runtime::TaskExecutionEngine::new(registry.clone(), runner);
+            let engine = runtime::TaskExecutionEngine::with_workers(
+                registry.clone(),
+                runner,
+                worker_registry.clone(),
+            );
             let _ = engine.assign_team(&task_id)?;
             let outcome = engine.execute(&task_id, from_node.as_deref())?;
             save_task_registry(&registry)?;
+            save_worker_registry(&worker_registry)?;
             match output_format {
                 CliOutputFormat::Text => println!("{}", outcome.message),
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
@@ -6882,6 +7088,273 @@ fn run_task_command(
     Ok(())
 }
 
+fn print_local_command_output(
+    value: Value,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match output_format {
+        CliOutputFormat::StreamJson => print_stream_json_event(value),
+        CliOutputFormat::Json => print_task_json(value)?,
+        CliOutputFormat::Text => println!("{}", render_local_command_text(&value)),
+    }
+    Ok(())
+}
+
+fn run_local_command(
+    command: LocalCliCommand,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let value = local_command_value(command)?;
+    print_local_command_output(value, output_format)
+}
+
+fn local_command_value(command: LocalCliCommand) -> Result<Value, Box<dyn std::error::Error>> {
+    match command {
+        LocalCliCommand::Test { filter } => verification_local_command_value("test", filter),
+        LocalCliCommand::Lint { filter } => verification_local_command_value("lint", filter),
+        LocalCliCommand::Build { target } => verification_local_command_value("build", target),
+        LocalCliCommand::Review { scope } => review_local_command_value(scope),
+        LocalCliCommand::Diagnostics { path } => diagnostics_local_command_value(path),
+        LocalCliCommand::Workspace { path } => workspace_local_command_value(path),
+    }
+}
+
+fn verification_local_command_value(
+    command: &str,
+    argument: Option<String>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let Some(executable) = detect_local_verification_command(command, argument.as_deref(), &cwd)
+    else {
+        return Ok(json!({
+            "type": "local_command",
+            "command": command,
+            "status": "skipped",
+            "cwd": cwd,
+            "request": { "argument": argument },
+            "execution": null,
+            "summary": format!("no {command} command detected for this workspace"),
+        }));
+    };
+    let request = runtime::VerificationRequest {
+        task_id: format!("local-{command}"),
+        objective: format!("Run local {command}"),
+        scope: cwd.display().to_string(),
+        acceptance_tests: vec![executable.clone()],
+        reporting_contract: "return local command status and captured output".to_string(),
+        policy: runtime::VerificationPolicy::Targeted,
+        required_green_level: runtime::VerificationPolicy::Targeted.required_green_level(),
+    };
+    let runner = runtime::VerificationRunner::new(Some(cwd.clone()));
+    let result = runner.run(&request);
+    Ok(json!({
+        "type": "local_command",
+        "command": command,
+        "status": if result.passed { "passed" } else { "failed" },
+        "cwd": cwd,
+        "request": { "argument": argument },
+        "execution": {
+            "command": executable,
+            "passed": result.passed,
+            "summary": result.summary,
+            "evidence": result.evidence,
+        },
+        "summary": if result.passed { format!("{command} passed") } else { format!("{command} failed") },
+    }))
+}
+
+fn detect_local_verification_command(
+    command: &str,
+    argument: Option<&str>,
+    cwd: &Path,
+) -> Option<String> {
+    if package_script_exists(cwd, command) {
+        let mut executable = format!("npm run {command}");
+        if let Some(argument) = argument.filter(|value| !value.trim().is_empty()) {
+            executable.push_str(" -- ");
+            executable.push_str(argument.trim());
+        }
+        return Some(executable);
+    }
+
+    let cargo_manifest = if cwd.join("Cargo.toml").exists() {
+        Some(PathBuf::from("Cargo.toml"))
+    } else if cwd.join("rust").join("Cargo.toml").exists() {
+        Some(PathBuf::from("rust/Cargo.toml"))
+    } else {
+        None
+    }?;
+    let manifest_arg = if cargo_manifest == PathBuf::from("Cargo.toml") {
+        String::new()
+    } else {
+        format!(" --manifest-path {}", cargo_manifest.display())
+    };
+
+    match command {
+        "test" => {
+            let mut executable = format!("cargo test{manifest_arg}");
+            if let Some(argument) = argument.filter(|value| !value.trim().is_empty()) {
+                executable.push(' ');
+                executable.push_str(argument.trim());
+            }
+            Some(executable)
+        }
+        "lint" => Some(format!("cargo fmt{manifest_arg} --check")),
+        "build" => {
+            let mut executable = format!("cargo build{manifest_arg}");
+            if let Some(argument) = argument.filter(|value| !value.trim().is_empty()) {
+                executable.push(' ');
+                if argument.trim() == "release" {
+                    executable.push_str("--release");
+                } else {
+                    executable.push_str(argument.trim());
+                }
+            }
+            Some(executable)
+        }
+        _ => None,
+    }
+}
+
+fn package_script_exists(cwd: &Path, script: &str) -> bool {
+    let package_json = cwd.join("package.json");
+    let Ok(raw) = fs::read_to_string(package_json) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    value
+        .get("scripts")
+        .and_then(Value::as_object)
+        .and_then(|scripts| scripts.get(script))
+        .and_then(Value::as_str)
+        .is_some_and(|script| !script.trim().is_empty())
+}
+
+fn review_local_command_value(scope: Option<String>) -> Result<Value, Box<dyn std::error::Error>> {
+    let context = status_context(None)?;
+    let diff_stat = git_diff_stat().unwrap_or_else(|| "git diff is unavailable".to_string());
+    let status = if context.git_summary.changed_files == 0 {
+        "clean"
+    } else {
+        "needs_review"
+    };
+    Ok(json!({
+        "type": "local_command",
+        "command": "review",
+        "status": status,
+        "cwd": context.cwd,
+        "request": { "scope": scope },
+        "workspace": {
+            "project_root": context.project_root,
+            "git_branch": context.git_branch,
+            "git_state": context.git_summary.headline(),
+            "changed_files": context.git_summary.changed_files,
+            "staged_files": context.git_summary.staged_files,
+            "unstaged_files": context.git_summary.unstaged_files,
+            "untracked_files": context.git_summary.untracked_files,
+        },
+        "diff_stat": diff_stat,
+        "summary": if context.git_summary.changed_files == 0 {
+            "workspace is clean; no local changes to review".to_string()
+        } else {
+            "review local changes with /diff before committing".to_string()
+        },
+    }))
+}
+
+fn diagnostics_local_command_value(
+    path: Option<String>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let registry = runtime::lsp_client::LspRegistry::new();
+    let diagnostics = registry.dispatch("diagnostics", path.as_deref(), None, None, None)?;
+    Ok(json!({
+        "type": "local_command",
+        "command": "diagnostics",
+        "status": "ok",
+        "cwd": cwd,
+        "request": { "path": path },
+        "diagnostics": diagnostics,
+        "summary": "no cached LSP diagnostics are available in this CLI process",
+    }))
+}
+
+fn workspace_local_command_value(
+    path: Option<PathBuf>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let requested_path = path.clone();
+    if let Some(path) = path.as_ref() {
+        env::set_current_dir(path)?;
+    }
+    let context = status_context(None)?;
+    Ok(json!({
+        "type": "local_command",
+        "command": "workspace",
+        "status": "ok",
+        "cwd": context.cwd,
+        "request": { "path": requested_path },
+        "workspace": {
+            "project_root": context.project_root,
+            "git_branch": context.git_branch,
+            "git_state": context.git_summary.headline(),
+            "changed_files": context.git_summary.changed_files,
+            "staged_files": context.git_summary.staged_files,
+            "unstaged_files": context.git_summary.unstaged_files,
+            "untracked_files": context.git_summary.untracked_files,
+            "loaded_config_files": context.loaded_config_files,
+            "discovered_config_files": context.discovered_config_files,
+            "memory_file_count": context.memory_file_count,
+        },
+        "summary": "workspace context loaded",
+    }))
+}
+
+fn git_diff_stat() -> Option<String> {
+    let output = Command::new("git")
+        .args(["diff", "--stat", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Some(if stdout.is_empty() {
+        "no diff against HEAD".to_string()
+    } else {
+        stdout
+    })
+}
+
+fn render_local_command_text(value: &Value) -> String {
+    let command = value["command"].as_str().unwrap_or("local");
+    let status = value["status"].as_str().unwrap_or("unknown");
+    let summary = value["summary"].as_str().unwrap_or("");
+    let cwd = value["cwd"].as_str().unwrap_or("");
+    let mut lines = vec![format!(
+        "Local command\n  Command          /{command}\n  Status           {status}\n  Cwd              {cwd}\n  Summary          {summary}"
+    )];
+    if let Some(execution) = value.get("execution").filter(|value| value.is_object()) {
+        if let Some(command_line) = execution.get("command").and_then(Value::as_str) {
+            lines.push(format!("  Executed         {command_line}"));
+        }
+        if let Some(detail) = execution.get("summary").and_then(Value::as_str) {
+            lines.push(format!("  Detail           {detail}"));
+        }
+    }
+    if let Some(workspace) = value.get("workspace").filter(|value| value.is_object()) {
+        if let Some(git_state) = workspace.get("git_state").and_then(Value::as_str) {
+            lines.push(format!("  Git state        {git_state}"));
+        }
+    }
+    if let Some(diff_stat) = value.get("diff_stat").and_then(Value::as_str) {
+        lines.push("  Diff stat".to_string());
+        lines.extend(diff_stat.lines().map(|line| format!("    {line}")));
+    }
+    lines.join("\n")
+}
+
 fn print_worker_output(
     value: Value,
     output_format: CliOutputFormat,
@@ -6993,6 +7466,24 @@ fn run_worker_command(
                 }
             }
         }
+        WorkerCliCommand::Complete {
+            worker_id,
+            finish_reason,
+            tokens_output,
+        } => {
+            let registry = load_worker_registry()?;
+            let worker = registry.observe_completion(&worker_id, &finish_reason, tokens_output)?;
+            save_worker_registry(&registry)?;
+            match output_format {
+                CliOutputFormat::Text => println!("{}", worker.status),
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_worker_output(
+                        json!({"type":"worker_complete","worker":worker}),
+                        output_format,
+                    )?;
+                }
+            }
+        }
         WorkerCliCommand::Restart { worker_id } => {
             let registry = load_worker_registry()?;
             let worker = registry.restart(&worker_id)?;
@@ -7046,6 +7537,11 @@ fn run_worker_command(
 fn task_registry_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     Ok(cwd.join(".Himalaya").join("tasks"))
+}
+
+fn scheduler_state_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    Ok(cwd.join(".Himalaya").join("scheduler"))
 }
 
 fn cron_registry_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -7135,6 +7631,75 @@ fn read_task_packet(path: &Path) -> Result<runtime::TaskPacket, Box<dyn std::err
     Ok(packet)
 }
 
+fn persist_task_packet_plan(
+    registry: &runtime::TaskRegistry,
+    task: &runtime::task_registry::Task,
+) -> Result<runtime::task_registry::Task, Box<dyn std::error::Error>> {
+    let capabilities = task
+        .task_packet
+        .as_ref()
+        .map(task_packet_capabilities)
+        .unwrap_or_else(|| infer_task_capabilities(&task.prompt));
+    let mut constraints = vec![
+        format!("scope:{}", task.description.as_deref().unwrap_or_default()),
+        "source:task_packet".to_string(),
+    ];
+    if let Some(packet) = task.task_packet.as_ref() {
+        constraints.push(format!("repo:{}", packet.repo));
+        constraints.push(format!("branch-policy:{}", packet.branch_policy));
+        constraints.push(format!("commit-policy:{}", packet.commit_policy));
+    }
+    let decision_task = runtime::Task::new(
+        &task.task_id,
+        task.prompt.trim().to_string(),
+        estimate_task_complexity(&task.prompt, &capabilities),
+        capabilities,
+        constraints,
+    );
+    let available_tools = mvp_tool_specs()
+        .into_iter()
+        .map(|spec| {
+            runtime::tool_from_profile(spec.name, Some(spec.description), Some(&spec.input_schema))
+        })
+        .collect::<Vec<_>>();
+    let reasoning_context = runtime::ReasoningContext {
+        workspace_root: env::current_dir().ok(),
+        active_constraints: decision_task.constraints.clone(),
+        max_parallelism: 4,
+        ..runtime::ReasoningContext::default()
+    };
+    let engine = runtime::DecisioningEngine::new(
+        runtime::ToolSelector::new(available_tools, reasoning_context),
+        runtime::TaskPlanner::new(4),
+        runtime::SafetyPolicy::default(),
+    );
+    let snapshot = engine.analyze(&decision_task);
+    let dag = runtime::build_plan_dag(&decision_task, &snapshot.plan, &snapshot.selected_tools);
+    Ok(registry.record_plan(
+        &task.task_id,
+        dag.clone(),
+        runtime::PlanExecution::new(&dag),
+    )?)
+}
+
+fn task_packet_capabilities(packet: &runtime::TaskPacket) -> Vec<String> {
+    let mut text = format!(
+        "{} {} {} {}",
+        packet.objective, packet.scope, packet.reporting_contract, packet.commit_policy
+    );
+    if !packet.acceptance_tests.is_empty() {
+        text.push_str(" test verify");
+        text.push_str(&packet.acceptance_tests.join(" "));
+    }
+    let mut capabilities = infer_task_capabilities(&text);
+    for capability in ["read", "edit", "test", "agent"] {
+        if !capabilities.iter().any(|item| item == capability) {
+            capabilities.push(capability.to_string());
+        }
+    }
+    capabilities
+}
+
 fn task_packet_verification_handoff(task: &runtime::task_registry::Task) -> Value {
     let policy = runtime::infer_verification_policy(task.task_packet.as_ref());
     let request = task
@@ -7182,6 +7747,7 @@ fn run_task_packet_command(
             let packet = read_task_packet(&path)?;
             let registry = load_task_registry()?;
             let task = registry.create_from_packet(packet)?;
+            let task = persist_task_packet_plan(&registry, &task)?;
             save_task_registry(&registry)?;
             print_task_output(
                 task_packet_status_value(&registry, task, "task_packet_create"),
@@ -7192,6 +7758,7 @@ fn run_task_packet_command(
             let packet = read_task_packet(&path)?;
             let registry = load_task_registry()?;
             let task = registry.create_from_packet(packet)?;
+            let task = persist_task_packet_plan(&registry, &task)?;
             registry.set_status(&task.task_id, runtime::TaskStatus::Running)?;
             let task = registry
                 .get(&task.task_id)
@@ -7224,12 +7791,18 @@ fn run_task_scheduler_command(
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let registry = load_task_registry()?;
+    let worker_registry = load_worker_registry()?;
     let runner = runtime::VerificationRunner::new(Some(env::current_dir()?));
-    let scheduler = runtime::DurableTaskScheduler::new(registry.clone(), runner);
+    let scheduler = runtime::DurableTaskScheduler::with_workers(
+        registry.clone(),
+        runner,
+        worker_registry.clone(),
+    );
     match command {
         TaskSchedulerCliCommand::Tick => {
             let tick = scheduler.tick()?;
             save_task_registry(&registry)?;
+            save_worker_registry(&worker_registry)?;
             match output_format {
                 CliOutputFormat::Text => println!("{}", tick.message),
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
@@ -7255,6 +7828,70 @@ fn run_task_scheduler_command(
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_task_output(
                         json!({"type":"task_scheduler_queue","queue":queue}),
+                        output_format,
+                    )?;
+                }
+            }
+        }
+        TaskSchedulerCliCommand::Run { max_ticks } => {
+            let daemon = runtime::SchedulerDaemon::new(scheduler, scheduler_state_dir()?);
+            let mut runs = Vec::new();
+            for _ in 0..max_ticks {
+                let run = daemon.run_once()?;
+                let idle = run.tick.status == runtime::DurableSchedulerStatus::Idle;
+                runs.push(run);
+                save_task_registry(&registry)?;
+                save_worker_registry(&worker_registry)?;
+                if idle {
+                    break;
+                }
+            }
+            let state = runs.last().map(|run| run.state.clone());
+            match output_format {
+                CliOutputFormat::Text => {
+                    if let Some(state) = &state {
+                        println!(
+                            "scheduler {:?}: {} ({} tick(s))",
+                            state.status, state.message, state.tick_count
+                        );
+                    } else {
+                        println!("scheduler did not run");
+                    }
+                }
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(
+                        json!({
+                            "type":"task_scheduler_daemon_run",
+                            "runs":runs,
+                            "state":state,
+                        }),
+                        output_format,
+                    )?;
+                }
+            }
+        }
+        TaskSchedulerCliCommand::Status => {
+            let daemon = runtime::SchedulerDaemon::new(scheduler, scheduler_state_dir()?);
+            let state = daemon.load_state().ok();
+            match output_format {
+                CliOutputFormat::Text => {
+                    if let Some(state) = &state {
+                        println!(
+                            "scheduler {:?}: {} ({} tick(s))",
+                            state.status, state.message, state.tick_count
+                        );
+                    } else {
+                        println!("scheduler has not run");
+                    }
+                }
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(
+                        json!({
+                            "type":"task_scheduler_daemon_status",
+                            "state":state,
+                            "state_path":daemon.state_path(),
+                            "events_path":daemon.events_path(),
+                        }),
                         output_format,
                     )?;
                 }
@@ -8089,12 +8726,7 @@ fn init_json_value(message: &str) -> serde_json::Value {
 }
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
-    match mode.trim() {
-        "read-only" => Some("read-only"),
-        "workspace-write" => Some("workspace-write"),
-        "danger-full-access" => Some("danger-full-access"),
-        _ => None,
-    }
+    PermissionMode::parse_public(mode).map(PermissionMode::as_str)
 }
 
 fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
@@ -9324,7 +9956,7 @@ fn build_runtime_with_plugin_state(
         runtime = runtime.with_runtime_event_reporter(CliRuntimeEventReporter);
     }
     runtime = runtime.with_model_router(runtime::ModelRouter::new(
-        runtime::MoERoutingPolicy::balanced(model),
+        feature_config.model_routing().to_policy(&model),
     ));
     if let Ok(store) = load_route_feedback_store() {
         runtime = runtime.with_workspace_route_feedback(store.feedback().to_vec());
@@ -9643,6 +10275,33 @@ fn load_runtime_oauth_config_for(cwd: &Path) -> Result<Option<OAuthConfig>, api:
     Ok(config.oauth().cloned())
 }
 
+impl AnthropicRuntimeClient {
+    fn client_for_routed_model(
+        &self,
+        routed_model: &str,
+    ) -> Result<ApiProviderClient, RuntimeError> {
+        let resolved_current = api::resolve_model_alias(&self.model);
+        let resolved_routed = api::resolve_model_alias(routed_model);
+        if resolved_current == resolved_routed {
+            return Ok(self.client.clone());
+        }
+        match detect_provider_kind(&resolved_routed) {
+            ProviderKind::Anthropic => {
+                let auth = resolve_cli_auth_source()
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                let inner = AnthropicClient::from_auth(auth)
+                    .with_base_url(api::read_base_url())
+                    .with_prompt_cache(PromptCache::new(&self.session_id));
+                Ok(ApiProviderClient::Anthropic(inner))
+            }
+            ProviderKind::Xai | ProviderKind::OpenAi => {
+                ApiProviderClient::from_model_with_anthropic_auth(&resolved_routed, None)
+                    .map_err(|error| RuntimeError::new(error.to_string()))
+            }
+        }
+    }
+}
+
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -9655,6 +10314,7 @@ impl ApiClient for AnthropicRuntimeClient {
             .as_ref()
             .map(|route| route.model.as_str())
             .unwrap_or(&self.model);
+        let routed_client = self.client_for_routed_model(routed_model)?;
         let message_request = MessageRequest {
             model: routed_model.to_string(),
             max_tokens: max_tokens_for_model(routed_model),
@@ -9678,7 +10338,11 @@ impl ApiClient for AnthropicRuntimeClient {
 
             for attempt in 1..=max_attempts {
                 let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
+                    .consume_stream(
+                        &routed_client,
+                        &message_request,
+                        is_post_tool && attempt == 1,
+                    )
                     .await;
                 match result {
                     Ok(events) => return Ok(events),
@@ -9705,11 +10369,11 @@ impl AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     async fn consume_stream(
         &self,
+        client: &ApiProviderClient,
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream = self
-            .client
+        let mut stream = client
             .stream_message(message_request)
             .await
             .map_err(|error| {
@@ -10125,7 +10789,6 @@ const STUB_COMMANDS: &[&str] = &[
     "security-review",
     "keybindings",
     "privacy-settings",
-    "review",
     "theme",
     "voice",
     "usage",
@@ -10147,12 +10810,10 @@ const STUB_COMMANDS: &[&str] = &[
     // NOTE: do NOT add "stats", "tokens", "cache" — they are implemented.
     "allowed-tools",
     "bookmarks",
-    "workspace",
     "reasoning",
     "budget",
     "rate-limit",
     "changelog",
-    "diagnostics",
     "metrics",
     "tool-details",
     "focus",
@@ -10181,9 +10842,6 @@ const STUB_COMMANDS: &[&str] = &[
     "listen",
     "speak",
     "format",
-    "test",
-    "lint",
-    "build",
     "run",
     "git",
     "stash",
@@ -11289,7 +11947,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Himalaya workers [list|create|observe|ready|resolve-trust|prompt|restart|terminate|supervise]"
+        "  Himalaya workers [list|create|observe|ready|resolve-trust|prompt|complete|restart|terminate|supervise]"
     )?;
     writeln!(
         out,

@@ -98,6 +98,7 @@ enum Scenario {
     BashPermissionPromptApproved,
     BashPermissionPromptDenied,
     PluginToolRoundtrip,
+    McpToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
     RepoReplayEval,
@@ -118,6 +119,7 @@ impl Scenario {
             "bash_permission_prompt_approved" => Some(Self::BashPermissionPromptApproved),
             "bash_permission_prompt_denied" => Some(Self::BashPermissionPromptDenied),
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
+            "mcp_tool_roundtrip" => Some(Self::McpToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
             "repo_replay_eval" => Some(Self::RepoReplayEval),
@@ -139,6 +141,7 @@ impl Scenario {
             Self::BashPermissionPromptApproved => "bash_permission_prompt_approved",
             Self::BashPermissionPromptDenied => "bash_permission_prompt_denied",
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
+            Self::McpToolRoundtrip => "mcp_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
             Self::RepoReplayEval => "repo_replay_eval",
@@ -467,6 +470,17 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 &[r#"{"message":"hello from plugin parity"}"#],
             ),
         },
+        Scenario::McpToolRoundtrip => match latest_tool_result(request) {
+            Some((tool_output, _)) => final_text_sse(&format!(
+                "mcp tool completed: {}",
+                extract_mcp_echo(&tool_output)
+            )),
+            None => tool_use_sse(
+                "toolu_mcp_echo",
+                "mcp__alpha__echo",
+                &[r#"{"text":"hello from mcp lifecycle"}"#],
+            ),
+        },
         Scenario::AutoCompactTriggered => {
             final_text_sse_with_usage("auto compact parity complete.", 50_000, 200)
         }
@@ -665,6 +679,18 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 json!({"message": "hello from plugin parity"}),
             ),
         },
+        Scenario::McpToolRoundtrip => match latest_tool_result(request) {
+            Some((tool_output, _)) => text_message_response(
+                "msg_mcp_tool_final",
+                &format!("mcp tool completed: {}", extract_mcp_echo(&tool_output)),
+            ),
+            None => tool_message_response(
+                "msg_mcp_tool_start",
+                "toolu_mcp_echo",
+                "mcp__alpha__echo",
+                json!({"text": "hello from mcp lifecycle"}),
+            ),
+        },
         Scenario::AutoCompactTriggered => text_message_response_with_usage(
             "msg_auto_compact_triggered",
             "auto compact parity complete.",
@@ -773,6 +799,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::BashPermissionPromptApproved => "req_bash_permission_prompt_approved",
         Scenario::BashPermissionPromptDenied => "req_bash_permission_prompt_denied",
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
+        Scenario::McpToolRoundtrip => "req_mcp_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
         Scenario::RepoReplayEval => "req_repo_replay_eval",
@@ -1408,6 +1435,19 @@ fn extract_plugin_message(tool_output: &str) -> String {
             value
                 .get("input")
                 .and_then(|input| input.get("message"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| tool_output.trim().to_string())
+}
+
+fn extract_mcp_echo(tool_output: &str) -> String {
+    serde_json::from_str::<Value>(tool_output)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("structuredContent")
+                .and_then(|content| content.get("echoed"))
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         })

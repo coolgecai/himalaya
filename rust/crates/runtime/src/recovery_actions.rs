@@ -272,17 +272,11 @@ fn action_from_step(
 fn action_allowed(risk: RecoveryActionRisk, permission_mode: PermissionMode) -> bool {
     match risk {
         RecoveryActionRisk::Safe => true,
-        RecoveryActionRisk::NeedsWorkspaceWrite => matches!(
-            permission_mode,
-            PermissionMode::WorkspaceWrite
-                | PermissionMode::DangerFullAccess
-                | PermissionMode::Allow
-        ),
+        RecoveryActionRisk::NeedsWorkspaceWrite => {
+            permission_mode.satisfies(PermissionMode::WorkspaceWrite)
+        }
         RecoveryActionRisk::NeedsDangerFullAccess => {
-            matches!(
-                permission_mode,
-                PermissionMode::DangerFullAccess | PermissionMode::Allow
-            )
+            permission_mode.satisfies(PermissionMode::DangerFullAccess)
         }
         RecoveryActionRisk::NeedsHuman => false,
     }

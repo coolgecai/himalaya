@@ -81,9 +81,10 @@ pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, DecisioningConfig,
     DecisioningSafetyPolicyConfig, Himalaya_SETTINGS_SCHEMA_NAME, McpConfigCollection,
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
-    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
-    ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
-    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
+    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig,
+    ModelRoutingConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig,
+    RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
+    ScopedMcpServerConfig,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -106,8 +107,9 @@ pub use decisioning::{
 };
 pub use execution_scheduler::{
     durable_status_for_task, DurableSchedulerStatus, DurableSchedulerTaskSnapshot,
-    DurableSchedulerTick, DurableTaskScheduler, ExecutionScheduler, SchedulerNodeOutcome,
-    SchedulerNodeSelection,
+    DurableSchedulerTick, DurableTaskScheduler, ExecutionScheduler, SchedulerDaemon,
+    SchedulerDaemonEvent, SchedulerDaemonRun, SchedulerDaemonState, SchedulerDaemonStatus,
+    SchedulerNodeOutcome, SchedulerNodeSelection,
 };
 pub use failure_classifier::{FailureClassification, FailureClassifier};
 pub use file_ops::{
@@ -157,8 +159,9 @@ pub use oauth::{
     PkceChallengeMethod, PkceCodePair,
 };
 pub use permissions::{
-    PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
-    PermissionPromptDecision, PermissionPrompter, PermissionRequest,
+    PermissionContext, PermissionMode, PermissionModeParseError, PermissionOutcome,
+    PermissionOverride, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
+    PermissionRequest,
 };
 pub use plan_executor::{
     dependency_map, reverse_dependency_map, NodeVerificationGate, PlanExecution,
@@ -238,8 +241,12 @@ pub use verifier::{
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
     WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
+    DEFAULT_WORKER_LEASE_SECS, DEFAULT_WORKER_MAX_RESTARTS,
 };
-pub use worker_supervisor::{WorkerSupervisor, WorkerSupervisorStatus, WorkerSupervisorTick};
+pub use worker_supervisor::{
+    WorkerEventIndexEntry, WorkerSupervisor, WorkerSupervisorCapacity, WorkerSupervisorStatus,
+    WorkerSupervisorTick,
+};
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

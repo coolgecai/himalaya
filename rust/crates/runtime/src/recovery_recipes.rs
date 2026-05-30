@@ -48,7 +48,7 @@ impl FailureScenario {
             WorkerFailureKind::TrustGate => Self::TrustPromptUnresolved,
             WorkerFailureKind::PromptDelivery => Self::PromptMisdelivery,
             WorkerFailureKind::Protocol => Self::McpHandshakeFailure,
-            WorkerFailureKind::Provider => Self::ProviderFailure,
+            WorkerFailureKind::Provider | WorkerFailureKind::LeaseExpired => Self::ProviderFailure,
         }
     }
 }

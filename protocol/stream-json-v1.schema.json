@@ -1,0 +1,1343 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://himalaya.local/protocol/stream-json-v1.schema.json",
+  "title": "Himalaya stream-json event v1",
+  "description": "Schema for one NDJSON line emitted by the Himalaya CLI when --output-format stream-json is enabled.",
+  "type": "object",
+  "required": [
+    "type"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "type": {
+      "$ref": "#/$defs/eventType"
+    },
+    "protocol_version": {
+      "description": "Current stream protocol version emitted by Rust CLI.",
+      "const": 1
+    },
+    "schema_version": {
+      "description": "Legacy VS Code fallback; prefer protocol_version.",
+      "type": "number"
+    }
+  },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/messageStartEvent"
+        },
+        {
+          "$ref": "#/$defs/messageStopEvent"
+        },
+        {
+          "$ref": "#/$defs/textDeltaEvent"
+        },
+        {
+          "$ref": "#/$defs/toolUseEvent"
+        },
+        {
+          "$ref": "#/$defs/toolResultEvent"
+        },
+        {
+          "$ref": "#/$defs/doneEvent"
+        },
+        {
+          "$ref": "#/$defs/sessionMetaEvent"
+        },
+        {
+          "$ref": "#/$defs/commandMatchEvent"
+        },
+        {
+          "$ref": "#/$defs/toolMatchEvent"
+        },
+        {
+          "$ref": "#/$defs/permissionRequestEvent"
+        },
+        {
+          "$ref": "#/$defs/permissionDenialEvent"
+        },
+        {
+          "$ref": "#/$defs/reasoningStepEvent"
+        },
+        {
+          "$ref": "#/$defs/decisioningEvent"
+        },
+        {
+          "$ref": "#/$defs/planExecutionEvent"
+        },
+        {
+          "$ref": "#/$defs/taskLedgerEvent"
+        },
+        {
+          "$ref": "#/$defs/modelRouteEvent"
+        },
+        {
+          "$ref": "#/$defs/teamExecutionEvent"
+        },
+        {
+          "$ref": "#/$defs/recoveryEvent"
+        },
+        {
+          "$ref": "#/$defs/recoveryActionEvent"
+        },
+        {
+          "$ref": "#/$defs/taskExecutionEvent"
+        },
+        {
+          "$ref": "#/$defs/localCommandEvent"
+        },
+        {
+          "$ref": "#/$defs/recoverySuggestionEvent"
+        },
+        {
+          "$ref": "#/$defs/taskListEvent"
+        },
+        {
+          "$ref": "#/$defs/taskShowEvent"
+        },
+        {
+          "$ref": "#/$defs/taskExecutionCommandEvent"
+        },
+        {
+          "$ref": "#/$defs/taskRecoveryEvent"
+        },
+        {
+          "$ref": "#/$defs/taskVerificationEvent"
+        },
+        {
+          "$ref": "#/$defs/taskNodeRetryEvent"
+        },
+        {
+          "$ref": "#/$defs/taskNodeVerificationEvent"
+        },
+        {
+          "$ref": "#/$defs/taskCompactedEvent"
+        },
+        {
+          "$ref": "#/$defs/taskCancelledEvent"
+        },
+        {
+          "$ref": "#/$defs/taskPacketCreateEvent"
+        },
+        {
+          "$ref": "#/$defs/taskPacketRunEvent"
+        },
+        {
+          "$ref": "#/$defs/taskPacketStatusEvent"
+        },
+        {
+          "$ref": "#/$defs/taskSchedulerTickEvent"
+        },
+        {
+          "$ref": "#/$defs/taskSchedulerQueueEvent"
+        },
+        {
+          "$ref": "#/$defs/taskSchedulerDaemonRunEvent"
+        },
+        {
+          "$ref": "#/$defs/taskSchedulerDaemonStatusEvent"
+        },
+        {
+          "$ref": "#/$defs/benchmarkSuiteEvent"
+        },
+        {
+          "$ref": "#/$defs/benchmarkTaskEvent"
+        },
+        {
+          "$ref": "#/$defs/benchmarkRunEvent"
+        },
+        {
+          "$ref": "#/$defs/workerListEvent"
+        },
+        {
+          "$ref": "#/$defs/workerObjectEvent"
+        },
+        {
+          "$ref": "#/$defs/workerReadyEvent"
+        },
+        {
+          "$ref": "#/$defs/workerSupervisorTickEvent"
+        },
+        {
+          "$ref": "#/$defs/errorEvent"
+        }
+      ]
+    }
+  ],
+  "$defs": {
+    "eventType": {
+      "type": "string",
+      "enum": [
+        "text_delta",
+        "tool_use",
+        "tool_result",
+        "done",
+        "session_meta",
+        "message_start",
+        "message_stop",
+        "command_match",
+        "tool_match",
+        "permission_denial",
+        "permission_request",
+        "reasoning_step",
+        "decisioning_event",
+        "plan_execution_event",
+        "task_ledger_event",
+        "model_route_event",
+        "team_execution_event",
+        "recovery_event",
+        "recovery_action_event",
+        "task_execution_event",
+        "local_command",
+        "recovery_suggestion",
+        "task_list",
+        "task_show",
+        "task_execution",
+        "task_recovery",
+        "task_verification",
+        "task_node_retry",
+        "task_node_verification",
+        "task_compacted",
+        "task_cancelled",
+        "task_packet_create",
+        "task_packet_run",
+        "task_packet_status",
+        "task_scheduler_tick",
+        "task_scheduler_queue",
+        "task_scheduler_daemon_run",
+        "task_scheduler_daemon_status",
+        "benchmark_suite",
+        "benchmark_task",
+        "benchmark_run",
+        "worker_list",
+        "worker_create",
+        "worker_observe",
+        "worker_ready",
+        "worker_resolve_trust",
+        "worker_prompt",
+        "worker_complete",
+        "worker_restart",
+        "worker_terminate",
+        "worker_supervisor_tick",
+        "error"
+      ]
+    },
+    "baseEvent": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "protocol_version": {
+          "const": 1
+        },
+        "schema_version": {
+          "type": "number"
+        }
+      }
+    },
+    "messageStartEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "message_start"
+            }
+          }
+        }
+      ]
+    },
+    "messageStopEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "message_stop"
+            }
+          }
+        }
+      ]
+    },
+    "textDeltaEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "text"
+          ],
+          "properties": {
+            "type": {
+              "const": "text_delta"
+            },
+            "text": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "toolUseEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "id",
+            "name",
+            "input"
+          ],
+          "properties": {
+            "type": {
+              "const": "tool_use"
+            },
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "toolResultEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "name",
+            "output",
+            "is_error"
+          ],
+          "properties": {
+            "type": {
+              "const": "tool_result"
+            },
+            "name": {
+              "type": "string"
+            },
+            "output": {
+              "type": "string"
+            },
+            "is_error": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "doneEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "iterations"
+          ],
+          "properties": {
+            "type": {
+              "const": "done"
+            },
+            "iterations": {
+              "type": "number"
+            }
+          }
+        }
+      ]
+    },
+    "sessionMetaEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "session_id",
+            "session_path",
+            "model"
+          ],
+          "properties": {
+            "type": {
+              "const": "session_meta"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "session_path": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "commandMatchEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "command"
+          ],
+          "properties": {
+            "type": {
+              "const": "command_match"
+            },
+            "command": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "toolMatchEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "tool"
+          ],
+          "properties": {
+            "type": {
+              "const": "tool_match"
+            },
+            "tool": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "permissionRequestEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "tool",
+            "input",
+            "current_mode",
+            "required_mode",
+            "reason"
+          ],
+          "properties": {
+            "type": {
+              "const": "permission_request"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "current_mode": {
+              "type": "string"
+            },
+            "required_mode": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "permissionDenialEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "tool",
+            "reason"
+          ],
+          "properties": {
+            "type": {
+              "const": "permission_denial"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "reasoningStepEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "reasoning_step"
+          ],
+          "properties": {
+            "type": {
+              "const": "reasoning_step"
+            },
+            "reasoning_step": {
+              "type": "object",
+              "required": [
+                "step_type"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      ]
+    },
+    "decisioningEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "decisioning_event"
+          ],
+          "properties": {
+            "type": {
+              "const": "decisioning_event"
+            },
+            "decisioning_event": {
+              "type": "object",
+              "required": [
+                "kind",
+                "title",
+                "summary"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      ]
+    },
+    "planExecutionEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "plan_execution_event"
+          ],
+          "properties": {
+            "type": {
+              "const": "plan_execution_event"
+            },
+            "plan_execution_event": {
+              "type": "object",
+              "required": [
+                "seq",
+                "task_id",
+                "node_id",
+                "kind",
+                "status"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      ]
+    },
+    "taskLedgerEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task_ledger_event"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_ledger_event"
+            },
+            "task_ledger_event": {
+              "type": "object",
+              "required": [
+                "seq",
+                "task_id",
+                "event",
+                "status"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      ]
+    },
+    "modelRouteEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "model_route_event"
+          ],
+          "properties": {
+            "type": {
+              "const": "model_route_event"
+            },
+            "model_route_event": {
+              "type": "object",
+              "required": [
+                "phase",
+                "model",
+                "reason"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      ]
+    },
+    "teamExecutionEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "team_execution_event"
+          ],
+          "properties": {
+            "type": {
+              "const": "team_execution_event"
+            },
+            "team_execution_event": {
+              "type": "object",
+              "required": [
+                "seq",
+                "team_id",
+                "task_id",
+                "role",
+                "kind"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      ]
+    },
+    "recoveryEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "recovery_event"
+          ],
+          "properties": {
+            "type": {
+              "const": "recovery_event"
+            }
+          }
+        }
+      ]
+    },
+    "recoveryActionEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "recovery_action_event"
+          ],
+          "properties": {
+            "type": {
+              "const": "recovery_action_event"
+            },
+            "recovery_action_event": {
+              "type": "object",
+              "required": [
+                "task_id",
+                "results"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      ]
+    },
+    "taskExecutionEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task_execution_event"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_execution_event"
+            },
+            "task_execution_event": {
+              "type": "object",
+              "required": [
+                "task_id",
+                "steps",
+                "completed",
+                "blocked",
+                "message"
+              ],
+              "additionalProperties": true
+            }
+          }
+        }
+      ]
+    },
+    "recoverySuggestionEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "source_event",
+            "failure_class",
+            "tool",
+            "reason",
+            "action",
+            "suggestion"
+          ],
+          "properties": {
+            "type": {
+              "const": "recovery_suggestion"
+            },
+            "source_event": {
+              "type": "string"
+            },
+            "failure_class": {
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "action": {
+              "type": "string"
+            },
+            "suggestion": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "taskListEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "tasks"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_list"
+            },
+            "tasks": {
+              "type": "array"
+            }
+          }
+        }
+      ]
+    },
+    "taskShowEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task",
+            "ledger"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_show"
+            },
+            "task": {
+              "type": "object"
+            },
+            "ledger": {
+              "type": "array"
+            }
+          }
+        }
+      ]
+    },
+    "taskExecutionCommandEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "outcome"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_execution"
+            },
+            "outcome": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "taskRecoveryEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "execution"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_recovery"
+            },
+            "execution": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "taskVerificationEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "result"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_verification"
+            },
+            "result": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "taskNodeRetryEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task",
+            "node_id"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_node_retry"
+            },
+            "task": {
+              "type": "object"
+            },
+            "node_id": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "taskNodeVerificationEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task",
+            "node_id",
+            "command"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_node_verification"
+            },
+            "task": {
+              "type": "object"
+            },
+            "node_id": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "taskCompactedEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task",
+            "keep_last"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_compacted"
+            },
+            "task": {
+              "type": "object"
+            },
+            "keep_last": {
+              "type": "number"
+            }
+          }
+        }
+      ]
+    },
+    "taskCancelledEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_cancelled"
+            },
+            "task": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "taskPacketCreateEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task",
+            "ledger",
+            "verification_handoff"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_packet_create"
+            },
+            "task": {
+              "type": "object"
+            },
+            "ledger": {
+              "type": "array"
+            },
+            "verification_handoff": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "taskPacketRunEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task",
+            "ledger",
+            "verification_handoff"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_packet_run"
+            },
+            "task": {
+              "type": "object"
+            },
+            "ledger": {
+              "type": "array"
+            },
+            "verification_handoff": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "taskPacketStatusEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task",
+            "ledger",
+            "verification_handoff"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_packet_status"
+            },
+            "task": {
+              "type": "object"
+            },
+            "ledger": {
+              "type": "array"
+            },
+            "verification_handoff": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "taskSchedulerTickEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "tick"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_scheduler_tick"
+            },
+            "tick": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "taskSchedulerQueueEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "queue"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_scheduler_queue"
+            },
+            "queue": {
+              "type": "array"
+            }
+          }
+        }
+      ]
+    },
+    "benchmarkSuiteEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "suite_id",
+            "version",
+            "tasks"
+          ],
+          "properties": {
+            "type": {
+              "const": "benchmark_suite"
+            },
+            "suite_id": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "tasks": {
+              "type": "array"
+            }
+          }
+        }
+      ]
+    },
+    "benchmarkTaskEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task"
+          ],
+          "properties": {
+            "type": {
+              "const": "benchmark_task"
+            },
+            "task": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "benchmarkRunEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "run"
+          ],
+          "properties": {
+            "type": {
+              "const": "benchmark_run"
+            },
+            "run": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "workerListEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "workers"
+          ],
+          "properties": {
+            "type": {
+              "const": "worker_list"
+            },
+            "workers": {
+              "type": "array"
+            }
+          }
+        }
+      ]
+    },
+    "workerObjectEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "worker"
+          ],
+          "properties": {
+            "type": {
+              "enum": [
+                "worker_create",
+                "worker_observe",
+                "worker_resolve_trust",
+                "worker_prompt",
+                "worker_complete",
+                "worker_restart",
+                "worker_terminate"
+              ]
+            },
+            "worker": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "workerReadyEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "ready"
+          ],
+          "properties": {
+            "type": {
+              "const": "worker_ready"
+            },
+            "ready": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "workerSupervisorTickEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "tick"
+          ],
+          "properties": {
+            "type": {
+              "const": "worker_supervisor_tick"
+            },
+            "tick": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "errorEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "error"
+          ],
+          "properties": {
+            "type": {
+              "const": "error"
+            },
+            "error": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "taskSchedulerDaemonRunEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "runs",
+            "state"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_scheduler_daemon_run"
+            },
+            "runs": {
+              "type": "array"
+            },
+            "state": {
+              "type": [
+                "object",
+                "null"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "taskSchedulerDaemonStatusEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "state",
+            "state_path",
+            "events_path"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_scheduler_daemon_status"
+            },
+            "state": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "state_path": {
+              "type": "string"
+            },
+            "events_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "localCommandEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "command",
+            "status",
+            "summary"
+          ],
+          "properties": {
+            "type": {
+              "const": "local_command"
+            },
+            "command": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
