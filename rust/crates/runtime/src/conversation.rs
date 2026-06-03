@@ -3644,7 +3644,8 @@ where
                     "A previous attempt did not satisfy the acceptance criteria: {last_failure}. Fix the root cause for this step only."
                 ))
             };
-            let Some(summary) = self.run_structured_node_turn(task_id, user_input, node, extra)
+            let Some((summary, route)) =
+                self.run_structured_node_turn(task_id, user_input, node, extra)
             else {
                 last_failure = "node produced no output".to_string();
                 if attempt >= max_recovery {
@@ -3666,6 +3667,23 @@ where
                     if attempt >= max_recovery {
                         return NodeRunResult::Failed { reason };
                     }
+                    // Record per-node route failure feedback so the next
+                    // attempt's route selection can adaptively escalate this
+                    // node to a higher-quality route (difficulty-aware routing).
+                    let _ = self.task_registry.update_latest_route_feedback(
+                        task_id,
+                        crate::ModelRouteFeedback::pending(
+                            task_id.to_string(),
+                            route,
+                            current_time_millis() / 1_000,
+                        )
+                        .with_outcome(
+                            false,
+                            Some(false),
+                            true,
+                            Some(reason),
+                        ),
+                    );
                     attempt += 1;
                 }
             }
@@ -3673,14 +3691,16 @@ where
     }
 
     /// Run one focused model sub-turn for a node, optionally with extra
-    /// re-drive guidance. Returns the node's text output, or `None` if empty.
+    /// re-drive guidance. Returns the node's text output and the route used
+    /// (so the caller can record per-node route feedback for adaptive
+    /// escalation), or `None` if the output is empty.
     fn run_structured_node_turn(
         &mut self,
         task_id: &str,
         user_input: &str,
         node: &crate::structured_execution::ExecutionNode,
         extra_guidance: Option<String>,
-    ) -> Option<String> {
+    ) -> Option<(String, ModelRouteDecision)> {
         let route = self.select_model_route_for_task_with_complexity(
             task_id,
             crate::ModelRoutePhase::Coding,
@@ -3702,7 +3722,7 @@ where
         let request = ApiRequest {
             system_prompt: vec![STRUCTURED_NODE_SYSTEM_PROMPT.to_string()],
             messages: vec![ConversationMessage::user_text(prompt)],
-            model_route: Some(route),
+            model_route: Some(route.clone()),
         };
         let events = self.api_client.stream(request).ok()?;
         let mut text = String::new();
@@ -3715,7 +3735,7 @@ where
         if text.is_empty() {
             None
         } else {
-            Some(text.to_string())
+            Some((text.to_string(), route))
         }
     }
 
@@ -7189,5 +7209,102 @@ mod tests {
         assert!(marker.exists(), "re-drive should have satisfied acceptance");
 
         let _ = fs::remove_dir_all(&workspace_root);
+    }
+
+    #[test]
+    fn structured_node_routes_high_effort_to_quality_model() {
+        use std::sync::{Arc, Mutex};
+
+        // Records the model id used for each node sub-turn so we can assert the
+        // high-effort node selected the high-quality route.
+        #[derive(Clone)]
+        struct NodeRouteApi {
+            node_models: Arc<Mutex<Vec<String>>>,
+        }
+        impl ApiClient for NodeRouteApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let phase = request
+                    .model_route
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.phase))
+                    .unwrap_or_default();
+                if phase == "Planning" {
+                    // One node with high estimated_effort.
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "{\"steps\":[{\"id\":\"hard\",\"title\":\"Hard step\",\"estimated_effort\":5}]}".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                let user_text = request
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.blocks.iter())
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                if user_text.contains("Focus only on this step") {
+                    if let Some(model) = request.model_route.as_ref().map(|r| r.model.clone()) {
+                        self.node_models
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(model);
+                    }
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(false)
+                .with_structured_execution_threshold(3),
+        );
+        // Two Coding routes: a cheap/fast one and a high-quality one.
+        let policy = crate::MoERoutingPolicy::new(
+            "default",
+            vec![
+                crate::ModelRoute::new(crate::ModelRoutePhase::Coding, "cheap-fast")
+                    .with_weights(5, 5, 2),
+                crate::ModelRoute::new(crate::ModelRoutePhase::Coding, "high-quality")
+                    .with_weights(1, 1, 5),
+                crate::ModelRoute::new(crate::ModelRoutePhase::Planning, "planner"),
+            ],
+        );
+        let node_models = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            NodeRouteApi {
+                node_models: node_models.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        )
+        .with_model_router(crate::ModelRouter::new(policy));
+
+        let _ = runtime
+            .run_turn(
+                "implement, refactor, write, test and verify the hard module",
+                None,
+            )
+            .expect("turn should succeed");
+
+        let models = node_models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            models.iter().any(|m| m == "high-quality"),
+            "high-effort node should route to the high-quality model, got: {models:?}"
+        );
     }
 }
