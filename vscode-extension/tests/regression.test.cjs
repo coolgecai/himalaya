@@ -411,6 +411,10 @@ test('task board surfaces worker supervisor state', () => {
   assert.match(chatPanelSource, /function renderTaskBoardWorkerSupervisor\(\)/);
   assert.match(chatPanelSource, /function renderTaskBoardWorkerDetail\(worker\)/);
   assert.match(chatPanelSource, /task-board-worker-detail-grid/);
+  assert.match(chatPanelSource, /renderTaskBoardOperations/);
+  assert.match(chatPanelSource, /Scheduler daemon/);
+  assert.match(chatPanelSource, /Route feedback/);
+  assert.match(chatPanelSource, /Benchmark/);
   assert.match(chatPanelSource, /data-worker-id/);
   assert.match(chatPanelSource, /worker\.process/);
   assert.match(chatPanelSource, /worker\.isolation/);
@@ -463,6 +467,10 @@ test('stream protocol helpers behave as expected', async () => {
   } = require(streamProtocolPath);
 
   assert.equal(streamJsonSchema.properties.protocol_version.const, STREAM_PROTOCOL_VERSION);
+  assert.equal(streamJsonSchema.required.includes('type'), true);
+  assert.equal(streamJsonSchema.required.includes('protocol_version'), true);
+  assert.equal(streamJsonSchema.$defs.baseEvent.required.includes('type'), true);
+  assert.equal(streamJsonSchema.$defs.baseEvent.required.includes('protocol_version'), true);
   assert.deepEqual(streamJsonSchema.$defs.eventType.enum, KNOWN_STREAM_EVENT_TYPES);
   const schemaBranchTypes = new Set();
   for (const branch of streamJsonSchema.allOf[0].oneOf) {

@@ -57,7 +57,8 @@ export type KnownStreamEventType =
   | 'worker_restart'
   | 'worker_terminate'
   | 'worker_supervisor_tick'
-  | 'error';
+  | 'error'
+  | 'context_event';
 
 
 export type StreamEvent = {
@@ -431,6 +432,7 @@ export const KNOWN_STREAM_EVENT_TYPES: readonly KnownStreamEventType[] = [
   'worker_terminate',
   'worker_supervisor_tick',
   'error',
+  'context_event',
 ];
 
 const KNOWN_EVENT_TYPES: ReadonlySet<KnownStreamEventType> = new Set(KNOWN_STREAM_EVENT_TYPES);
@@ -630,6 +632,8 @@ function validateStreamEventShape(event: Record<string, unknown>): boolean {
       return hasObject(event, 'tick');
     case 'error':
       return hasString(event, 'error');
+    case 'context_event':
+      return hasString(event, 'kind');
     default:
       return true;
   }

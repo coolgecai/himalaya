@@ -698,6 +698,7 @@ export class HimalayaChatPanel {
     const seenUnknownEventTypes = new Set<string>();
     let malformedEventCount = 0;
     let protocolMismatchWarned = false;
+    let protocolMissingWarned = false;
     const offeredPermissionRetries = new Set<string>();
     const offerPermissionRetryOnce = (toolName: string, reason: string, source: string) => {
       const key = `${toolName}:${reason}`;
@@ -728,6 +729,11 @@ export class HimalayaChatPanel {
         const actual = readProtocolVersion(event);
         this.output.appendLine(`[protocol] stream protocol mismatch expected=${STREAM_PROTOCOL_VERSION} actual=${String(actual)}`);
         this.host.webview.postMessage({ type: 'stderrChunk', text: `Protocol mismatch detected. Expected v${STREAM_PROTOCOL_VERSION}, got v${String(actual)}\n` });
+      }
+      if (!protocolMissingWarned && versionStatus === 'missing') {
+        protocolMissingWarned = true;
+        this.output.appendLine(`[protocol] stream event is missing protocol_version (expected v${STREAM_PROTOCOL_VERSION})`);
+        this.host.webview.postMessage({ type: 'stderrChunk', text: `Warning: stream event is missing protocol_version (expected v${STREAM_PROTOCOL_VERSION})\n` });
       }
 
       switch (event.type) {
@@ -2014,6 +2020,22 @@ export class HimalayaChatPanel {
     }
     .send-btn:hover { opacity: .85; }
     .send-btn:disabled { opacity: .4; cursor: not-allowed; }
+    .stop-btn {
+      flex-shrink: 0;
+      background: rgba(248,81,73,0.18);
+      border: 1px solid rgba(248,81,73,0.5);
+      border-radius: var(--radius);
+      color: #ff7b72;
+      cursor: pointer;
+      padding: 6px 10px;
+      font-size: 14px;
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: opacity .15s;
+    }
+    .stop-btn:hover { background: rgba(248,81,73,0.3); }
     .composer-hint {
       font-size: 10px;
       color: var(--text-dim);
@@ -2153,7 +2175,8 @@ export class HimalayaChatPanel {
     }
     .task-board-list,
     .task-board-recovery-list,
-    .task-board-worker-list {
+    .task-board-worker-list,
+    .task-board-metric-list {
       display: flex;
       flex-direction: column;
       gap: 6px;
@@ -2169,7 +2192,8 @@ export class HimalayaChatPanel {
     .task-board-recovery-item,
     .task-board-worker,
     .task-board-worker-detail,
-    .task-board-supervisor {
+    .task-board-supervisor,
+    .task-board-metric-card {
       border: 1px solid rgba(255,255,255,0.07);
       border-radius: 8px;
       background: rgba(255,255,255,0.03);
@@ -2303,6 +2327,7 @@ export class HimalayaChatPanel {
         spellcheck="false"
       ></textarea>
       <button class="send-btn" id="sendBtn">Send</button>
+      <button class="stop-btn" id="stopBtn" style="display:none" title="Stop generation">⏹</button>
     </div>
     <div class="composer-hint">
       <kbd>Enter</kbd> send &nbsp;·&nbsp; <kbd>Shift+Enter</kbd> newline &nbsp;·&nbsp; 📎 attach files
@@ -2378,6 +2403,7 @@ export class HimalayaChatPanel {
     const emptyState   = document.getElementById('emptyState');
     const promptInput  = document.getElementById('promptInput');
     const sendBtn      = document.getElementById('sendBtn');
+    const stopBtn      = document.getElementById('stopBtn');
     const attachBtn    = document.getElementById('attachBtn');
     const attachChips  = document.getElementById('attachChips');
     const modelLabel   = document.getElementById('modelLabel');
@@ -2439,11 +2465,15 @@ export class HimalayaChatPanel {
         if (!sendBtn) { return; }
         const blocked = !state.isTrusted;
         sendBtn.disabled = state.streaming || blocked;
+        sendBtn.style.display = state.streaming ? 'none' : '';
         sendBtn.title = blocked
           ? 'Trust the workspace or enable himalayaCode.allowUntrustedRuns to run prompts'
           : state.streaming
             ? 'A request is already running'
             : 'Send prompt';
+        if (stopBtn) {
+          stopBtn.style.display = state.streaming ? '' : 'none';
+        }
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'updateSendButtonState failed: ' + String(e) }); } catch (_) {}
       }
@@ -3216,7 +3246,10 @@ export class HimalayaChatPanel {
         workers: {},
         workerOrder: [],
         selectedWorkerId: null,
-        workerSupervisor: null
+        workerSupervisor: null,
+        daemon: null,
+        routeSummary: null,
+        benchmark: null
       };
     }
 
@@ -3269,6 +3302,33 @@ export class HimalayaChatPanel {
       }
     }
 
+    function rememberTaskBoardDaemon(kind, event) {
+      if (!event || typeof event !== 'object') { return; }
+      const daemon = Object.assign({}, state.taskBoard.daemon || {}, { kind: kind });
+      if (Array.isArray(event.runs)) { daemon.runs = event.runs; }
+      if ('state' in event) { daemon.state = event.state; }
+      if (event.state_path) { daemon.state_path = event.state_path; }
+      if (event.events_path) { daemon.events_path = event.events_path; }
+      if (Array.isArray(event.events)) { daemon.events = event.events; }
+      state.taskBoard.daemon = daemon;
+      const latestRun = Array.isArray(event.runs) && event.runs.length ? event.runs[event.runs.length - 1] : null;
+      const tick = latestRun && latestRun.tick && typeof latestRun.tick === 'object' ? latestRun.tick : null;
+      if (tick && tick.task && typeof tick.task === 'object') { rememberTaskBoardTask(tick.task); }
+    }
+
+    function rememberTaskBoardRouteSummary(event) {
+      if (!event || typeof event !== 'object') { return; }
+      state.taskBoard.routeSummary = event;
+    }
+
+    function rememberTaskBoardBenchmark(kind, event) {
+      if (!event || typeof event !== 'object') { return; }
+      const benchmark = Object.assign({}, state.taskBoard.benchmark || {});
+      if (kind === 'benchmark_suite') { benchmark.suite = event; }
+      if (kind === 'benchmark_task') { benchmark.task = event.task || event; }
+      if (kind === 'benchmark_run') { benchmark.run = event.run || event; }
+      state.taskBoard.benchmark = benchmark;
+    }
 
     function rememberTaskBoardRecovery(kind, event) {
       const summary = kind === 'recoverySuggestion'
@@ -3369,6 +3429,12 @@ export class HimalayaChatPanel {
         } else if (kind === 'worker_supervisor_tick') {
           const tick = value.tick && typeof value.tick === 'object' ? value.tick : value;
           rememberTaskBoardWorkerSupervisor(tick);
+        } else if (kind === 'task_scheduler_daemon_run' || kind === 'task_scheduler_daemon_status' || kind === 'task_scheduler_daemon_logs') {
+          rememberTaskBoardDaemon(kind, value);
+        } else if (kind === 'route_feedback_summary') {
+          rememberTaskBoardRouteSummary(value);
+        } else if (kind === 'benchmark_suite' || kind === 'benchmark_task' || kind === 'benchmark_run') {
+          rememberTaskBoardBenchmark(kind, value);
         }
         if (kind === 'recovery_event' || kind === 'recovery_action_event' || kind === 'task_recovery') {
           rememberTaskBoardRecovery(kind, value);
@@ -3512,6 +3578,62 @@ export class HimalayaChatPanel {
       }).join('') + '</div>';
     }
 
+    function renderTaskBoardMetricCard(title, lines, status) {
+      const safeStatus = sanitizeDecisioningClassToken(String(status || 'unknown'));
+      return '<div class="task-board-metric-card"><div class="task-board-task-head"><div class="task-board-task-title">' + esc(title) + '</div>' +
+        (status ? '<span class="task-board-status status-' + esc(safeStatus) + '">' + esc(String(status)) + '</span>' : '') + '</div>' +
+        lines.filter(Boolean).map(function(line) { return '<div class="task-board-meta">' + esc(line) + '</div>'; }).join('') + '</div>';
+    }
+
+    function renderTaskBoardDaemon() {
+      const daemon = state.taskBoard.daemon;
+      if (!daemon) { return '<div class="task-board-empty">No daemon events.</div>'; }
+      const stateValue = daemon.state && typeof daemon.state === 'object' ? daemon.state : daemon.state;
+      const lastTick = stateValue && typeof stateValue === 'object' && stateValue.last_tick ? stateValue.last_tick : null;
+      const status = stateValue && typeof stateValue === 'object' ? stateValue.status : (lastTick && lastTick.status);
+      const runs = Array.isArray(daemon.runs) ? daemon.runs.length : undefined;
+      const logs = Array.isArray(daemon.events) ? daemon.events.length : undefined;
+      return renderTaskBoardMetricCard('Scheduler daemon', [
+        daemon.kind ? 'event ' + daemon.kind : undefined,
+        runs !== undefined ? runs + ' run(s)' : undefined,
+        lastTick && lastTick.selected_task_id ? 'selected ' + lastTick.selected_task_id : undefined,
+        logs !== undefined ? logs + ' log event(s)' : undefined,
+        daemon.events_path ? 'logs ' + daemon.events_path : undefined
+      ], status || 'unknown');
+    }
+
+    function renderTaskBoardRouteSummary() {
+      const routeSummary = state.taskBoard.routeSummary;
+      if (!routeSummary) { return '<div class="task-board-empty">No route feedback summary.</div>'; }
+      const summaries = Array.isArray(routeSummary.summaries) ? routeSummary.summaries.slice(0, 3) : [];
+      const lines = ['feedback ' + String(routeSummary.feedback_count || 0)];
+      summaries.forEach(function(summary) {
+        const success = Math.round(Number(summary.success_rate || 0) * 100) + '%';
+        const latency = summary.avg_latency_ms !== undefined && summary.avg_latency_ms !== null ? Math.round(Number(summary.avg_latency_ms)) + 'ms' : 'n/a';
+        lines.push([summary.phase, summary.model, success, latency, 'fail ' + String(summary.failures || 0)].filter(Boolean).join(' · '));
+      });
+      return renderTaskBoardMetricCard('Route feedback', lines, summaries.some(function(summary) { return Number(summary.failures || 0) > 0; }) ? 'failed' : 'completed');
+    }
+
+    function renderTaskBoardBenchmark() {
+      const benchmark = state.taskBoard.benchmark;
+      if (!benchmark) { return '<div class="task-board-empty">No benchmark run.</div>'; }
+      const run = benchmark.run && typeof benchmark.run === 'object' ? benchmark.run : {};
+      const summary = run.summary && typeof run.summary === 'object' ? run.summary : {};
+      return renderTaskBoardMetricCard('Benchmark', [
+        benchmark.suite && benchmark.suite.suite_id ? 'suite ' + benchmark.suite.suite_id : undefined,
+        summary.total_tasks !== undefined ? summary.total_tasks + ' task(s)' : undefined,
+        summary.passed_tasks !== undefined ? summary.passed_tasks + ' passed' : undefined,
+        summary.average_total_score !== undefined ? 'score ' + Number(summary.average_total_score).toFixed(2) : undefined,
+        summary.average_adaptive_routing_quality_score !== undefined ? 'routing ' + Number(summary.average_adaptive_routing_quality_score).toFixed(2) : undefined
+      ], summary.passed_tasks !== undefined && summary.total_tasks !== undefined && summary.passed_tasks < summary.total_tasks ? 'failed' : 'completed');
+    }
+
+    function renderTaskBoardOperations() {
+      return '<div class="task-board-metric-list">' + renderTaskBoardDaemon() + renderTaskBoardRouteSummary() + renderTaskBoardBenchmark() + '</div>';
+    }
+
+
     function updateTaskBoardSurface() {
       try {
         if (!taskBoardSurface) { return; }
@@ -3523,7 +3645,8 @@ export class HimalayaChatPanel {
           .map(function(workerId) { return state.taskBoard.workers[workerId]; })
           .filter(Boolean);
         const hasWorkerState = workers.length > 0 || state.taskBoard.workerSupervisor;
-        const hasBoardState = tasks.length > 0 || state.taskBoard.currentNode || state.taskBoard.recoveryEvents.length > 0 || hasWorkerState;
+        const hasOperationsState = state.taskBoard.daemon || state.taskBoard.routeSummary || state.taskBoard.benchmark;
+        const hasBoardState = tasks.length > 0 || state.taskBoard.currentNode || state.taskBoard.recoveryEvents.length > 0 || hasWorkerState || hasOperationsState;
         if (!hasBoardState) {
           taskBoardSurface.hidden = true;
           taskBoardSurface.innerHTML = '';
@@ -3540,6 +3663,7 @@ export class HimalayaChatPanel {
           '</div></div>' +
           '<div class="task-board-panel"><div class="task-board-panel-title">Workers</div>' + renderTaskBoardWorkerSupervisor() + '</div>' +
           '<div class="task-board-panel"><div class="task-board-panel-title">Current Node</div>' + renderTaskBoardNode(state.taskBoard.currentNode) + '<div class="task-board-panel-title" style="margin-top:8px;">Recovery</div>' + renderTaskBoardRecovery() + '</div>' +
+          '<div class="task-board-panel"><div class="task-board-panel-title">Operations</div>' + renderTaskBoardOperations() + '</div>' +
         '</div>';
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'updateTaskBoardSurface failed: ' + String(e) }); } catch (_) {}
@@ -3646,6 +3770,19 @@ export class HimalayaChatPanel {
 
     /* ── event wiring ── */
     if (sendBtn) { sendBtn.addEventListener('click', submit); }
+    if (stopBtn) {
+      stopBtn.addEventListener('click', () => {
+        try {
+          state.streaming = false;
+          updateSendButtonState();
+          setStatus('Cancelling…', 'warning');
+          vscode.postMessage({ type: 'cancel' });
+          promptInput.focus();
+        } catch (e) {
+          try { vscode.postMessage({ type: 'webview-error', message: 'stop failed: ' + String(e) }); } catch (_) {}
+        }
+      });
+    }
 
     if (promptInput) {
       promptInput.addEventListener('keydown', function(e) {
