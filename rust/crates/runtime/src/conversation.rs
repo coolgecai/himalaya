@@ -1900,6 +1900,23 @@ enum TurnFlow {
     Fail(RuntimeError),
 }
 
+/// Outcome of running one structured-plan node (with per-node verification and
+/// bounded local re-drive).
+enum NodeRunResult {
+    Succeeded { summary: String },
+    Failed { reason: String },
+}
+
+/// Outcome of verifying a node's acceptance criteria.
+enum NodeVerifyOutcome {
+    Passed,
+    /// No acceptance commands, or running them is not permitted in this mode.
+    Skipped,
+    Failed {
+        reason: String,
+    },
+}
+
 /// Coordinates the model loop, tool execution, hooks, and session updates.
 pub struct ConversationRuntime<C, T> {
     session: Session,
@@ -3547,19 +3564,35 @@ where
         let mut event_offset = 0usize;
         let mut reports: Vec<String> = Vec::new();
 
+        // Per-node acceptance criteria (id -> shell commands) for Stage 3
+        // per-node verification.
+        let acceptance: std::collections::HashMap<String, Vec<String>> =
+            validated.acceptance.iter().cloned().collect();
+        let max_node_recovery = self.max_recovery_attempts;
+
         // Bound total node dispatches as a runaway guard.
         let max_nodes = dag.nodes.len().saturating_add(1);
         let outcome =
             crate::structured_execution::dispatch_plan(&dag, &mut execution, max_nodes, |node| {
-                let summary = self.execute_structured_node(task_id, user_input, node);
-                match summary {
-                    Some(text) => {
-                        reports.push(format!("- {} ({}): {}", node.id, node.title, text));
-                        crate::structured_execution::NodeExecutionResult::success(text)
+                let node_acceptance = acceptance.get(&node.id).cloned().unwrap_or_default();
+                let result = self.execute_structured_node_verified(
+                    task_id,
+                    user_input,
+                    node,
+                    &node_acceptance,
+                    max_node_recovery,
+                );
+                match result {
+                    NodeRunResult::Succeeded { summary } => {
+                        reports.push(format!("- {} ({}): {}", node.id, node.title, summary));
+                        crate::structured_execution::NodeExecutionResult::success(summary)
                     }
-                    None => {
-                        reports.push(format!("- {} ({}): no output", node.id, node.title));
-                        crate::structured_execution::NodeExecutionResult::failure("node_no_output")
+                    NodeRunResult::Failed { reason } => {
+                        reports.push(format!(
+                            "- {} ({}): FAILED — {}",
+                            node.id, node.title, reason
+                        ));
+                        crate::structured_execution::NodeExecutionResult::failure(reason)
                     }
                 }
             });
@@ -3586,15 +3619,67 @@ where
         Some(report)
     }
 
-    /// Run a single structured-plan node as a focused model sub-turn. Returns
-    /// the node's text output, or `None` on failure. The node is routed by its
-    /// estimated effort as a complexity hint (difficulty-aware routing extends
-    /// this in Stage 4).
-    fn execute_structured_node(
+    /// Run a single structured-plan node with bounded local re-drive: execute
+    /// a focused model sub-turn, verify the node's acceptance commands (when it
+    /// declared any and the permission mode allows running them), and on
+    /// verification failure re-drive the node with the failure detail up to
+    /// `max_recovery` times before failing it. This extends the P0 fix-verify
+    /// loop to node granularity so a failing node is repaired without aborting
+    /// the whole plan.
+    fn execute_structured_node_verified(
         &mut self,
         task_id: &str,
         user_input: &str,
         node: &crate::structured_execution::ExecutionNode,
+        acceptance: &[String],
+        max_recovery: usize,
+    ) -> NodeRunResult {
+        let mut attempt = 0usize;
+        let mut last_failure = String::from("node produced no output");
+        loop {
+            let extra = if attempt == 0 {
+                None
+            } else {
+                Some(format!(
+                    "A previous attempt did not satisfy the acceptance criteria: {last_failure}. Fix the root cause for this step only."
+                ))
+            };
+            let Some(summary) = self.run_structured_node_turn(task_id, user_input, node, extra)
+            else {
+                last_failure = "node produced no output".to_string();
+                if attempt >= max_recovery {
+                    return NodeRunResult::Failed {
+                        reason: last_failure,
+                    };
+                }
+                attempt += 1;
+                continue;
+            };
+
+            // Verify acceptance commands when present and permitted.
+            match self.verify_node_acceptance(task_id, node, acceptance) {
+                NodeVerifyOutcome::Passed | NodeVerifyOutcome::Skipped => {
+                    return NodeRunResult::Succeeded { summary };
+                }
+                NodeVerifyOutcome::Failed { reason } => {
+                    last_failure = reason.clone();
+                    if attempt >= max_recovery {
+                        return NodeRunResult::Failed { reason };
+                    }
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// Run one focused model sub-turn for a node, optionally with extra
+    /// re-drive guidance. Returns the node's text output, or `None` if empty.
+    fn run_structured_node_turn(
+        &mut self,
+        task_id: &str,
+        user_input: &str,
+        node: &crate::structured_execution::ExecutionNode,
+        extra_guidance: Option<String>,
     ) -> Option<String> {
         let route = self.select_model_route_for_task_with_complexity(
             task_id,
@@ -3606,12 +3691,17 @@ where
         } else {
             node.depends_on.join(", ")
         };
+        let mut prompt = format!(
+            "Overall task: {user_input}\n\nFocus only on this step:\n- id: {}\n- goal: {}\n- depends on: {deps}\n\nProduce the concrete result/output for this step in a few sentences.",
+            node.id, node.title
+        );
+        if let Some(extra) = extra_guidance {
+            prompt.push_str("\n\n");
+            prompt.push_str(&extra);
+        }
         let request = ApiRequest {
             system_prompt: vec![STRUCTURED_NODE_SYSTEM_PROMPT.to_string()],
-            messages: vec![ConversationMessage::user_text(format!(
-                "Overall task: {user_input}\n\nFocus only on this step:\n- id: {}\n- goal: {}\n- depends on: {deps}\n\nProduce the concrete result/output for this step in a few sentences.",
-                node.id, node.title
-            ))],
+            messages: vec![ConversationMessage::user_text(prompt)],
             model_route: Some(route),
         };
         let events = self.api_client.stream(request).ok()?;
@@ -3626,6 +3716,44 @@ where
             None
         } else {
             Some(text.to_string())
+        }
+    }
+
+    /// Verify a node's acceptance commands. Skipped when the node declared none
+    /// or when the permission mode forbids running verification commands.
+    fn verify_node_acceptance(
+        &self,
+        task_id: &str,
+        node: &crate::structured_execution::ExecutionNode,
+        acceptance: &[String],
+    ) -> NodeVerifyOutcome {
+        if acceptance.is_empty() {
+            return NodeVerifyOutcome::Skipped;
+        }
+        if !matches!(
+            self.permission_policy.active_mode(),
+            crate::PermissionMode::DangerFullAccess | crate::PermissionMode::Allow
+        ) {
+            // Cannot run commands in this mode; treat as skipped so the node is
+            // accepted on its model output (matches turn-level gating behavior).
+            return NodeVerifyOutcome::Skipped;
+        }
+        let request = crate::VerificationRequest {
+            task_id: format!("{task_id}:{}", node.id),
+            objective: node.title.clone(),
+            scope: "structured node".to_string(),
+            acceptance_tests: acceptance.to_vec(),
+            reporting_contract: "node acceptance".to_string(),
+            policy: crate::VerificationPolicy::Targeted,
+            required_green_level: None,
+        };
+        let result = self.verification_runner.run(&request);
+        if result.passed {
+            NodeVerifyOutcome::Passed
+        } else {
+            NodeVerifyOutcome::Failed {
+                reason: result.summary,
+            }
         }
     }
 
@@ -6943,5 +7071,123 @@ mod tests {
             .clone();
         // Both nodes ran, dependency before dependent.
         assert_eq!(dispatched, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn structured_node_redrives_until_acceptance_passes() {
+        use std::sync::{Arc, Mutex};
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "himalaya-node-redrive-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&workspace_root).expect("workspace");
+        let marker = workspace_root.join("node.marker");
+        let script = workspace_root.join("accept.sh");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ntest -f {}\n", marker.display()),
+        )
+        .expect("script");
+
+        // Planning returns a one-node plan with an acceptance command. The node
+        // sub-turn (Coding) creates the marker only on its SECOND invocation, so
+        // the first acceptance check fails and the node must re-drive.
+        #[derive(Clone)]
+        struct NodeRedriveApi {
+            node_calls: Arc<Mutex<usize>>,
+            marker: std::path::PathBuf,
+            accept_cmd: String,
+        }
+        impl ApiClient for NodeRedriveApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let phase = request
+                    .model_route
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.phase))
+                    .unwrap_or_default();
+                if phase == "Planning" {
+                    let json = format!(
+                        "{{\"steps\":[{{\"id\":\"build\",\"title\":\"Build\",\"acceptance\":[{}]}}]}}",
+                        serde_json::to_string(&self.accept_cmd).unwrap()
+                    );
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(json),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                let user_text = request
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.blocks.iter())
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                if user_text.contains("Focus only on this step") {
+                    let mut calls = self
+                        .node_calls
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *calls += 1;
+                    if *calls >= 2 {
+                        let _ = fs::write(&self.marker, "ok");
+                    }
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("step output".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(false)
+                .with_structured_execution_threshold(3),
+        );
+        let node_calls = Arc::new(Mutex::new(0usize));
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new().with_workspace_root(workspace_root.clone()),
+            NodeRedriveApi {
+                node_calls: node_calls.clone(),
+                marker: marker.clone(),
+                accept_cmd: format!("sh {}", script.display()),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+
+        let _ = runtime
+            .run_turn(
+                "implement, refactor, write, test and verify the build pipeline",
+                None,
+            )
+            .expect("turn should succeed");
+
+        // The node ran at least twice (initial + one re-drive) and the marker
+        // its re-drive created exists.
+        assert!(
+            *node_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                >= 2,
+            "node should have re-driven at least once"
+        );
+        assert!(marker.exists(), "re-drive should have satisfied acceptance");
+
+        let _ = fs::remove_dir_all(&workspace_root);
     }
 }
