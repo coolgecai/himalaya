@@ -1,13 +1,30 @@
 # Parity Status — Himalaya-code Rust Port
 
-Last updated: 2026-05-29
+Last updated: 2026-06-03
 
 ## Summary
 
 - Canonical document: this top-level `PARITY.md` is the file consumed by `rust/scripts/run_mock_parity_diff.py`.
 - Requested 9-lane checkpoint: **All 9 lanes are present in the current Rust workspace.**
-- Current branch reality: this branch includes `rust/crates/runtime/src/bash_validation.rs`, exports it from `runtime`, and passes `cargo test --manifest-path rust/Cargo.toml --workspace` on 2026-05-29.
-- Mock parity harness stats at the original checkpoint: **13 scripted scenarios**, **46 captured `/v1/messages` requests** in `rust/crates/rusty-Himalaya-cli/tests/mock_parity_harness.rs`.
+- Current branch reality: this branch includes protocol v1 hardening, durable task/worker/model-routing control-plane work, and a local `scripts/ci-gate.sh` intended to mirror the high-signal GitHub Actions path.
+- Mock parity harness stats at the current checkpoint: **13 scripted scenarios**, **23 captured `/v1/messages` requests** after filtering out `/v1/messages/count_tokens` requests in `rust/crates/rusty-Himalaya-cli/tests/mock_parity_harness.rs`.
+
+## Near-term 8-PR checkpoint — 2026-06-03
+
+All 8 tracks are landed in this branch. Whole-workspace verification:
+`cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` (all green), and `node vscode-extension/tests/regression.test.cjs` (39 pass).
+
+| Track | Status in this branch | Evidence / validation |
+|---|---|---|
+| 1. stream-json protocol repair | Done: v1 schema requires `protocol_version` at root and in `baseEvent`; CLI help advertises `stream-json`; NDJSON REPL error/done events are versioned via `print_stream_json_event`. | `cargo test -p rusty-Himalaya-cli --test stream_json_contract`; `--test output_format_contract`; VS Code regression. |
+| 2. CI gate + docs | Done: `scripts/ci-gate.sh` runs no-secrets, Rust fmt/clippy/build/tests, stream/output contracts, mock parity diff, VS Code regression, and prepackage; `.github/workflows/ci.yml` adds a `local-ci-gate` job. | `bash scripts/ci-gate.sh` |
+| 3. Slash command truth source | Done: implemented/stub/resume-safe status lives in `commands` helpers (`slash_command_status`, `is_stub_slash_command`, `stub_slash_commands`); resume + filtered help derive from it. | `cargo test -p commands`; `cargo test -p rusty-Himalaya-cli --test resume_slash_commands` |
+| 4. Model routing feedback | Done: `route_feedback_store` persists with atomic temp-file + rename; duplicate saves do not inflate stats. | `cargo test -p runtime route_feedback`; CLI route summary tests. |
+| 5. Permission enforcer integration | Done: `PermissionEnforcer` is the dispatch-time safety net for built-in, plugin, and runtime tools. It hard-denies deny-rules and non-promptable mode mismatches, but defers promptable escalations (e.g. workspace-write→danger) to the interactive prompter in `run_turn` via `check_allowing_prompted_escalation`, so an approved escalation is never double-gated. | `cargo test -p runtime permission_enforcer`; `cargo test -p tools`; `cargo test -p rusty-Himalaya-cli --test mock_parity_harness` |
+| 6. VS Code protocol parity | Done: missing `protocol_version` warning, Stop/cancel button wiring, REPL golden replay, `context_event` parser support. | `node vscode-extension/tests/regression.test.cjs` |
+| 7. Worker transport MVP | Done: in-process worker stdin/stdout transport via piped stdio (`WorkerProcessHandle::send_prompt`/`drain_stdout`); durable cross-CLI handles remain out of MVP scope. | `cargo test -p runtime worker`; stream contracts. |
+| 8. Context-as-tool MVP | Done: `ContextRead`/`ContextWrite`/`ContextCompact` tool specs + handlers; long-term memory uses atomic writes and (kind, topic, note) dedupe with confidence-upsert; `context_event` in schema + VS Code protocol. | `cargo test -p tools context`; `cargo test -p runtime`; schema/VS Code protocol tests. |
 
 ## Mock parity harness — milestone 1
 
@@ -64,6 +81,7 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 - **Feature commit:** `36dac6c` — `feat: add bash validation submodules — readOnlyValidation, destructiveCommandWarning, modeValidation, sedValidation, pathValidation, commandSemantics`
 - **Evidence:** `rust/crates/runtime/src/bash_validation.rs` is present in this workspace and exported from `runtime::lib`; the runtime also keeps `rust/crates/runtime/src/bash.rs` as the active subprocess execution layer.
 - **Main-branch reality:** bash execution, sandboxing, permission enforcement, and validation are split across `bash.rs`, `permission_enforcer.rs`, and `bash_validation.rs` rather than a single upstream-style module tree.
+- **Bash tool — upstream has 18 submodules, Rust has 1:** Rust intentionally consolidates most upstream bash validation concerns into `bash_validation.rs` plus runtime permission/sandbox enforcement rather than mirroring the upstream directory structure exactly.
 
 ### Bash tool — validation coverage
 
@@ -149,9 +167,9 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 - `PermissionEnforcer::check()` delegates to `PermissionPolicy::authorize()` and returns structured allow/deny results.
 - `check_file_write()` enforces workspace boundaries and read-only denial; `check_bash()` denies mutating commands in read-only mode and blocks prompt-mode bash without confirmation.
 
-## Tool Surface: 40 exposed tool specs on `main`
+## Tool Surface: 50 exposed tool specs on this branch
 
-- `mvp_tool_specs()` in `rust/crates/tools/src/lib.rs` exposes **40** tool specs.
+- `mvp_tool_specs()` in `rust/crates/tools/src/lib.rs` exposes **50** tool specs.
 - Core execution is present for `bash`, `read_file`, `write_file`, `edit_file`, `glob_search`, and `grep_search`.
 - Existing product tools in `mvp_tool_specs()` include `WebFetch`, `WebSearch`, `TodoWrite`, `Skill`, `Agent`, `ToolSearch`, `NotebookEdit`, `Sleep`, `SendUserMessage`, `Config`, `EnterPlanMode`, `ExitPlanMode`, `StructuredOutput`, `REPL`, and `PowerShell`.
 - The 9-lane push replaced pure fixed-payload stubs for `Task*`, `Team*`, `Cron*`, `LSP`, and MCP tools with registry-backed handlers on `main`.
@@ -184,6 +202,21 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 - [ ] Token counting / cost tracking accuracy
 - [x] Bash validation lane merged onto `main`
 - [ ] CI green on every commit
+
+
+## Next parity gap execution table — 2026-05-30
+
+| Priority | Gap | Current state | Next task | Validation |
+| --- | --- | --- | --- | --- |
+| P0 | CI green on every commit | Local `scripts/ci-gate.sh` now mirrors the high-signal GitHub Actions path. | Keep this gate green before commits and wire future PR checks to it when practical. | `./scripts/ci-gate.sh` |
+| P1 | End-to-end MCP runtime lifecycle | Registry bridge and lifecycle reporting exist, but full connect/auth/resource/tool/shutdown UX is still shallow. | Add MCP harness cases for stdio server startup, auth/degraded startup, list/read resources, tool calls, and shutdown events. | Runtime MCP lifecycle tests plus stream-json golden coverage. |
+| P1 | VS Code interactive prompts | `AskUserQuestion` works through CLI stdin/stdout only. | Route `AskUserQuestion` requests through the VS Code webview with option selection and response delivery back to the running process. | VS Code regression replay with an interactive prompt event. |
+| P1 | Cron execution loop | Cron create/delete/list persists registry state; scheduled prompt execution is not yet a real loop. | Implement a cron scheduler runner that fires due prompts, records durable events, and exposes status/log stream events. | Runtime cron scheduler tests and CLI `cron run/status/logs` contracts. |
+| P2 | Session compaction matching | Compaction exists, but upstream behavioral equivalence is still marked open. | Add parity fixtures for large sessions, tool-use/result boundaries, continuation prompts, and token threshold behavior. | Mock parity harness scenarios plus runtime compaction tests. |
+| P2 | Token/cost accuracy | Usage tracking and route feedback costs exist, but exact provider accounting remains open. | Compare token/cost math across Anthropic-compatible mock usage, cache tokens, route feedback summaries, and `/cost` output. | CLI cost contract tests and route feedback summary fixtures. |
+| P2 | RemoteTrigger production hardening | Basic bounded HTTP request execution exists. | Add allowlist policy, auth handling, retry/backoff, and structured failure events before using it as orchestration infrastructure. | Permission/policy tests and remote trigger contract tests. |
+| P2 | LSP feature depth | LSP tool exposes symbols/references/diagnostics/definition/hover. | Expose completion/format actions backed by real language-server integration tests. | LSP registry tests against a local server fixture. |
+| P3 | Parity document drift | Top-level `PARITY.md` is canonical, while `rust/PARITY.md` still contains stale unchecked items for config/plugin/output truncation. | Reconcile or retire stale duplicate checklist entries so audits have one source of truth. | `rust/scripts/run_mock_parity_diff.py` and doc diff review. |
 
 ## Migration Readiness
 

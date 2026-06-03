@@ -71,6 +71,37 @@ cd rust
 ./target/debug/Himalaya --output-format json prompt "status"
 ```
 
+### Stream-json output for harnesses and VS Code
+
+`stream-json` is newline-delimited JSON on stdout. Every v1 event includes `protocol_version: 1`, including `error` and `done` events from the persistent REPL path.
+
+```bash
+cd rust
+./target/debug/Himalaya --output-format stream-json prompt "summarize this repository"
+```
+
+Persistent clients can reuse one CLI process with the NDJSON REPL protocol:
+
+```bash
+cd rust
+./target/debug/Himalaya --repl --model sonnet
+# stdin lines:
+# {"type":"prompt","text":"summarize this repository","files":[]}
+# {"type":"exit"}
+```
+
+The protocol schema and golden transcript live under `protocol/stream-json-v1.schema.json` and `protocol/stream-json-v1.golden.ndjson`. The VS Code extension replays the same golden stream in regression tests.
+
+### Local CI gate
+
+Run the repository gate before committing broad runtime, CLI, protocol, or VS Code changes:
+
+```bash
+bash scripts/ci-gate.sh
+```
+
+The gate runs the secret/generated-artifact check, Rust fmt/clippy/build/tests, stream-json and output-format contracts, mock parity diff, VS Code regression tests, and extension prepackage checks. If `vscode-extension/node_modules` is missing locally, the script runs `npm ci` before extension checks.
+
 ## Model and permission controls
 
 ```bash
@@ -132,7 +163,7 @@ cd rust
 ./target/debug/Himalaya --output-format json routes summary
 ```
 
-The summary groups feedback by phase/model and includes success rate plus average latency, token, and cost metrics.
+The summary groups feedback by phase/provider/model and includes success rate plus average latency, token, and cost metrics. This is phase-level adaptive routing (an agent-level model cascade), not token-level MoE or automatic multi-model voting.
 
 ## Authentication
 
@@ -439,6 +470,16 @@ Runtime config is loaded in this order, with later entries overriding earlier on
 3. `<repo>/.Himalaya.json`
 4. `<repo>/.Himalaya/settings.json`
 5. `<repo>/.Himalaya/settings.local.json`
+
+## Local CI gate
+
+Run the same high-signal checks before opening or updating a PR:
+
+```bash
+./scripts/ci-gate.sh
+```
+
+The gate runs repository safety checks, Rust formatting/clippy/build/tests, the CLI output-format contracts including the shared stream-json golden transcript, the mock parity harness, and VS Code regression/prepackage checks.
 
 ## Mock parity harness
 

@@ -161,3 +161,46 @@ jobs:
       - name: Run extension prepackage checks
         working-directory: vscode-extension
         run: npm run prepackage
+
+  local-ci-gate:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            git \
+            ca-certificates \
+            python3
+
+      - name: Install Rust + clippy + rustfmt
+        run: |
+          rustup toolchain install 1.88.0
+          rustup default 1.88.0
+          rustup component add clippy rustfmt
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-local-gate-1.88.0-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-local-gate-1.88.0-
+
+      - name: Run local CI gate
+        run: bash scripts/ci-gate.sh
