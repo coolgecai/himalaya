@@ -12,7 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use telemetry::SessionTracer;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    compact_session, compact_session_with, estimate_session_tokens, CompactionConfig,
+    CompactionResult,
 };
 use crate::config::{DecisioningConfig, RuntimeFeatureConfig};
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
@@ -34,6 +35,11 @@ use crate::{
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const DEFAULT_MAX_CONVERSATION_ITERATIONS: usize = 32;
+/// How many times a turn may automatically re-drive the model to fix a failed
+/// verification before giving up. Each attempt feeds the verification failure
+/// and recovery plan back into the conversation, then re-verifies. A value of
+/// `0` preserves the legacy single-shot behavior (fail the turn immediately).
+const DEFAULT_MAX_RECOVERY_ATTEMPTS: usize = 2;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "Himalaya_CODE_AUTO_COMPACT_INPUT_TOKENS";
 const WORKSPACE_CONTEXT_MAX_ENTRIES: usize = 220;
 const WORKSPACE_CONTEXT_MAX_DEPTH: usize = 4;
@@ -661,6 +667,125 @@ fn workspace_evidence_tools_available(available_tool_names: &BTreeSet<String>) -
 
 fn workspace_evidence_gate_prompt() -> &'static str {
     "Workspace analysis is not allowed to finish from the injected navigation snapshot. Use local evidence tools now: run glob_search or grep_search to discover relevant files/entry points, read root manifests with read_file, read at least three relevant source files with read_file, then answer only from those observations. Preserve the active output-language contract from the system prompt."
+}
+
+/// Build the user-facing guidance injected when a turn re-drives after a failed
+/// verification. It states the failure, the recovery actions already attempted,
+/// and the remaining budget so the model fixes the root cause rather than
+/// repeating the same work.
+fn format_recovery_redrive_guidance(
+    attempt: usize,
+    max_attempts: usize,
+    reason: &str,
+    action_plan: &crate::RecoveryActionPlan,
+) -> String {
+    let mut guidance = String::new();
+    guidance.push_str("# Verification failed — automated fix attempt ");
+    guidance.push_str(&attempt.to_string());
+    guidance.push_str(" of ");
+    guidance.push_str(&max_attempts.to_string());
+    guidance.push_str("\nThe previous attempt did not pass verification:\n- Reason: ");
+    guidance.push_str(reason);
+    if !action_plan.actions.is_empty() {
+        guidance.push_str("\n\nRecovery analysis suggested these actions:");
+        for action in &action_plan.actions {
+            guidance.push_str(&format!("\n- [{:?}] {}", action.scenario, action.message));
+        }
+    }
+    guidance.push_str(
+        "\n\nDiagnose the root cause from the evidence above, make the necessary changes with the available tools, and ensure the acceptance criteria will pass. Do not repeat work that already succeeded; focus on what made verification fail.",
+    );
+    guidance
+}
+
+/// Maximum characters of rendered transcript to send to the summarizer model.
+/// Bounds the cost/latency of compaction summarization on very large windows.
+const MODEL_SUMMARY_MAX_TRANSCRIPT_CHARS: usize = 24_000;
+
+/// Ask the model (via the Summarization route) to summarize the messages being
+/// compacted away. Returns `Some(summary_text)` on success, or `None` on any
+/// failure so the caller falls back to the deterministic heuristic summary.
+fn model_summarize_removed<C: ApiClient>(
+    api_client: &mut C,
+    route: &ModelRouteDecision,
+    removed: &[ConversationMessage],
+) -> Option<String> {
+    if removed.is_empty() {
+        return None;
+    }
+    let transcript = render_messages_for_summary(removed);
+    if transcript.trim().is_empty() {
+        return None;
+    }
+    let request = ApiRequest {
+        system_prompt: vec![SUMMARIZATION_SYSTEM_PROMPT.to_string()],
+        messages: vec![ConversationMessage::user_text(format!(
+            "Summarize the following earlier conversation segment so work can continue without it. Capture the objective, decisions, key files, tool results, and pending next steps.\n\n{transcript}"
+        ))],
+        model_route: Some(route.clone()),
+    };
+    let events = api_client.stream(request).ok()?;
+    let mut summary = String::new();
+    for event in events {
+        if let AssistantEvent::TextDelta(delta) = event {
+            summary.push_str(&delta);
+        }
+    }
+    let summary = summary.trim();
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary.to_string())
+    }
+}
+
+const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are compacting a long coding-agent conversation. Produce a concise, factual summary that preserves: the active objective, decisions made, files and symbols touched, important tool results (successes and failures), and concrete pending next steps. Do not invent details. Output only the summary text.";
+
+const PLANNING_SYSTEM_PROMPT: &str = "You are the planning model for a coding agent. Given a complex task and a heuristic pre-plan, produce a short, concrete, ordered execution plan (3-7 steps). Be specific to the task, call out risks and dependencies, and recommend an order. Do not write code or take actions; output only the plan as a short markdown list.";
+
+/// Render messages into a compact, role-tagged transcript for summarization,
+/// truncating to a bounded length to keep summarization cheap.
+fn render_messages_for_summary(messages: &[ConversationMessage]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        let role = match message.role {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+        };
+        for block in &message.blocks {
+            let rendered = match block {
+                ContentBlock::Text { text } => text.clone(),
+                ContentBlock::ToolUse { name, input, .. } => {
+                    format!("[tool-use {name}] {input}")
+                }
+                ContentBlock::ToolResult {
+                    tool_name,
+                    output,
+                    is_error,
+                    ..
+                } => format!(
+                    "[tool-result {tool_name}{}] {output}",
+                    if *is_error { " error" } else { "" }
+                ),
+                ContentBlock::Image { .. } => "[image]".to_string(),
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => continue,
+            };
+            if rendered.trim().is_empty() {
+                continue;
+            }
+            out.push_str(role);
+            out.push_str(": ");
+            out.push_str(rendered.trim());
+            out.push('\n');
+            if out.len() >= MODEL_SUMMARY_MAX_TRANSCRIPT_CHARS {
+                out.push_str("… [transcript truncated for summarization]\n");
+                return out;
+            }
+        }
+    }
+    out
 }
 
 fn extract_json_string_field(input: &str, field: &str) -> Option<String> {
@@ -1692,6 +1817,20 @@ struct DecisioningTurnPlan {
     next_execution_event_offset: usize,
     selected_positions: BTreeMap<String, usize>,
     workspace_evidence_stage_active: bool,
+    /// Optional model-driven planning guidance for high-complexity tasks,
+    /// folded into the advisory prompt alongside the heuristic plan.
+    model_planning_guidance: Option<String>,
+}
+
+/// Flow decision returned by `finalize_turn_or_recover` after verification.
+enum TurnFlow {
+    /// Verification passed or was not required — finish the turn.
+    Complete,
+    /// Verification failed but recovery converged and budget remains — feed the
+    /// failure detail and recovery plan back into the conversation, then retry.
+    Redrive { guidance: String },
+    /// Verification failed terminally — fail the turn with this error.
+    Fail(RuntimeError),
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
@@ -1702,6 +1841,7 @@ pub struct ConversationRuntime<C, T> {
     permission_policy: PermissionPolicy,
     system_prompt: Vec<String>,
     max_iterations: usize,
+    max_recovery_attempts: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     decisioning_config: DecisioningConfig,
@@ -1767,6 +1907,7 @@ where
             permission_policy,
             system_prompt,
             max_iterations: DEFAULT_MAX_CONVERSATION_ITERATIONS,
+            max_recovery_attempts: DEFAULT_MAX_RECOVERY_ATTEMPTS,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             decisioning_config: feature_config.decisioning().clone(),
@@ -1794,6 +1935,15 @@ where
     #[must_use]
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    /// Override how many times a turn may automatically re-drive the model to
+    /// fix a failed verification before failing the turn. `0` restores the
+    /// legacy single-shot behavior.
+    #[must_use]
+    pub fn with_max_recovery_attempts(mut self, max_recovery_attempts: usize) -> Self {
+        self.max_recovery_attempts = max_recovery_attempts;
         self
     }
 
@@ -2067,6 +2217,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut recovery_attempts = 0;
         let mut chain_of_thought: Option<ChainOfThought> = None;
         let user_memory_facts = extract_user_memory_facts(&user_input);
         if !user_memory_facts.is_empty() {
@@ -2074,9 +2225,13 @@ where
             record_user_memory(&mut memory, &user_memory_facts);
         }
         let mut effective_system_prompt = self.system_prompt.clone();
+        // Complexity signal used to bias model routing toward higher-quality
+        // routes for harder tasks (difficulty-aware routing).
+        let mut task_complexity: Option<u8> = None;
         if let Some(initial_plan) =
             self.build_initial_decisioning_plan(&runtime_task_id, &user_input)
         {
+            task_complexity = Some(initial_plan.task.complexity);
             effective_system_prompt.push(Self::format_initial_decisioning_prompt(&initial_plan));
         }
         if let Some(memory_override) = format_user_memory_override(&user_memory_facts) {
@@ -2098,7 +2253,7 @@ where
         }
         effective_system_prompt.push(task_state.format_context());
 
-        loop {
+        'turn: loop {
             iterations += 1;
             if iterations > self.max_iterations {
                 let error = RuntimeError::new(
@@ -2108,8 +2263,11 @@ where
                 return Err(error);
             }
 
-            let model_route =
-                self.select_model_route_for_task(&runtime_task_id, crate::ModelRoutePhase::Coding);
+            let model_route = self.select_model_route_for_task_with_complexity(
+                &runtime_task_id,
+                crate::ModelRoutePhase::Coding,
+                task_complexity,
+            );
             let model_started_at = std::time::Instant::now();
             let request = ApiRequest {
                 system_prompt: {
@@ -2199,7 +2357,22 @@ where
             assistant_messages.push(assistant_message);
 
             if pending_tool_uses.is_empty() {
-                break;
+                match self.finalize_turn_or_recover(
+                    &runtime_task_id,
+                    &mut task_ledger_offset,
+                    iterations,
+                    recovery_attempts,
+                ) {
+                    TurnFlow::Complete => break 'turn,
+                    TurnFlow::Fail(error) => return Err(error),
+                    TurnFlow::Redrive { guidance } => {
+                        recovery_attempts += 1;
+                        self.session
+                            .push_message(ConversationMessage::user_text(guidance))
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        continue 'turn;
+                    }
+                }
             }
 
             let mut decisioning_plan = self.build_decisioning_turn_plan(
@@ -2519,9 +2692,35 @@ where
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
         };
-        let verification_route = self
-            .select_model_route_for_task(&runtime_task_id, crate::ModelRoutePhase::Verification);
-        let mut verification_decision = self.evaluate_runtime_task_completion(&runtime_task_id);
+        // Run lightweight reflection and learning hooks before completing the turn.
+        self.reflect_on_outcome(&chain_of_thought, &summary);
+        self.record_turn_completed(&summary);
+
+        Ok(summary)
+    }
+
+    /// Drive verification once the model has stopped requesting tools, then
+    /// decide how the turn should proceed:
+    ///
+    /// - `Complete` — verification passed or was not required; finish the turn.
+    /// - `Redrive` — verification failed but recovery succeeded and the
+    ///   recovery budget still has room, so the failure detail and recovery
+    ///   plan are fed back into the conversation for another fix-verify pass.
+    /// - `Fail` — verification failed and the turn cannot recover (budget
+    ///   exhausted, recovery did not converge, or verification stayed blocked).
+    ///
+    /// The bounded re-drive loop is what turns the verifier + recovery
+    /// orchestrator from a single-shot reporter into an autonomous fix loop.
+    fn finalize_turn_or_recover(
+        &mut self,
+        runtime_task_id: &str,
+        task_ledger_offset: &mut usize,
+        iterations: usize,
+        recovery_attempts: usize,
+    ) -> TurnFlow {
+        let verification_route =
+            self.select_model_route_for_task(runtime_task_id, crate::ModelRoutePhase::Verification);
+        let mut verification_decision = self.evaluate_runtime_task_completion(runtime_task_id);
         if let VerificationDecision::Required(request) = &verification_decision {
             let result = if matches!(
                 self.permission_policy.active_mode(),
@@ -2530,7 +2729,7 @@ where
                 self.verification_runner.run(request)
             } else {
                 VerificationResult {
-                    task_id: runtime_task_id.clone(),
+                    task_id: runtime_task_id.to_string(),
                     passed: false,
                     observed_green_level: None,
                     summary: format!(
@@ -2542,17 +2741,17 @@ where
             };
             let _ = self
                 .task_registry
-                .record_verification(&runtime_task_id, result);
-            self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
-            task_ledger_offset = self.task_registry.ledger_for_task(&runtime_task_id).len();
-            verification_decision = self.evaluate_runtime_task_completion(&runtime_task_id);
+                .record_verification(runtime_task_id, result);
+            self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
+            *task_ledger_offset = self.task_registry.ledger_for_task(runtime_task_id).len();
+            verification_decision = self.evaluate_runtime_task_completion(runtime_task_id);
         }
         let mut team_ledger = TeamExecutionLedger::new(
             format!("team-{}", self.session.session_id),
-            runtime_task_id.clone(),
+            runtime_task_id.to_string(),
         );
         self.emit_team_execution_event_for_task(
-            &runtime_task_id,
+            runtime_task_id,
             team_ledger
                 .record_verification(&verification_decision, Some(verification_route.clone())),
         );
@@ -2560,9 +2759,9 @@ where
             VerificationDecision::Failed { reason } => {
                 let _ = self
                     .task_registry
-                    .set_status(&runtime_task_id, crate::TaskStatus::Recovering);
-                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
-                task_ledger_offset = self.task_registry.ledger_for_task(&runtime_task_id).len();
+                    .set_status(runtime_task_id, crate::TaskStatus::Recovering);
+                self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
+                *task_ledger_offset = self.task_registry.ledger_for_task(runtime_task_id).len();
                 let classification = self.failure_classifier.classify_reason(&reason);
                 let mut recovery = RecoveryOrchestrator::new();
                 let outcome = recovery.recover_once(classification.scenario);
@@ -2573,28 +2772,64 @@ where
                 for event in outcome.events.clone() {
                     let _ = self
                         .task_registry
-                        .record_recovery_event(&runtime_task_id, event.clone());
+                        .record_recovery_event(runtime_task_id, event.clone());
                     self.emit_runtime_event(RuntimeEvent::Recovery(event));
                 }
-                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
-                task_ledger_offset = self.task_registry.ledger_for_task(&runtime_task_id).len();
+                self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
+                *task_ledger_offset = self.task_registry.ledger_for_task(runtime_task_id).len();
                 let action_plan = self.recovery_action_engine.plan(
-                    runtime_task_id.clone(),
+                    runtime_task_id.to_string(),
                     &outcome,
                     self.task_registry
-                        .get(&runtime_task_id)
+                        .get(runtime_task_id)
                         .and_then(|task| task.plan)
                         .and_then(|plan| plan.resume_cursor)
                         .and_then(|cursor| cursor.node_id),
                 );
                 let action_execution = self.recovery_action_engine.execute_against_registry(
-                    action_plan,
+                    action_plan.clone(),
                     self.permission_policy.active_mode(),
                     &self.task_registry,
                 );
                 self.emit_runtime_event(RuntimeEvent::RecoveryAction(action_execution));
-                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
-                task_ledger_offset = self.task_registry.ledger_for_task(&runtime_task_id).len();
+                self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
+                *task_ledger_offset = self.task_registry.ledger_for_task(runtime_task_id).len();
+
+                // Bounded autonomous re-drive: if recovery converged and we
+                // still have budget, feed the failure + recovery plan back to
+                // the model and re-verify instead of giving up.
+                if recovery_succeeded && recovery_attempts < self.max_recovery_attempts {
+                    let _ = self
+                        .task_registry
+                        .set_status(runtime_task_id, crate::TaskStatus::Running);
+                    self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
+                    *task_ledger_offset = self.task_registry.ledger_for_task(runtime_task_id).len();
+                    let _ = self.task_registry.update_latest_route_feedback(
+                        runtime_task_id,
+                        crate::ModelRouteFeedback::pending(
+                            runtime_task_id.to_string(),
+                            verification_route.clone(),
+                            current_time_millis() / 1_000,
+                        )
+                        .with_outcome(
+                            false,
+                            Some(false),
+                            true,
+                            Some(reason.clone()),
+                        ),
+                    );
+                    // Clear the stale failing result so the next pass re-verifies
+                    // against the model's new attempt.
+                    let _ = self.task_registry.clear_verification(runtime_task_id);
+                    let guidance = format_recovery_redrive_guidance(
+                        recovery_attempts + 1,
+                        self.max_recovery_attempts,
+                        &reason,
+                        &action_plan,
+                    );
+                    return TurnFlow::Redrive { guidance };
+                }
+
                 let terminal_status = if recovery_succeeded {
                     crate::TaskStatus::Blocked
                 } else {
@@ -2602,12 +2837,12 @@ where
                 };
                 let _ = self
                     .task_registry
-                    .set_status(&runtime_task_id, terminal_status);
-                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+                    .set_status(runtime_task_id, terminal_status);
+                self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
                 let _ = self.task_registry.update_latest_route_feedback(
-                    &runtime_task_id,
+                    runtime_task_id,
                     crate::ModelRouteFeedback::pending(
-                        runtime_task_id.clone(),
+                        runtime_task_id.to_string(),
                         verification_route.clone(),
                         current_time_millis() / 1_000,
                     )
@@ -2619,11 +2854,11 @@ where
                     ),
                 );
                 self.record_turn_failed(iterations, &RuntimeError::new(reason.clone()));
-                return Err(RuntimeError::new(reason));
+                TurnFlow::Fail(RuntimeError::new(reason))
             }
             VerificationDecision::Required(request) => {
                 let result = VerificationResult {
-                    task_id: runtime_task_id.clone(),
+                    task_id: runtime_task_id.to_string(),
                     passed: false,
                     observed_green_level: None,
                     summary: format!(
@@ -2634,18 +2869,18 @@ where
                 };
                 let _ = self
                     .task_registry
-                    .record_verification(&runtime_task_id, result);
-                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
-                task_ledger_offset = self.task_registry.ledger_for_task(&runtime_task_id).len();
+                    .record_verification(runtime_task_id, result);
+                self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
+                *task_ledger_offset = self.task_registry.ledger_for_task(runtime_task_id).len();
                 let _ = self
                     .task_registry
-                    .set_status(&runtime_task_id, crate::TaskStatus::Failed);
-                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+                    .set_status(runtime_task_id, crate::TaskStatus::Failed);
+                self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
                 let error = RuntimeError::new("verification is required before task completion");
                 let _ = self.task_registry.update_latest_route_feedback(
-                    &runtime_task_id,
+                    runtime_task_id,
                     crate::ModelRouteFeedback::pending(
-                        runtime_task_id.clone(),
+                        runtime_task_id.to_string(),
                         verification_route.clone(),
                         current_time_millis() / 1_000,
                     )
@@ -2657,13 +2892,13 @@ where
                     ),
                 );
                 self.record_turn_failed(iterations, &error);
-                return Err(error);
+                TurnFlow::Fail(error)
             }
             VerificationDecision::NotRequired | VerificationDecision::Passed => {
                 let _ = self.task_registry.update_latest_route_feedback(
-                    &runtime_task_id,
+                    runtime_task_id,
                     crate::ModelRouteFeedback::pending(
-                        runtime_task_id.clone(),
+                        runtime_task_id.to_string(),
                         verification_route.clone(),
                         current_time_millis() / 1_000,
                     )
@@ -2671,15 +2906,11 @@ where
                 );
                 let _ = self
                     .task_registry
-                    .set_status(&runtime_task_id, crate::TaskStatus::Completed);
-                self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
+                    .set_status(runtime_task_id, crate::TaskStatus::Completed);
+                self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
+                TurnFlow::Complete
             }
         }
-        // Run lightweight reflection and learning hooks before completing the turn.
-        self.reflect_on_outcome(&chain_of_thought, &summary);
-        self.record_turn_completed(&summary);
-
-        Ok(summary)
     }
 
     #[must_use]
@@ -2727,12 +2958,20 @@ where
             return None;
         }
 
-        let result = compact_session(
+        // Borrow the fields the summarizer needs disjointly from `self.session`
+        // (which `compact_session_with` borrows) so the closure can call the
+        // model while compaction reads the session.
+        let api_client = &mut self.api_client;
+        let summarization_route = self
+            .model_router
+            .select(crate::ModelRoutePhase::Summarization);
+        let result = compact_session_with(
             &self.session,
             CompactionConfig {
                 max_estimated_tokens: 0,
                 ..CompactionConfig::default()
             },
+            |removed| model_summarize_removed(api_client, &summarization_route, removed),
         );
 
         if result.removed_message_count == 0 {
@@ -3041,7 +3280,7 @@ where
     }
 
     fn build_initial_decisioning_plan(
-        &self,
+        &mut self,
         task_id: &str,
         user_input: &str,
     ) -> Option<DecisioningTurnPlan> {
@@ -3077,6 +3316,12 @@ where
             .map(|(index, tool)| (tool.name.clone(), index))
             .collect::<BTreeMap<_, _>>();
 
+        // Difficulty gate: for complex tasks, enrich the heuristic plan with a
+        // real model-driven planning pass via the Planning route. The heuristic
+        // plan remains the base; the model output is advisory guidance only.
+        let model_planning_guidance =
+            self.maybe_model_plan(task_id, user_input, &decisioning_task, &snapshot);
+
         Some(DecisioningTurnPlan {
             engine: decisioning_engine,
             task: decisioning_task,
@@ -3086,7 +3331,55 @@ where
             next_execution_event_offset,
             selected_positions,
             workspace_evidence_stage_active: user_requests_current_workspace_analysis(user_input),
+            model_planning_guidance,
         })
+    }
+
+    /// When the task is complex enough (per `planning_complexity_threshold`),
+    /// ask the model (Planning route) for a short, concrete plan to augment the
+    /// heuristic decomposition. Returns `None` when the gate is disabled, the
+    /// task is below threshold, or the model call fails — in every case the
+    /// heuristic plan still stands on its own.
+    fn maybe_model_plan(
+        &mut self,
+        task_id: &str,
+        user_input: &str,
+        task: &Task,
+        snapshot: &DecisioningSnapshot,
+    ) -> Option<String> {
+        let threshold = self.decisioning_config.planning_complexity_threshold();
+        if threshold == 0 || task.complexity < threshold {
+            return None;
+        }
+        let route = self.select_model_route_for_task(task_id, crate::ModelRoutePhase::Planning);
+        let heuristic_steps = snapshot
+            .plan
+            .steps
+            .iter()
+            .map(|step| format!("- {}: {}", step.id, step.title))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let request = ApiRequest {
+            system_prompt: vec![PLANNING_SYSTEM_PROMPT.to_string()],
+            messages: vec![ConversationMessage::user_text(format!(
+                "Task (complexity {}/5): {user_input}\n\nA heuristic pre-plan proposed these steps:\n{heuristic_steps}\n\nProduce a short, concrete execution plan (3-7 ordered steps) that improves on the heuristic where useful. Note risks and the recommended order. Be specific to this task.",
+                task.complexity
+            ))],
+            model_route: Some(route),
+        };
+        let events = self.api_client.stream(request).ok()?;
+        let mut text = String::new();
+        for event in events {
+            if let AssistantEvent::TextDelta(delta) = event {
+                text.push_str(&delta);
+            }
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        }
     }
 
     fn format_initial_decisioning_prompt(plan: &DecisioningTurnPlan) -> String {
@@ -3117,7 +3410,7 @@ where
         } else {
             selected_tools.join(", ")
         };
-        format!(
+        let mut prompt = format!(
             "# Advisory task plan\nThis capability-aware plan was generated before the first model step. Treat it as guidance, not permission escalation. Follow workspace evidence and permission requirements before answering.\n- Task id: {}\n- Execution mode: {}\n- Confidence: {:.0}%\n- Safety outcome: {:?} (risk {:.0}%)\n- Preferred tools: {}\n\n{}",
             plan.task.id,
             plan.snapshot.plan.execution_mode.label(),
@@ -3126,7 +3419,14 @@ where
             plan.snapshot.risk.score * 100.0,
             selected_summary,
             steps,
-        )
+        );
+        if let Some(guidance) = &plan.model_planning_guidance {
+            prompt.push_str(
+                "\n\n## Model planning guidance (high-complexity task)\nThe following plan was produced by the planning model. Use it to refine your approach; still gather evidence and respect permissions.\n",
+            );
+            prompt.push_str(guidance);
+        }
+        prompt
     }
 
     fn build_decisioning_turn_plan(
@@ -3179,6 +3479,9 @@ where
             selected_positions,
             workspace_evidence_stage_active: workspace_evidence_stage_active
                 && user_requests_current_workspace_analysis(user_input),
+            // Per-iteration plans rely on the heuristic; model planning runs
+            // once up front in build_initial_decisioning_plan.
+            model_planning_guidance: None,
         })
     }
 
@@ -3317,6 +3620,15 @@ where
         task_id: &str,
         phase: crate::ModelRoutePhase,
     ) -> ModelRouteDecision {
+        self.select_model_route_for_task_with_complexity(task_id, phase, None)
+    }
+
+    fn select_model_route_for_task_with_complexity(
+        &self,
+        task_id: &str,
+        phase: crate::ModelRoutePhase,
+        complexity: Option<u8>,
+    ) -> ModelRouteDecision {
         let mut feedback = self.workspace_route_feedback.clone();
         feedback.extend(
             self.task_registry
@@ -3324,7 +3636,9 @@ where
                 .map(|task| task.route_feedback)
                 .unwrap_or_default(),
         );
-        let decision = self.model_router.select_with_feedback(phase, &feedback);
+        let decision = self
+            .model_router
+            .select_with_feedback_and_context(phase, &feedback, complexity);
         if let Some(reporter) = &self.model_route_event_reporter {
             reporter.emit_model_route_event(&decision);
         }
@@ -4903,6 +5217,110 @@ mod tests {
                 if *scenario == crate::FailureScenario::CompileRedCrossCrate
         )));
     }
+
+    #[test]
+    fn bounded_recovery_redrive_lets_a_second_attempt_pass_verification() {
+        // A scripted client that fails verification on the first pass (no
+        // marker file yet), then on the re-drive calls a tool that creates the
+        // marker so the acceptance script passes on re-verification.
+        struct RedriveApiClient {
+            calls: usize,
+            marker: std::path::PathBuf,
+        }
+
+        impl ApiClient for RedriveApiClient {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    // First pass: claim done without satisfying the acceptance
+                    // test, so verification will fail and trigger recovery.
+                    1 => Ok(vec![
+                        AssistantEvent::TextDelta("first attempt".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // Re-drive pass: create the marker via a tool call.
+                    2 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: format!("fix-{}", self.calls),
+                            name: "create_marker".to_string(),
+                            input: format!(
+                                "{{\"path\":{}}}",
+                                serde_json::to_string(&self.marker.to_string_lossy().to_string())
+                                    .expect("marker path should serialize")
+                            ),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    // After the fix, stop requesting tools so verification runs
+                    // again — this time the marker exists and it passes.
+                    _ => Ok(vec![
+                        AssistantEvent::TextDelta("fixed and verified".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                }
+            }
+        }
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "himalaya-redrive-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after UNIX_EPOCH")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&workspace_root).expect("workspace should be created");
+        let marker = workspace_root.join("verified.marker");
+        // Acceptance test: a shell script that succeeds only once the marker exists.
+        let script_path = workspace_root.join("acceptance.sh");
+        fs::write(
+            &script_path,
+            format!("#!/bin/sh\ntest -f {}\n", marker.display()),
+        )
+        .expect("acceptance script should be written");
+
+        let packet = serde_json::json!({
+            "objective": "Create the marker and verify",
+            "scope": "runtime recovery",
+            "repo": "Himalaya",
+            "branch_policy": "no branch change",
+            "acceptance_tests": [format!("sh {}", script_path.display())],
+            "commit_policy": "no commit",
+            "reporting_contract": "report verification result",
+            "escalation_policy": "manual"
+        })
+        .to_string();
+
+        let marker_for_tool = marker.clone();
+        let mut runtime = ConversationRuntime::new(
+            Session::new().with_workspace_root(workspace_root.clone()),
+            RedriveApiClient {
+                calls: 0,
+                marker: marker.clone(),
+            },
+            StaticToolExecutor::new().register("create_marker", move |_input| {
+                fs::write(&marker_for_tool, "ok").expect("marker write should succeed");
+                Ok("marker created".to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn(packet, None)
+            .expect("bounded re-drive should let the second attempt pass verification");
+
+        // The turn re-drove at least once (more than one model call) and the
+        // marker the recovery pass created is present.
+        assert!(summary.iterations >= 2, "expected a re-drive iteration");
+        assert!(marker.exists(), "re-drive should have created the marker");
+
+        let _ = fs::remove_dir_all(&workspace_root);
+    }
+
     #[test]
     fn decisioning_keeps_workspace_analysis_in_evidence_stage() {
         struct WorkspaceStageApiClient {
@@ -5647,6 +6065,233 @@ mod tests {
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn auto_compaction_uses_model_summarization_route_when_available() {
+        use std::sync::{Arc, Mutex};
+
+        // Records the phase of each request so we can assert a Summarization
+        // request was issued during auto-compaction, and returns a recognizable
+        // summary for that phase.
+        #[derive(Clone)]
+        struct PhaseRecordingApi {
+            phases: Arc<Mutex<Vec<Option<String>>>>,
+        }
+        impl ApiClient for PhaseRecordingApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let phase = request
+                    .model_route
+                    .as_ref()
+                    .map(|route| format!("{:?}", route.phase));
+                self.phases
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(phase.clone());
+                if phase.as_deref() == Some("Summarization") {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "MODEL_SUMMARY: prior work captured.".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 120_000,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("one"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "four".to_string(),
+            }]),
+        ];
+
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            session,
+            PhaseRecordingApi {
+                phases: phases.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert!(summary.auto_compaction.is_some(), "compaction should occur");
+        // A Summarization-phase request was issued during compaction.
+        let recorded = phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|phase| phase.as_deref() == Some("Summarization")),
+            "expected a Summarization-route request, got: {recorded:?}"
+        );
+        // The model summary made it into the compacted system message.
+        let system_text = runtime.session().messages[0]
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(
+            system_text.contains("MODEL_SUMMARY: prior work captured."),
+            "expected model summary in continuation, got: {system_text}"
+        );
+    }
+
+    #[test]
+    fn difficulty_gate_invokes_planning_route_for_complex_tasks() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct PlanPhaseApi {
+            phases: Arc<Mutex<Vec<Option<String>>>>,
+        }
+        impl ApiClient for PlanPhaseApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let phase = request
+                    .model_route
+                    .as_ref()
+                    .map(|route| format!("{:?}", route.phase));
+                self.phases
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(phase.clone());
+                if phase.as_deref() == Some("Planning") {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "PLAN: 1. inspect 2. implement 3. test".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                // Coding phase: answer with final text (no tools) so the turn ends.
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(false)
+                .with_planning_complexity_threshold(4),
+        );
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            PlanPhaseApi {
+                phases: phases.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+
+        // A multi-capability request (implement + edit + test + verify) clamps
+        // to high complexity without triggering the workspace-analysis gate.
+        let _ = runtime
+            .run_turn(
+                "implement, refactor, write, test and verify the new payment feature",
+                None,
+            )
+            .expect("turn should succeed");
+
+        let recorded = phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|phase| phase.as_deref() == Some("Planning")),
+            "expected a Planning-route request for a complex task, got: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn difficulty_gate_skips_planning_for_simple_tasks() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct PlanPhaseApi {
+            phases: Arc<Mutex<Vec<Option<String>>>>,
+        }
+        impl ApiClient for PlanPhaseApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let phase = request
+                    .model_route
+                    .as_ref()
+                    .map(|route| format!("{:?}", route.phase));
+                self.phases
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(phase);
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(false)
+                .with_planning_complexity_threshold(4),
+        );
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            PlanPhaseApi {
+                phases: phases.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+
+        let _ = runtime.run_turn("hi", None).expect("turn should succeed");
+
+        let recorded = phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            !recorded
+                .iter()
+                .any(|phase| phase.as_deref() == Some("Planning")),
+            "simple task should not trigger the Planning route, got: {recorded:?}"
+        );
     }
 
     #[test]

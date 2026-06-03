@@ -94,6 +94,25 @@ pub fn get_compact_continuation_message(
 /// Compacts a session by summarizing older messages and preserving the recent tail.
 #[must_use]
 pub fn compact_session(session: &Session, config: CompactionConfig) -> CompactionResult {
+    // Heuristic-only path: no model summarizer supplied.
+    compact_session_with(session, config, |_removed| None)
+}
+
+/// Compacts a session like [`compact_session`], but allows a caller-supplied
+/// `summarizer` to produce a higher-fidelity summary of the removed messages
+/// (typically a model call via the Summarization route). The summarizer
+/// receives the messages being compacted away and returns `Some(text)` to use
+/// its summary, or `None` to fall back to the deterministic heuristic summary.
+///
+/// This is the seam that upgrades compaction from template/statistics-based
+/// summaries to model-driven ones without losing the deterministic fallback
+/// that keeps offline and test runs stable.
+#[must_use]
+pub fn compact_session_with(
+    session: &Session,
+    config: CompactionConfig,
+    summarizer: impl FnOnce(&[ConversationMessage]) -> Option<String>,
+) -> CompactionResult {
     if !should_compact(session, config) {
         return CompactionResult {
             summary: String::new(),
@@ -176,8 +195,15 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     };
     let removed = &session.messages[compacted_prefix_len..keep_from];
     let preserved = session.messages[keep_from..].to_vec();
-    let summary =
-        merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
+    // Prefer a model-produced summary when the summarizer returns one; fall
+    // back to the deterministic heuristic summary otherwise. The model summary
+    // is wrapped in the same <summary> envelope the heuristic uses so all
+    // downstream formatting (`format_compact_summary`, continuation message)
+    // works identically regardless of source.
+    let new_summary = summarizer(removed)
+        .map(|model_summary| wrap_model_summary(&model_summary))
+        .unwrap_or_else(|| summarize_messages(removed));
+    let summary = merge_compact_summaries(existing_summary.as_deref(), &new_summary);
     let formatted_summary = format_compact_summary(&summary);
     let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
 
@@ -334,6 +360,17 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
     }
     lines.push("</summary>".to_string());
     lines.join("\n")
+}
+
+/// Wrap a model-produced summary in the same `<summary>` envelope the heuristic
+/// summary uses, so downstream formatting is source-agnostic. If the model
+/// already wrapped its output in a `<summary>` block we reuse that inner text
+/// rather than double-wrapping.
+fn wrap_model_summary(model_summary: &str) -> String {
+    let inner = extract_tag_block(model_summary, "summary")
+        .map(|content| content.trim().to_string())
+        .unwrap_or_else(|| model_summary.trim().to_string());
+    format!("<summary>\n{inner}\n</summary>")
 }
 
 fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) -> String {
@@ -700,10 +737,73 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_key_files, compact_session, format_compact_summary,
+        collect_key_files, compact_session, compact_session_with, format_compact_summary,
         get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+
+    fn large_session() -> Session {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("one ".repeat(200)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two ".repeat(200),
+            }]),
+            ConversationMessage::tool_result("1", "bash", "ok ".repeat(200), false),
+            ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![ContentBlock::Text {
+                    text: "recent".to_string(),
+                }],
+                usage: None,
+            },
+        ];
+        session
+    }
+
+    #[test]
+    fn model_summarizer_output_is_used_when_present() {
+        let session = large_session();
+        let config = CompactionConfig {
+            preserve_recent_messages: 1,
+            max_estimated_tokens: 1,
+        };
+        let result = compact_session_with(&session, config, |removed| {
+            assert!(
+                !removed.is_empty(),
+                "summarizer should receive removed messages"
+            );
+            Some("Model-written summary of the earlier work.".to_string())
+        });
+
+        assert!(result.removed_message_count >= 1);
+        assert!(
+            result
+                .summary
+                .contains("Model-written summary of the earlier work."),
+            "expected model summary, got: {}",
+            result.summary
+        );
+        // The model summary is wrapped in the <summary> envelope so downstream
+        // formatting produces the same "Summary:" prefix as the heuristic path.
+        assert!(result.formatted_summary.contains("Model-written summary"));
+    }
+
+    #[test]
+    fn falls_back_to_heuristic_when_summarizer_returns_none() {
+        let session = large_session();
+        let config = CompactionConfig {
+            preserve_recent_messages: 1,
+            max_estimated_tokens: 1,
+        };
+        let model_result = compact_session_with(&session, config, |_removed| None);
+        let heuristic_result = compact_session(&session, config);
+
+        // With no model summary, compact_session_with must match the pure
+        // heuristic compact_session byte-for-byte.
+        assert_eq!(model_result.summary, heuristic_result.summary);
+        assert!(model_result.summary.contains("Conversation summary:"));
+    }
 
     #[test]
     fn formats_compact_summary_like_upstream() {

@@ -163,6 +163,11 @@ pub struct DecisioningConfig {
     emit_events: bool,
     max_parallelism: usize,
     safety_policy: DecisioningSafetyPolicyConfig,
+    /// Task complexity (1..=5) at or above which the initial plan is enriched
+    /// with a real model-driven planning pass (via the Planning route) instead
+    /// of relying on the heuristic decomposition alone. `0` disables the gate
+    /// (always heuristic-only); a value above 5 effectively never triggers it.
+    planning_complexity_threshold: u8,
 }
 
 impl Default for DecisioningConfig {
@@ -172,6 +177,10 @@ impl Default for DecisioningConfig {
             emit_events: true,
             max_parallelism: 2,
             safety_policy: DecisioningSafetyPolicyConfig::default(),
+            // Off by default: model-driven planning is opt-in so enabling the
+            // decisioning skeleton alone does not add a model call per turn.
+            // Set to 1..=5 to enable for tasks at/above that complexity.
+            planning_complexity_threshold: 0,
         }
     }
 }
@@ -680,6 +689,12 @@ impl DecisioningConfig {
     }
 
     #[must_use]
+    pub fn with_planning_complexity_threshold(mut self, threshold: u8) -> Self {
+        self.planning_complexity_threshold = threshold;
+        self
+    }
+
+    #[must_use]
     pub fn with_safety_thresholds(mut self, review_percent: u8, deny_percent: u8) -> Self {
         self.safety_policy = self
             .safety_policy
@@ -707,6 +722,12 @@ impl DecisioningConfig {
     #[must_use]
     pub fn max_parallelism(&self) -> usize {
         self.max_parallelism.max(1)
+    }
+
+    /// Task complexity at/above which model-driven planning enrichment runs.
+    #[must_use]
+    pub fn planning_complexity_threshold(&self) -> u8 {
+        self.planning_complexity_threshold
     }
 
     #[must_use]

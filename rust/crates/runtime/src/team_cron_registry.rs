@@ -229,6 +229,35 @@ impl CronRegistry {
         Ok(())
     }
 
+    /// Return enabled cron entries that are due to fire at `now_secs` (Unix
+    /// seconds, UTC): their schedule matches the current minute and they have
+    /// not already fired during this same minute. Entries with an unparseable
+    /// schedule are skipped. This is the deterministic core a scheduler runner
+    /// loop calls each tick; firing/recording is the caller's responsibility
+    /// (typically: run the prompt, then `record_run`).
+    #[must_use]
+    pub fn due_entries(&self, now_secs: u64) -> Vec<CronEntry> {
+        let now = crate::cron_schedule::civil_time_from_unix_secs(now_secs);
+        let current_minute_start = now_secs - (now_secs % 60);
+        let inner = self.inner.lock().expect("cron registry lock poisoned");
+        inner
+            .entries
+            .values()
+            .filter(|entry| entry.enabled)
+            .filter(|entry| {
+                // Skip if it already ran within the current minute window.
+                entry
+                    .last_run_at
+                    .is_none_or(|last| last < current_minute_start)
+            })
+            .filter(|entry| {
+                crate::cron_schedule::CronSchedule::parse(&entry.schedule)
+                    .is_some_and(|schedule| schedule.matches(now))
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn save_to_dir(&self, dir: &Path) -> io::Result<()> {
         let inner = self.inner.lock().expect("cron registry lock poisoned");
         fs::create_dir_all(dir)?;
@@ -372,6 +401,55 @@ mod tests {
         let fetched = registry.get(&entry.cron_id).unwrap();
         assert_eq!(fetched.run_count, 2);
         assert!(fetched.last_run_at.is_some());
+    }
+
+    #[test]
+    fn due_entries_selects_matching_schedules() {
+        // 2026-06-03 14:30:00 UTC (Wednesday).
+        let now = 1_780_497_000_u64;
+        let registry = CronRegistry::new();
+        let matching = registry.create("30 14 * * *", "Daily at 14:30", None);
+        let _non_matching = registry.create("0 9 * * *", "Daily at 09:00", None);
+        let every_minute = registry.create("* * * * *", "Every minute", None);
+
+        let due = registry.due_entries(now);
+        let due_ids = due.iter().map(|e| e.cron_id.as_str()).collect::<Vec<_>>();
+        assert!(due_ids.contains(&matching.cron_id.as_str()));
+        assert!(due_ids.contains(&every_minute.cron_id.as_str()));
+        assert_eq!(
+            due.len(),
+            2,
+            "only the two matching schedules should be due"
+        );
+    }
+
+    #[test]
+    fn due_entries_skips_disabled_and_already_run_this_minute() {
+        let now = 1_780_497_000_u64; // 14:30:00 UTC
+        let registry = CronRegistry::new();
+        let entry = registry.create("30 14 * * *", "Daily", None);
+
+        // Disabled entries are never due.
+        registry.disable(&entry.cron_id).unwrap();
+        assert!(registry.due_entries(now).is_empty());
+
+        // Re-enable by recreating; mark as already run within the current minute.
+        let entry2 = registry.create("30 14 * * *", "Daily2", None);
+        {
+            let mut inner = registry.inner.lock().unwrap();
+            inner.entries.get_mut(&entry2.cron_id).unwrap().last_run_at = Some(now);
+        }
+        assert!(
+            registry.due_entries(now).is_empty(),
+            "an entry already run this minute should not be due again"
+        );
+
+        // A run in a previous minute makes it due again.
+        {
+            let mut inner = registry.inner.lock().unwrap();
+            inner.entries.get_mut(&entry2.cron_id).unwrap().last_run_at = Some(now - 120);
+        }
+        assert_eq!(registry.due_entries(now).len(), 1);
     }
 
     #[test]

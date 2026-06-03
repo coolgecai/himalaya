@@ -929,6 +929,20 @@ impl TaskRegistry {
         Some(removed)
     }
 
+    /// Clear any recorded verification result so the next completion check
+    /// re-verifies against the current task state. Used by the bounded
+    /// fix-verify re-drive loop after a recovery attempt mutates the workspace.
+    pub fn clear_verification(&self, task_id: &str) -> Result<Task, String> {
+        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let task = inner
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        task.verification_result = None;
+        task.updated_at = now_secs();
+        Ok(task.clone())
+    }
+
     pub fn record_verification(
         &self,
         task_id: &str,

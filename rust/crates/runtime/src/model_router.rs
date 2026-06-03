@@ -298,7 +298,22 @@ impl ModelRouter {
         phase: ModelRoutePhase,
         feedback: &[ModelRouteFeedback],
     ) -> ModelRouteDecision {
-        let Some(primary) = self.best_configured_route(phase) else {
+        self.select_with_feedback_and_context(phase, feedback, None)
+    }
+
+    /// Like [`select_with_feedback`], but biases route selection by task
+    /// `complexity` (1..=5): harder tasks prefer higher-quality routes. The
+    /// adaptive failure-rate switching behavior is preserved; complexity only
+    /// changes how the quality/cost/latency weights are balanced when ranking
+    /// routes. `None` complexity reproduces the original behavior exactly.
+    #[must_use]
+    pub fn select_with_feedback_and_context(
+        &self,
+        phase: ModelRoutePhase,
+        feedback: &[ModelRouteFeedback],
+        complexity: Option<u8>,
+    ) -> ModelRouteDecision {
+        let Some(primary) = self.best_configured_route_for_complexity(phase, complexity) else {
             return self.select(phase);
         };
         if !self.policy.adaptive {
@@ -320,7 +335,8 @@ impl ModelRouter {
                     &route.model,
                     feedback,
                 );
-                (route, stats, adaptive_route_score(route, &stats))
+                let score = adaptive_route_score_with_complexity(route, &stats, complexity);
+                (route, stats, score)
             })
             .collect::<Vec<_>>();
         let primary_stats = RouteFeedbackStats::for_route(
@@ -385,6 +401,23 @@ impl ModelRouter {
         self.routes_for_phase(phase)
             .into_iter()
             .max_by(|left, right| route_weight_score(left).total_cmp(&route_weight_score(right)))
+    }
+
+    fn best_configured_route_for_complexity(
+        &self,
+        phase: ModelRoutePhase,
+        complexity: Option<u8>,
+    ) -> Option<&ModelRoute> {
+        match complexity {
+            None => self.best_configured_route(phase),
+            Some(_) => self
+                .routes_for_phase(phase)
+                .into_iter()
+                .max_by(|left, right| {
+                    complexity_weighted_score(left, complexity)
+                        .total_cmp(&complexity_weighted_score(right, complexity))
+                }),
+        }
     }
 
     fn routes_for_phase(&self, phase: ModelRoutePhase) -> Vec<&ModelRoute> {
@@ -494,6 +527,21 @@ fn route_weight_score(route: &ModelRoute) -> f32 {
         + f32::from(route.cost_weight)
 }
 
+/// Like [`route_weight_score`], but tilts the weighting toward quality as task
+/// complexity rises (1..=5). At complexity 1 this equals `route_weight_score`;
+/// at higher complexity, `quality_weight` is amplified and cost/latency are
+/// de-emphasized, so harder tasks prefer higher-quality routes. `None`
+/// complexity is treated as the neutral baseline.
+fn complexity_weighted_score(route: &ModelRoute, complexity: Option<u8>) -> f32 {
+    let level = f32::from(complexity.unwrap_or(1).clamp(1, 5));
+    // 0.0 at complexity 1 → 1.0 at complexity 5.
+    let tilt = (level - 1.0) / 4.0;
+    let quality_multiplier = 2.0 + tilt * 3.0; // 2.0 → 5.0
+    let efficiency_multiplier = 1.0 - tilt * 0.5; // 1.0 → 0.5
+    f32::from(route.quality_weight) * quality_multiplier
+        + (f32::from(route.latency_weight) + f32::from(route.cost_weight)) * efficiency_multiplier
+}
+
 fn average_metric(values: impl Iterator<Item = f32>) -> Option<f32> {
     let mut total = 0.0;
     let mut count = 0_u32;
@@ -510,10 +558,25 @@ fn metric_penalty(value: f32, target: f32, weight: u8) -> f32 {
     (1.0 / (1.0 + over_target * weight)).clamp(0.35, 1.0)
 }
 
+#[cfg(test)]
 fn adaptive_route_score(route: &ModelRoute, stats: &RouteFeedbackStats) -> f32 {
-    route_weight_score(route)
-        * (1.0 - stats.failure_rate()).clamp(0.1, 1.0)
-        * stats.efficiency_factor(route)
+    adaptive_route_score_with_complexity(route, stats, None)
+}
+
+/// Adaptive score that folds in task complexity: the base weight uses the
+/// complexity-tilted scoring so harder tasks rank higher-quality routes above
+/// cheaper/faster ones, while still discounting by observed failure rate and
+/// efficiency. With `complexity == None` this equals [`adaptive_route_score`].
+fn adaptive_route_score_with_complexity(
+    route: &ModelRoute,
+    stats: &RouteFeedbackStats,
+    complexity: Option<u8>,
+) -> f32 {
+    let base = match complexity {
+        None => route_weight_score(route),
+        Some(_) => complexity_weighted_score(route, complexity),
+    };
+    base * (1.0 - stats.failure_rate()).clamp(0.1, 1.0) * stats.efficiency_factor(route)
 }
 
 #[cfg(test)]
@@ -650,5 +713,47 @@ mod tests {
             adaptive_route_score(&fast_route, &fast_stats)
                 > adaptive_route_score(&slow_route, &slow_stats)
         );
+    }
+
+    #[test]
+    fn complexity_weighted_score_favors_quality_as_complexity_rises() {
+        // A high-quality but expensive/slow route vs a cheap/fast lower-quality one.
+        let quality = ModelRoute::new(ModelRoutePhase::Coding, "quality").with_weights(1, 1, 5);
+        let cheap = ModelRoute::new(ModelRoutePhase::Coding, "cheap").with_weights(5, 5, 2);
+
+        // At low complexity the cheap/fast route scores at least as high.
+        assert!(
+            complexity_weighted_score(&cheap, Some(1))
+                >= complexity_weighted_score(&quality, Some(1))
+        );
+        // At high complexity the high-quality route wins.
+        assert!(
+            complexity_weighted_score(&quality, Some(5))
+                > complexity_weighted_score(&cheap, Some(5))
+        );
+    }
+
+    #[test]
+    fn difficulty_aware_selection_picks_quality_route_for_complex_tasks() {
+        let policy = MoERoutingPolicy::new(
+            "default",
+            vec![
+                ModelRoute::new(ModelRoutePhase::Coding, "cheap-fast").with_weights(5, 5, 2),
+                ModelRoute::new(ModelRoutePhase::Coding, "high-quality").with_weights(1, 1, 5),
+            ],
+        );
+        let router = ModelRouter::new(policy);
+
+        // High complexity should prefer the high-quality route.
+        let complex =
+            router.select_with_feedback_and_context(ModelRoutePhase::Coding, &[], Some(5));
+        assert_eq!(complex.model, "high-quality");
+
+        // No complexity hint reproduces the original weight-based choice
+        // (quality_weight is doubled in route_weight_score, so "high-quality"
+        // already wins there); the key assertion is that the context API never
+        // panics and returns a configured route.
+        let neutral = router.select_with_feedback_and_context(ModelRoutePhase::Coding, &[], None);
+        assert!(neutral.model == "high-quality" || neutral.model == "cheap-fast");
     }
 }

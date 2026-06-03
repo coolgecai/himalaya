@@ -13,6 +13,7 @@ mod compact;
 mod config;
 pub mod config_validate;
 mod conversation;
+pub mod cron_schedule;
 mod decisioning;
 pub mod execution_scheduler;
 pub mod failure_classifier;
