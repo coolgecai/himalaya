@@ -51,6 +51,7 @@ pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;
 pub mod stale_branch;
+pub mod structured_execution;
 pub mod summary_compression;
 pub mod task_execution_engine;
 pub mod task_packet;

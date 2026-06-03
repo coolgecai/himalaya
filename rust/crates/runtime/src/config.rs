@@ -168,6 +168,12 @@ pub struct DecisioningConfig {
     /// of relying on the heuristic decomposition alone. `0` disables the gate
     /// (always heuristic-only); a value above 5 effectively never triggers it.
     planning_complexity_threshold: u8,
+    /// Task complexity (1..=5) at or above which the turn runs the structured
+    /// execution path (decompose into a DAG, dispatch nodes, verify each node)
+    /// instead of the single-shot agentic loop. `0` disables it (always
+    /// single-shot). Requires `enabled`. Opt-in so behavior is unchanged by
+    /// default.
+    structured_execution_threshold: u8,
 }
 
 impl Default for DecisioningConfig {
@@ -181,6 +187,8 @@ impl Default for DecisioningConfig {
             // decisioning skeleton alone does not add a model call per turn.
             // Set to 1..=5 to enable for tasks at/above that complexity.
             planning_complexity_threshold: 0,
+            // Off by default: structured DAG execution is opt-in.
+            structured_execution_threshold: 0,
         }
     }
 }
@@ -695,6 +703,12 @@ impl DecisioningConfig {
     }
 
     #[must_use]
+    pub fn with_structured_execution_threshold(mut self, threshold: u8) -> Self {
+        self.structured_execution_threshold = threshold;
+        self
+    }
+
+    #[must_use]
     pub fn with_safety_thresholds(mut self, review_percent: u8, deny_percent: u8) -> Self {
         self.safety_policy = self
             .safety_policy
@@ -728,6 +742,21 @@ impl DecisioningConfig {
     #[must_use]
     pub fn planning_complexity_threshold(&self) -> u8 {
         self.planning_complexity_threshold
+    }
+
+    /// Task complexity at/above which the structured DAG execution path runs.
+    /// `0` keeps the single-shot agentic loop for every turn.
+    #[must_use]
+    pub fn structured_execution_threshold(&self) -> u8 {
+        self.structured_execution_threshold
+    }
+
+    /// Whether a task of the given complexity should use structured execution.
+    #[must_use]
+    pub fn uses_structured_execution(&self, complexity: u8) -> bool {
+        self.enabled
+            && self.structured_execution_threshold > 0
+            && complexity >= self.structured_execution_threshold
     }
 
     #[must_use]

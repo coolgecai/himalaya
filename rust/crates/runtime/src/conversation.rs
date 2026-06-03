@@ -2232,6 +2232,17 @@ where
             self.build_initial_decisioning_plan(&runtime_task_id, &user_input)
         {
             task_complexity = Some(initial_plan.task.complexity);
+            // Stage 0: assess whether this turn is eligible for structured DAG
+            // execution. The decision is recorded for observability but does
+            // not yet divert control flow — later stages consume it. When the
+            // gate is off (default) this is always Disabled.
+            let feasibility = crate::structured_execution::assess_feasibility(
+                self.decisioning_config.enabled(),
+                self.decisioning_config.structured_execution_threshold(),
+                initial_plan.task.complexity,
+                &initial_plan.snapshot.plan,
+            );
+            self.record_structured_feasibility(&runtime_task_id, &feasibility);
             effective_system_prompt.push(Self::format_initial_decisioning_prompt(&initial_plan));
         }
         if let Some(memory_override) = format_user_memory_override(&user_memory_facts) {
@@ -3483,6 +3494,24 @@ where
             // once up front in build_initial_decisioning_plan.
             model_planning_guidance: None,
         })
+    }
+
+    fn record_structured_feasibility(
+        &self,
+        task_id: &str,
+        feasibility: &crate::structured_execution::StructuredFeasibility,
+    ) {
+        let Some(session_tracer) = &self.session_tracer else {
+            return;
+        };
+        let mut attributes = Map::new();
+        attributes.insert("task_id".to_string(), Value::String(task_id.to_string()));
+        attributes.insert(
+            "eligible".to_string(),
+            Value::Bool(feasibility.is_eligible()),
+        );
+        attributes.insert("reason".to_string(), Value::String(feasibility.reason()));
+        session_tracer.record("structured_execution_feasibility", attributes);
     }
 
     fn record_decisioning_snapshot(&self, snapshot: &DecisioningSnapshot) {
