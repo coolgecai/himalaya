@@ -3738,6 +3738,7 @@ where
                 node,
                 None,
             )
+            .map(|(text, _route)| text)
             .unwrap_or_else(|| format!("Implement step '{}' directly.", node.title));
         // Record the architect's brief as a team event so the role dialogue is
         // captured in the TeamExecutionLedger / runtime event stream.
@@ -3757,7 +3758,7 @@ where
                 ),
                 None => format!("Approach brief: {brief}"),
             };
-            let Some(output) = self.run_team_role_turn(
+            let Some((output, exec_route)) = self.run_team_role_turn(
                 task_id,
                 crate::team_convergence::ConvergenceRole::Executor,
                 user_input,
@@ -3801,6 +3802,23 @@ where
                         crate::TeamExecutionEventKind::VerificationFailed,
                         format!("[{}] reviewer requested changes: {}", node.id, reasons),
                     );
+                    // Stage 4: record the executor route as failed so the next
+                    // round's route selection can escalate this node's Executor
+                    // to a higher-quality Coding route when alternates exist.
+                    let _ = self.task_registry.update_latest_route_feedback(
+                        task_id,
+                        crate::ModelRouteFeedback::pending(
+                            task_id.to_string(),
+                            exec_route,
+                            current_time_millis() / 1_000,
+                        )
+                        .with_outcome(
+                            false,
+                            Some(false),
+                            true,
+                            Some(reasons.clone()),
+                        ),
+                    );
                     prior_reasons = Some(reasons);
                 }
             }
@@ -3830,6 +3848,8 @@ where
 
     /// Run one role's focused sub-turn for a node, routed by the role's phase.
     /// `extra` carries role-specific context (the brief, prior review reasons).
+    /// Returns the role's text output and the route used (so the caller can
+    /// record per-role route feedback for adaptive escalation).
     fn run_team_role_turn(
         &mut self,
         task_id: &str,
@@ -3837,7 +3857,7 @@ where
         user_input: &str,
         node: &crate::structured_execution::ExecutionNode,
         extra: Option<String>,
-    ) -> Option<String> {
+    ) -> Option<(String, ModelRouteDecision)> {
         let phase = role.team_role().route_phase();
         let route = self.select_model_route_for_task_with_complexity(
             task_id,
@@ -3862,7 +3882,7 @@ where
         let request = ApiRequest {
             system_prompt: vec![system_prompt.to_string()],
             messages: vec![ConversationMessage::user_text(prompt)],
-            model_route: Some(route),
+            model_route: Some(route.clone()),
         };
         let events = self.api_client.stream(request).ok()?;
         let mut text = String::new();
@@ -3875,7 +3895,7 @@ where
         if text.is_empty() {
             None
         } else {
-            Some(text.to_string())
+            Some((text.to_string(), route))
         }
     }
 
@@ -3903,7 +3923,7 @@ where
         );
         match review {
             None => crate::team_convergence::ReviewVerdict::Approve,
-            Some(text) => {
+            Some((text, _route)) => {
                 let upper = text.to_ascii_uppercase();
                 if upper.contains("REQUEST_CHANGES") || upper.contains("CHANGES NEEDED") {
                     crate::team_convergence::ReviewVerdict::RequestChanges { reasons: text }
@@ -7779,6 +7799,135 @@ mod tests {
                 .iter()
                 .any(|e| e.role == crate::TeamRole::Reviewer),
             "reviewer verdict should be recorded"
+        );
+    }
+
+    #[test]
+    fn team_convergence_escalates_executor_route_after_repeated_rejections() {
+        use std::sync::{Arc, Mutex};
+
+        // The reviewer rejects the first two executor attempts, then approves.
+        // With a two-route Coding policy, the escalation feedback should move a
+        // later executor attempt onto the high-quality route.
+        #[derive(Clone)]
+        struct EscalateApi {
+            exec_models: Arc<Mutex<Vec<String>>>,
+            reviews: Arc<Mutex<usize>>,
+        }
+        impl ApiClient for EscalateApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let phase = request
+                    .model_route
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.phase))
+                    .unwrap_or_default();
+                let model = request
+                    .model_route
+                    .as_ref()
+                    .map(|r| r.model.clone())
+                    .unwrap_or_default();
+                let user_text = request
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.blocks.iter())
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                if phase == "Planning" && !user_text.contains("Role: architect") {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "{\"steps\":[{\"id\":\"core\",\"title\":\"Core\",\"estimated_effort\":5}]}".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if user_text.contains("Role: executor") {
+                    self.exec_models
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(model);
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("attempt".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if user_text.contains("Role: reviewer") {
+                    let mut reviews = self
+                        .reviews
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *reviews += 1;
+                    let verdict = if *reviews < 3 {
+                        "REQUEST_CHANGES: not yet"
+                    } else {
+                        "APPROVE"
+                    };
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(verdict.to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(false)
+                .with_structured_execution_threshold(3)
+                .with_team_convergence_threshold(4),
+        );
+        // Two Coding routes; Verification + Planning routes for the other roles.
+        let policy = crate::MoERoutingPolicy::new(
+            "default",
+            vec![
+                crate::ModelRoute::new(crate::ModelRoutePhase::Coding, "cheap-fast")
+                    .with_weights(5, 5, 5),
+                crate::ModelRoute::new(crate::ModelRoutePhase::Coding, "high-quality")
+                    .with_weights(1, 1, 4),
+                crate::ModelRoute::new(crate::ModelRoutePhase::Planning, "planner"),
+                crate::ModelRoute::new(crate::ModelRoutePhase::Verification, "reviewer-model"),
+            ],
+        )
+        .with_adaptive(true, 1, 50);
+        let exec_models = Arc::new(Mutex::new(Vec::new()));
+        let reviews = Arc::new(Mutex::new(0usize));
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            EscalateApi {
+                exec_models: exec_models.clone(),
+                reviews: reviews.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        )
+        .with_model_router(crate::ModelRouter::new(policy))
+        .with_max_recovery_attempts(4);
+
+        let _ = runtime
+            .run_turn(
+                "implement, refactor, write, test and verify the core engine",
+                None,
+            )
+            .expect("turn should succeed");
+
+        let models = exec_models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // After repeated rejections, an executor attempt escalated to the
+        // high-quality route.
+        assert!(
+            models.iter().any(|m| m == "high-quality"),
+            "executor should escalate to high-quality after rejections, got: {models:?}"
         );
     }
 }
