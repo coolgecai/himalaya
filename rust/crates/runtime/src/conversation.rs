@@ -775,6 +775,12 @@ const STRUCTURED_PLAN_SYSTEM_PROMPT: &str = "You are the planning model for a co
 
 const STRUCTURED_NODE_SYSTEM_PROMPT: &str = "You are executing one step of a larger structured plan for a coding agent. Focus only on the named step and its goal; do not attempt the whole task. Produce a concise, concrete result for this step that downstream steps can build on.";
 
+const TEAM_ARCHITECT_SYSTEM_PROMPT: &str = "You are the Architect in a multi-role coding team. For the given step, produce a short, concrete approach brief: the intended solution shape, key decisions, and risks to watch. Do not implement; just set direction in a few sentences.";
+
+const TEAM_EXECUTOR_SYSTEM_PROMPT: &str = "You are the Executor in a multi-role coding team. Implement the given step following the architect's brief and addressing any reviewer feedback. Produce the concrete result/output for this step in a few sentences.";
+
+const TEAM_REVIEWER_SYSTEM_PROMPT: &str = "You are the Reviewer in a multi-role coding team. Judge whether the executor's result satisfies the step and the brief. Reply 'APPROVE' if it does; otherwise reply 'REQUEST_CHANGES: <specific reasons>'. Be concise and concrete.";
+
 /// Extract the first balanced top-level JSON object from text that may include
 /// prose or ```json code fences around it. Returns `None` if no `{...}` span is
 /// found. Used to recover a structured plan from a chatty model response.
@@ -3569,19 +3575,32 @@ where
         let acceptance: std::collections::HashMap<String, Vec<String>> =
             validated.acceptance.iter().cloned().collect();
         let max_node_recovery = self.max_recovery_attempts;
+        let team_convergence = self.decisioning_config.clone();
 
         // Bound total node dispatches as a runaway guard.
         let max_nodes = dag.nodes.len().saturating_add(1);
         let outcome =
             crate::structured_execution::dispatch_plan(&dag, &mut execution, max_nodes, |node| {
                 let node_acceptance = acceptance.get(&node.id).cloned().unwrap_or_default();
-                let result = self.execute_structured_node_verified(
-                    task_id,
-                    user_input,
-                    node,
-                    &node_acceptance,
-                    max_node_recovery,
-                );
+                // High-effort nodes run the multi-role convergence loop; others
+                // run the single-Executor verified path from Stage 3.
+                let result = if team_convergence.uses_team_convergence(node.estimated_effort) {
+                    self.execute_structured_node_with_team(
+                        task_id,
+                        user_input,
+                        node,
+                        &node_acceptance,
+                        max_node_recovery,
+                    )
+                } else {
+                    self.execute_structured_node_verified(
+                        task_id,
+                        user_input,
+                        node,
+                        &node_acceptance,
+                        max_node_recovery,
+                    )
+                };
                 match result {
                     NodeRunResult::Succeeded { summary } => {
                         reports.push(format!("- {} ({}): {}", node.id, node.title, summary));
@@ -3685,6 +3704,168 @@ where
                         ),
                     );
                     attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// Run a node through the multi-role convergence loop: Architect drafts an
+    /// approach, Executor implements it, Reviewer approves or requests changes
+    /// (re-driving the Executor with the reasons), bounded by `max_rounds`
+    /// review cycles. On convergence the node succeeds; on exhaustion it falls
+    /// back to the Stage 3 single-Executor verified path so a struggling node
+    /// still gets the standard recovery treatment before failing.
+    ///
+    /// Implemented imperatively (sequential `self` sub-turns) rather than via
+    /// `drive_convergence` because each role sub-turn needs `&mut self`, which
+    /// cannot be held by three simultaneous closures. The control flow mirrors
+    /// `drive_convergence` (which carries the unit-tested pure logic).
+    fn execute_structured_node_with_team(
+        &mut self,
+        task_id: &str,
+        user_input: &str,
+        node: &crate::structured_execution::ExecutionNode,
+        acceptance: &[String],
+        max_rounds: usize,
+    ) -> NodeRunResult {
+        let rounds_budget = max_rounds.max(1);
+        // Architect: draft the approach once (Planning route).
+        let brief = self
+            .run_team_role_turn(
+                task_id,
+                crate::team_convergence::ConvergenceRole::Architect,
+                user_input,
+                node,
+                None,
+            )
+            .unwrap_or_else(|| format!("Implement step '{}' directly.", node.title));
+
+        let mut prior_reasons: Option<String> = None;
+        for _round in 0..rounds_budget {
+            // Executor: implement against the brief and any prior review reasons.
+            let exec_context = match &prior_reasons {
+                Some(reasons) => format!(
+                    "Approach brief: {brief}\n\nThe reviewer requested changes: {reasons}. Address them.",
+                ),
+                None => format!("Approach brief: {brief}"),
+            };
+            let Some(output) = self.run_team_role_turn(
+                task_id,
+                crate::team_convergence::ConvergenceRole::Executor,
+                user_input,
+                node,
+                Some(exec_context),
+            ) else {
+                prior_reasons = Some("executor produced no output".to_string());
+                continue;
+            };
+
+            // Reviewer: approve or request changes (Verification route).
+            let verdict = self.review_team_node(task_id, user_input, node, &brief, &output);
+            match verdict {
+                crate::team_convergence::ReviewVerdict::Approve => {
+                    // Reviewer approved; still honor objective acceptance checks.
+                    match self.verify_node_acceptance(task_id, node, acceptance) {
+                        NodeVerifyOutcome::Passed | NodeVerifyOutcome::Skipped => {
+                            return NodeRunResult::Succeeded { summary: output };
+                        }
+                        NodeVerifyOutcome::Failed { reason } => {
+                            prior_reasons = Some(format!("acceptance checks failed: {reason}"));
+                        }
+                    }
+                }
+                crate::team_convergence::ReviewVerdict::RequestChanges { reasons } => {
+                    prior_reasons = Some(reasons);
+                }
+            }
+        }
+
+        // Convergence exhausted — fall back to the Stage 3 verified path so the
+        // node gets the standard recovery treatment before being failed.
+        self.execute_structured_node_verified(task_id, user_input, node, acceptance, max_rounds)
+    }
+
+    /// Run one role's focused sub-turn for a node, routed by the role's phase.
+    /// `extra` carries role-specific context (the brief, prior review reasons).
+    fn run_team_role_turn(
+        &mut self,
+        task_id: &str,
+        role: crate::team_convergence::ConvergenceRole,
+        user_input: &str,
+        node: &crate::structured_execution::ExecutionNode,
+        extra: Option<String>,
+    ) -> Option<String> {
+        let phase = role.team_role().route_phase();
+        let route = self.select_model_route_for_task_with_complexity(
+            task_id,
+            phase,
+            Some(node.estimated_effort.max(1)),
+        );
+        let system_prompt = match role {
+            crate::team_convergence::ConvergenceRole::Architect => TEAM_ARCHITECT_SYSTEM_PROMPT,
+            crate::team_convergence::ConvergenceRole::Executor => TEAM_EXECUTOR_SYSTEM_PROMPT,
+            crate::team_convergence::ConvergenceRole::Reviewer => TEAM_REVIEWER_SYSTEM_PROMPT,
+        };
+        let mut prompt = format!(
+            "Overall task: {user_input}\n\nStep: {} — {}\nRole: {}",
+            node.id,
+            node.title,
+            role.label()
+        );
+        if let Some(extra) = extra {
+            prompt.push_str("\n\n");
+            prompt.push_str(&extra);
+        }
+        let request = ApiRequest {
+            system_prompt: vec![system_prompt.to_string()],
+            messages: vec![ConversationMessage::user_text(prompt)],
+            model_route: Some(route),
+        };
+        let events = self.api_client.stream(request).ok()?;
+        let mut text = String::new();
+        for event in events {
+            if let AssistantEvent::TextDelta(delta) = event {
+                text.push_str(&delta);
+            }
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        }
+    }
+
+    /// Reviewer sub-turn: returns Approve unless the review output signals a
+    /// change request (case-insensitive "REQUEST_CHANGES" / "changes needed").
+    /// A missing review defaults to Approve so a silent reviewer does not wedge
+    /// the loop (acceptance checks still gate success).
+    fn review_team_node(
+        &mut self,
+        task_id: &str,
+        user_input: &str,
+        node: &crate::structured_execution::ExecutionNode,
+        brief: &str,
+        output: &str,
+    ) -> crate::team_convergence::ReviewVerdict {
+        let context = format!(
+            "Approach brief: {brief}\n\nExecutor result to review:\n{output}\n\nReply 'APPROVE' if the result satisfies the step, otherwise reply 'REQUEST_CHANGES: <reasons>'.",
+        );
+        let review = self.run_team_role_turn(
+            task_id,
+            crate::team_convergence::ConvergenceRole::Reviewer,
+            user_input,
+            node,
+            Some(context),
+        );
+        match review {
+            None => crate::team_convergence::ReviewVerdict::Approve,
+            Some(text) => {
+                let upper = text.to_ascii_uppercase();
+                if upper.contains("REQUEST_CHANGES") || upper.contains("CHANGES NEEDED") {
+                    crate::team_convergence::ReviewVerdict::RequestChanges { reasons: text }
+                } else {
+                    crate::team_convergence::ReviewVerdict::Approve
                 }
             }
         }
@@ -7305,6 +7486,145 @@ mod tests {
         assert!(
             models.iter().any(|m| m == "high-quality"),
             "high-effort node should route to the high-quality model, got: {models:?}"
+        );
+    }
+
+    #[test]
+    fn team_convergence_runs_three_roles_and_redrives_executor_on_rejection() {
+        use std::sync::{Arc, Mutex};
+
+        // Records each role sub-turn by phase, and makes the reviewer reject
+        // once before approving so the executor re-drives.
+        #[derive(Clone)]
+        struct TeamApi {
+            phases: Arc<Mutex<Vec<String>>>,
+            reviews: Arc<Mutex<usize>>,
+        }
+        impl ApiClient for TeamApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let phase = request
+                    .model_route
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.phase))
+                    .unwrap_or_default();
+                let user_text = request
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.blocks.iter())
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+
+                // Planning is used for the structured plan AND the architect.
+                // Distinguish by the architect role marker in the prompt.
+                if phase == "Planning" && !user_text.contains("Role: architect") {
+                    // Structured plan: one high-effort node.
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "{\"steps\":[{\"id\":\"core\",\"title\":\"Core work\",\"estimated_effort\":5}]}".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+
+                // Record role phases for the node convergence.
+                if user_text.contains("Role: architect") {
+                    self.phases
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push("architect".to_string());
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("brief: do X".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if user_text.contains("Role: executor") {
+                    self.phases
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push("executor".to_string());
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("implemented X".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if user_text.contains("Role: reviewer") {
+                    self.phases
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push("reviewer".to_string());
+                    let mut reviews = self
+                        .reviews
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *reviews += 1;
+                    let verdict = if *reviews < 2 {
+                        "REQUEST_CHANGES: tighten the edge case"
+                    } else {
+                        "APPROVE"
+                    };
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(verdict.to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+
+                // Main loop completion.
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(false)
+                .with_structured_execution_threshold(3)
+                .with_team_convergence_threshold(4),
+        );
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let reviews = Arc::new(Mutex::new(0usize));
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            TeamApi {
+                phases: phases.clone(),
+                reviews: reviews.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+
+        let _ = runtime
+            .run_turn(
+                "implement, refactor, write, test and verify the core engine",
+                None,
+            )
+            .expect("turn should succeed");
+
+        let recorded = phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // All three roles were invoked.
+        assert!(
+            recorded.contains(&"architect".to_string()),
+            "architect ran: {recorded:?}"
+        );
+        assert!(
+            recorded.contains(&"reviewer".to_string()),
+            "reviewer ran: {recorded:?}"
+        );
+        // Executor ran at least twice (initial + re-drive after rejection).
+        let executor_runs = recorded.iter().filter(|r| *r == "executor").count();
+        assert!(
+            executor_runs >= 2,
+            "executor should re-drive after rejection, ran {executor_runs} times: {recorded:?}"
         );
     }
 }
