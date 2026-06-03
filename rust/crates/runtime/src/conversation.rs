@@ -3739,6 +3739,14 @@ where
                 None,
             )
             .unwrap_or_else(|| format!("Implement step '{}' directly.", node.title));
+        // Record the architect's brief as a team event so the role dialogue is
+        // captured in the TeamExecutionLedger / runtime event stream.
+        self.emit_node_role_event(
+            task_id,
+            crate::TeamRole::Planner,
+            crate::TeamExecutionEventKind::NodeStarted,
+            format!("[{}] architect brief: {}", node.id, brief),
+        );
 
         let mut prior_reasons: Option<String> = None;
         for _round in 0..rounds_budget {
@@ -3759,11 +3767,23 @@ where
                 prior_reasons = Some("executor produced no output".to_string());
                 continue;
             };
+            self.emit_node_role_event(
+                task_id,
+                crate::TeamRole::Implementer,
+                crate::TeamExecutionEventKind::NodeFinished,
+                format!("[{}] executor output: {}", node.id, output),
+            );
 
             // Reviewer: approve or request changes (Verification route).
             let verdict = self.review_team_node(task_id, user_input, node, &brief, &output);
             match verdict {
                 crate::team_convergence::ReviewVerdict::Approve => {
+                    self.emit_node_role_event(
+                        task_id,
+                        crate::TeamRole::Reviewer,
+                        crate::TeamExecutionEventKind::VerificationPassed,
+                        format!("[{}] reviewer approved", node.id),
+                    );
                     // Reviewer approved; still honor objective acceptance checks.
                     match self.verify_node_acceptance(task_id, node, acceptance) {
                         NodeVerifyOutcome::Passed | NodeVerifyOutcome::Skipped => {
@@ -3775,6 +3795,12 @@ where
                     }
                 }
                 crate::team_convergence::ReviewVerdict::RequestChanges { reasons } => {
+                    self.emit_node_role_event(
+                        task_id,
+                        crate::TeamRole::Reviewer,
+                        crate::TeamExecutionEventKind::VerificationFailed,
+                        format!("[{}] reviewer requested changes: {}", node.id, reasons),
+                    );
                     prior_reasons = Some(reasons);
                 }
             }
@@ -3783,6 +3809,23 @@ where
         // Convergence exhausted — fall back to the Stage 3 verified path so the
         // node gets the standard recovery treatment before being failed.
         self.execute_structured_node_verified(task_id, user_input, node, acceptance, max_rounds)
+    }
+
+    /// Emit one role-dialogue event for a structured node into the team ledger
+    /// and runtime event stream, so multi-role convergence is observable.
+    fn emit_node_role_event(
+        &self,
+        task_id: &str,
+        role: crate::TeamRole,
+        kind: crate::TeamExecutionEventKind,
+        message: String,
+    ) {
+        let mut ledger = TeamExecutionLedger::new(
+            format!("team-{}", self.session.session_id),
+            task_id.to_string(),
+        );
+        let event = ledger.push(role, kind, None, Some(message));
+        self.emit_team_execution_event_for_task(task_id, event);
     }
 
     /// Run one role's focused sub-turn for a node, routed by the role's phase.
@@ -7625,6 +7668,117 @@ mod tests {
         assert!(
             executor_runs >= 2,
             "executor should re-drive after rejection, ran {executor_runs} times: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn team_convergence_records_role_dialogue_in_event_stream() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct TeamApi;
+        impl ApiClient for TeamApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let phase = request
+                    .model_route
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.phase))
+                    .unwrap_or_default();
+                let user_text = request
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.blocks.iter())
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                if phase == "Planning" && !user_text.contains("Role: architect") {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "{\"steps\":[{\"id\":\"core\",\"title\":\"Core\",\"estimated_effort\":5}]}".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                let reply = if user_text.contains("Role: reviewer") {
+                    "APPROVE"
+                } else {
+                    "ok"
+                };
+                Ok(vec![
+                    AssistantEvent::TextDelta(reply.to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        struct TeamEventRecorder {
+            events: Arc<Mutex<Vec<crate::TeamExecutionEvent>>>,
+        }
+        impl crate::RuntimeEventReporter for TeamEventRecorder {
+            fn emit_runtime_event(&self, event: &crate::RuntimeEvent) {
+                if let crate::RuntimeEvent::TeamExecution(team_event) = event {
+                    self.events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(team_event.clone());
+                }
+            }
+        }
+
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(false)
+                .with_structured_execution_threshold(3)
+                .with_team_convergence_threshold(4),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            TeamApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        )
+        .with_runtime_event_reporter(TeamEventRecorder {
+            events: events.clone(),
+        });
+
+        let _ = runtime
+            .run_turn(
+                "implement, refactor, write, test and verify the core engine",
+                None,
+            )
+            .expect("turn should succeed");
+
+        let team_events = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // The three role roles appear in the recorded team-execution dialogue.
+        assert!(
+            team_events
+                .iter()
+                .any(|e| e.role == crate::TeamRole::Planner
+                    && e.message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("architect brief"))),
+            "architect brief should be recorded: {team_events:?}"
+        );
+        assert!(
+            team_events
+                .iter()
+                .any(|e| e.role == crate::TeamRole::Implementer),
+            "executor output should be recorded"
+        );
+        assert!(
+            team_events
+                .iter()
+                .any(|e| e.role == crate::TeamRole::Reviewer),
+            "reviewer verdict should be recorded"
         );
     }
 }
