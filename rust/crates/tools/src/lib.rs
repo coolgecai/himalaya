@@ -25,9 +25,9 @@ use runtime::{
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
-    ToolError, ToolExecutor,
+    LaneEventStatus, LaneFailureClass, LongTermMemory, McpDegradedReport, MemoryKind, MessageRole,
+    PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
+    Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -335,6 +335,10 @@ impl GlobalToolRegistry {
 
     pub fn set_enforcer(&mut self, enforcer: PermissionEnforcer) {
         self.enforcer = Some(enforcer);
+    }
+
+    pub fn enforce_tool_permission(&self, name: &str, input: &Value) -> Result<(), String> {
+        maybe_enforce_permission_check(self.enforcer.as_ref(), name, input)
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
@@ -1153,17 +1157,64 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
+        ToolSpec {
+            name: "ContextRead",
+            description: "Read persisted long-term memory entries for the current workspace, ranked by confidence and recency.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "topic": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1 }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "ContextWrite",
+            description: "Persist a long-term memory entry (topic + note) for the current workspace. Duplicate (topic, note) entries are deduped and confidence is upserted.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "topic": { "type": "string" },
+                    "note": { "type": "string" },
+                    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+                },
+                "required": ["topic", "note"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "ContextCompact",
+            description: "Compact persisted long-term memory by dropping entries whose confidence is below a threshold. Returns how many entries were removed.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "min_confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
     ]
 }
 
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
+///
+/// This is the dispatch-time safety net and runs *downstream* of the
+/// interactive prompter in `run_turn`. It defers to upstream approvals for
+/// promptable escalations (see
+/// [`PermissionEnforcer::check_allowing_prompted_escalation`]) and only blocks
+/// hard denials, so it never double-gates an escalation the user already
+/// approved.
 pub fn enforce_permission_check(
     enforcer: &PermissionEnforcer,
     tool_name: &str,
     input: &Value,
 ) -> Result<(), String> {
     let input_str = serde_json::to_string(input).unwrap_or_default();
-    let result = enforcer.check(tool_name, &input_str);
+    let result = enforcer.check_allowing_prompted_escalation(tool_name, &input_str);
 
     match result {
         EnforcementResult::Allowed => Ok(()),
@@ -1243,6 +1294,9 @@ fn execute_tool_with_enforcer(
         "McpAuth" => from_value::<McpAuthInput>(input).and_then(run_mcp_auth),
         "RemoteTrigger" => from_value::<RemoteTriggerInput>(input).and_then(run_remote_trigger),
         "MCP" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
+        "ContextRead" => from_value::<ContextReadInput>(input).and_then(run_context_read),
+        "ContextWrite" => from_value::<ContextWriteInput>(input).and_then(run_context_write),
+        "ContextCompact" => from_value::<ContextCompactInput>(input).and_then(run_context_compact),
         _ => Err(format!("unsupported tool: {name}")),
     }
 }
@@ -1792,6 +1846,106 @@ fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
 
 fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> {
     serde_json::from_value(input.clone()).map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextReadInput {
+    #[serde(default)]
+    topic: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextWriteInput {
+    topic: String,
+    note: String,
+    #[serde(default)]
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextCompactInput {
+    #[serde(default)]
+    min_confidence: Option<f32>,
+}
+
+/// Resolve the long-term memory store for the current working directory.
+///
+/// Walks up from the current directory looking for an existing `.Himalaya`
+/// workspace marker; falls back to the current directory so writes still land
+/// in a deterministic place under tests.
+fn context_memory() -> LongTermMemory {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let workspace_root = cwd
+        .ancestors()
+        .find(|dir| dir.join(".Himalaya").is_dir())
+        .unwrap_or(cwd.as_path());
+    LongTermMemory::load_for_workspace(Some(workspace_root))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_context_read(input: ContextReadInput) -> Result<String, String> {
+    let memory = context_memory();
+    let limit = input.limit.unwrap_or(20).max(1);
+    let entries: Vec<&runtime::MemoryEntry> = memory
+        .entries
+        .iter()
+        .filter(|entry| {
+            input
+                .topic
+                .as_ref()
+                .is_none_or(|topic| entry.topic == *topic)
+        })
+        .collect();
+    let mut ranked = entries;
+    ranked.sort_by(|left, right| {
+        right
+            .confidence
+            .partial_cmp(&left.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.ts_ms.cmp(&left.ts_ms))
+    });
+    ranked.truncate(limit);
+    to_pretty_json(json!({
+        "kind": "context_read",
+        "total_entries": memory.entries.len(),
+        "entries": ranked,
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_context_write(input: ContextWriteInput) -> Result<String, String> {
+    if input.topic.trim().is_empty() || input.note.trim().is_empty() {
+        return Err("ContextWrite requires non-empty topic and note".to_owned());
+    }
+    let mut memory = context_memory();
+    let before = memory.entries.len();
+    let confidence = input.confidence.unwrap_or(0.5);
+    memory.add_typed_entry(MemoryKind::General, input.topic, input.note, confidence);
+    let after = memory.entries.len();
+    // When the count did not grow, an existing entry was deduped/upserted.
+    let deduped = usize::from(after == before);
+    to_pretty_json(json!({
+        "kind": "context_write",
+        "total_entries": after,
+        "deduped_entries": deduped,
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_context_compact(input: ContextCompactInput) -> Result<String, String> {
+    let mut memory = context_memory();
+    let threshold = input.min_confidence.unwrap_or(0.1).clamp(0.0, 1.0);
+    let before = memory.entries.len();
+    memory.entries.retain(|entry| entry.confidence >= threshold);
+    let removed = before - memory.entries.len();
+    memory.save().map_err(|error| error.to_string())?;
+    to_pretty_json(json!({
+        "kind": "context_compact",
+        "total_entries": memory.entries.len(),
+        "removed_entries": removed,
+    }))
 }
 
 fn run_bash(input: BashCommandInput) -> Result<String, String> {
@@ -5505,6 +5659,95 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn context_tools_are_registered_with_expected_permissions() {
+        let specs = mvp_tool_specs();
+        for (name, expected) in [
+            ("ContextRead", PermissionMode::ReadOnly),
+            ("ContextWrite", PermissionMode::WorkspaceWrite),
+            ("ContextCompact", PermissionMode::WorkspaceWrite),
+        ] {
+            let spec = specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .unwrap_or_else(|| panic!("{name} should be a registered MVP tool"));
+            assert_eq!(
+                spec.required_permission, expected,
+                "{name} should require {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_write_rejects_empty_fields() {
+        let err = execute_tool("ContextWrite", &json!({ "topic": "", "note": "" }))
+            .expect_err("empty topic/note should be rejected");
+        assert!(err.contains("non-empty"), "should explain the rule: {err}");
+    }
+
+    #[test]
+    fn context_tools_round_trip_through_workspace_memory() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let original = std::env::current_dir().expect("cwd");
+        let original_home = std::env::var("HOME").ok();
+        let dir =
+            std::env::temp_dir().join(format!("himalaya-context-tool-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".Himalaya")).expect("workspace marker");
+        // Isolate HOME so the long-term-memory fallback (~/.Himalaya/knowledge.json)
+        // cannot contaminate the workspace store under test.
+        std::env::set_var("HOME", &dir);
+        std::env::set_current_dir(&dir).expect("enter workspace");
+
+        // Write two entries, the second a duplicate to exercise dedupe.
+        execute_tool(
+            "ContextWrite",
+            &json!({ "topic": "deploy", "note": "use staging first", "confidence": 0.4 }),
+        )
+        .expect("first write");
+        let dup = execute_tool(
+            "ContextWrite",
+            &json!({ "topic": "deploy", "note": "use staging first", "confidence": 0.9 }),
+        )
+        .expect("dup write");
+        assert!(
+            dup.contains("\"deduped_entries\": 1"),
+            "duplicate write should dedupe: {dup}"
+        );
+        assert!(
+            dup.contains("\"total_entries\": 1"),
+            "dedup keeps a single entry: {dup}"
+        );
+
+        let read = execute_tool("ContextRead", &json!({ "topic": "deploy" })).expect("read");
+        assert!(
+            read.contains("use staging first"),
+            "read should surface note: {read}"
+        );
+
+        // Dedupe upserted confidence to 0.9, so a 0.95 threshold drops it.
+        let compact =
+            execute_tool("ContextCompact", &json!({ "min_confidence": 0.95 })).expect("compact");
+        assert!(
+            compact.contains("\"removed_entries\": 1"),
+            "compaction should drop the sub-threshold entry: {compact}"
+        );
+        assert!(
+            compact.contains("\"total_entries\": 0"),
+            "store should be empty after compaction: {compact}"
+        );
+
+        std::env::set_current_dir(&original).expect("restore cwd");
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn temp_path(name: &str) -> PathBuf {
