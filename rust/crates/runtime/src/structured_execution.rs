@@ -12,8 +12,9 @@
 //! module owns the *pure, testable* structured-plan logic, and the runtime
 //! calls into it. Nothing here changes behavior unless the gate is on.
 
-use crate::decisioning::{Subtask, TaskPlan};
-use crate::PlanDag;
+use crate::decisioning::{ExecutionMode, Subtask, TaskPlan};
+use crate::{PlanDag, PlanDagEdge, PlanDagEdgeKind, PlanDagNode, PlanNodeKind};
+use serde::Deserialize;
 
 /// Why a turn did or did not take the structured execution path. Recorded so
 /// callers (and tests) can assert the gating decision without reaching into
@@ -146,6 +147,180 @@ pub fn execution_nodes_from_dag(dag: &PlanDag, plan: &TaskPlan) -> Vec<Execution
     nodes
 }
 
+/// One step as returned by the planning model's structured JSON output.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StructuredPlanStep {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub parallelizable: bool,
+    #[serde(default)]
+    pub estimated_effort: Option<u8>,
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// The planning model's full structured plan (the JSON shape it is asked to
+/// return). Parsed defensively: any structural problem yields `None` so the
+/// caller falls back to the heuristic decomposition.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StructuredPlan {
+    pub steps: Vec<StructuredPlanStep>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+/// A validated structured plan: the `TaskPlan` to record/execute, the explicit
+/// dependency edges, and the per-node acceptance criteria for Stage 3.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedStructuredPlan {
+    pub plan: TaskPlan,
+    pub dependencies: Vec<(String, String)>,
+    pub acceptance: Vec<(String, Vec<String>)>,
+}
+
+/// Parse and validate a model-produced structured plan JSON string into a
+/// `TaskPlan` plus explicit dependency edges. Returns `None` (→ heuristic
+/// fallback) when the JSON is malformed, empty, has duplicate/blank ids, or
+/// references a dependency id that is not a declared step. This strict
+/// validation keeps a hallucinated plan from corrupting the execution DAG.
+#[must_use]
+pub fn parse_structured_plan(task_id: &str, json: &str) -> Option<ValidatedStructuredPlan> {
+    let parsed: StructuredPlan = serde_json::from_str(json.trim()).ok()?;
+    if parsed.steps.is_empty() {
+        return None;
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for step in &parsed.steps {
+        let id = step.id.trim();
+        if id.is_empty() || step.title.trim().is_empty() {
+            return None;
+        }
+        if !ids.insert(id.to_string()) {
+            return None; // duplicate id
+        }
+    }
+    // Every dependency must reference a declared step, and a step may not
+    // depend on itself.
+    let mut dependencies = Vec::new();
+    for step in &parsed.steps {
+        for dep in &step.depends_on {
+            let dep = dep.trim();
+            if dep == step.id.trim() || !ids.contains(dep) {
+                return None;
+            }
+            dependencies.push((dep.to_string(), step.id.trim().to_string()));
+        }
+    }
+
+    let steps = parsed
+        .steps
+        .iter()
+        .map(|step| Subtask {
+            id: step.id.trim().to_string(),
+            title: step.title.trim().to_string(),
+            required_capabilities: step.capabilities.clone(),
+            candidate_tools: Vec::new(),
+            parallelizable: step.parallelizable,
+            estimated_effort: step.estimated_effort.unwrap_or(1).max(1),
+            notes: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+
+    let has_parallel = steps.iter().filter(|s| s.parallelizable).count() > 1;
+    let execution_mode = if has_parallel {
+        ExecutionMode::Parallel {
+            max_concurrency: steps.iter().filter(|s| s.parallelizable).count(),
+        }
+    } else {
+        ExecutionMode::Serial
+    };
+
+    let acceptance = parsed
+        .steps
+        .iter()
+        .filter(|step| !step.acceptance.is_empty())
+        .map(|step| (step.id.trim().to_string(), step.acceptance.clone()))
+        .collect::<Vec<_>>();
+
+    let plan = TaskPlan {
+        task_id: task_id.to_string(),
+        steps,
+        execution_mode,
+        confidence: 0.8,
+        notes: if parsed.notes.is_empty() {
+            vec!["Model-derived structured plan.".to_string()]
+        } else {
+            parsed.notes.clone()
+        },
+    };
+
+    Some(ValidatedStructuredPlan {
+        plan,
+        dependencies,
+        acceptance,
+    })
+}
+
+/// Build a `PlanDag` from a validated structured plan, honoring the explicit
+/// dependency edges (unlike `build_plan_dag`, which infers serial/parallel
+/// edges from the execution mode). A step with no explicit dependencies and no
+/// incoming edge is treated as ready from the start (depends only on the root).
+#[must_use]
+pub fn build_structured_dag(
+    task_id: &str,
+    title: &str,
+    validated: &ValidatedStructuredPlan,
+) -> PlanDag {
+    let root_id = task_id.to_string();
+    let mut nodes = vec![PlanDagNode {
+        kind: PlanNodeKind::Task,
+        id: root_id.clone(),
+        title: title.to_string(),
+        parallelizable: matches!(
+            validated.plan.execution_mode,
+            ExecutionMode::Parallel { .. }
+        ),
+        estimated_effort: 1,
+        candidate_tools: Vec::new(),
+        notes: validated.plan.notes.clone(),
+    }];
+    let mut edges = Vec::new();
+    for step in &validated.plan.steps {
+        nodes.push(PlanDagNode {
+            kind: PlanNodeKind::Step,
+            id: step.id.clone(),
+            title: step.title.clone(),
+            parallelizable: step.parallelizable,
+            estimated_effort: step.estimated_effort,
+            candidate_tools: step.candidate_tools.clone(),
+            notes: step.notes.clone(),
+        });
+        edges.push(PlanDagEdge {
+            from: root_id.clone(),
+            to: step.id.clone(),
+            kind: PlanDagEdgeKind::Contains,
+        });
+    }
+    for (from, to) in &validated.dependencies {
+        edges.push(PlanDagEdge {
+            from: from.clone(),
+            to: to.clone(),
+            kind: PlanDagEdgeKind::DependsOn,
+        });
+    }
+    PlanDag {
+        task_id: task_id.to_string(),
+        root_id,
+        nodes,
+        edges,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +418,68 @@ mod tests {
         // The analyze node is first and has no DependsOn predecessor.
         let analyze = nodes.iter().find(|n| n.id == "t-analyze").expect("node");
         assert!(analyze.depends_on.is_empty());
+    }
+
+    #[test]
+    fn parses_valid_structured_plan_with_dependencies() {
+        let json = r#"{
+            "steps": [
+                {"id": "design", "title": "Design API", "parallelizable": false, "estimated_effort": 2, "acceptance": ["cargo build"]},
+                {"id": "impl", "title": "Implement", "depends_on": ["design"], "parallelizable": true},
+                {"id": "test", "title": "Add tests", "depends_on": ["impl"], "acceptance": ["cargo test"]}
+            ],
+            "notes": ["model plan"]
+        }"#;
+        let validated = parse_structured_plan("task-1", json).expect("valid plan");
+        assert_eq!(validated.plan.steps.len(), 3);
+        assert_eq!(validated.dependencies.len(), 2);
+        assert!(validated
+            .dependencies
+            .contains(&("design".to_string(), "impl".to_string())));
+        // Acceptance criteria are carried for nodes that declared them.
+        assert_eq!(validated.acceptance.len(), 2);
+    }
+
+    #[test]
+    fn rejects_plan_with_unknown_or_self_dependency() {
+        let unknown = r#"{"steps":[{"id":"a","title":"A","depends_on":["ghost"]}]}"#;
+        assert!(parse_structured_plan("t", unknown).is_none());
+        let self_dep = r#"{"steps":[{"id":"a","title":"A","depends_on":["a"]}]}"#;
+        assert!(parse_structured_plan("t", self_dep).is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_or_empty_or_duplicate_plan() {
+        assert!(parse_structured_plan("t", "not json").is_none());
+        assert!(parse_structured_plan("t", r#"{"steps":[]}"#).is_none());
+        let dup = r#"{"steps":[{"id":"a","title":"A"},{"id":"a","title":"B"}]}"#;
+        assert!(parse_structured_plan("t", dup).is_none());
+        let blank = r#"{"steps":[{"id":"  ","title":"A"}]}"#;
+        assert!(parse_structured_plan("t", blank).is_none());
+    }
+
+    #[test]
+    fn builds_dag_honoring_explicit_dependencies() {
+        let json = r#"{
+            "steps": [
+                {"id": "a", "title": "A"},
+                {"id": "b", "title": "B", "depends_on": ["a"]}
+            ]
+        }"#;
+        let validated = parse_structured_plan("task-9", json).expect("valid");
+        let dag = build_structured_dag("task-9", "Ship it", &validated);
+        // root + 2 step nodes
+        assert_eq!(dag.nodes.len(), 3);
+        // Contains edges from root to each step + one DependsOn edge a->b.
+        let depends_on = dag
+            .edges
+            .iter()
+            .filter(|e| e.kind == crate::PlanDagEdgeKind::DependsOn)
+            .count();
+        assert_eq!(depends_on, 1);
+        assert!(dag
+            .edges
+            .iter()
+            .any(|e| e.from == "a" && e.to == "b" && e.kind == crate::PlanDagEdgeKind::DependsOn));
     }
 }

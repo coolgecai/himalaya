@@ -698,6 +698,34 @@ fn format_recovery_redrive_guidance(
     guidance
 }
 
+/// Render a validated structured plan as an advisory system-prompt section so
+/// the model is aware of the intended DAG of steps and their dependencies.
+fn format_structured_plan_prompt(
+    validated: &crate::structured_execution::ValidatedStructuredPlan,
+) -> String {
+    let mut out = String::from(
+        "# Structured execution plan\nThis task was decomposed into a dependency graph. Work through the steps respecting their dependencies; satisfy each step's acceptance criteria before moving on.\n",
+    );
+    for step in &validated.plan.steps {
+        let deps = validated
+            .dependencies
+            .iter()
+            .filter(|(_, to)| to == &step.id)
+            .map(|(from, _)| from.as_str())
+            .collect::<Vec<_>>();
+        let deps_label = if deps.is_empty() {
+            "none".to_string()
+        } else {
+            deps.join(", ")
+        };
+        out.push_str(&format!(
+            "- {} ({}): depends on [{}]\n",
+            step.id, step.title, deps_label
+        ));
+    }
+    out
+}
+
 /// Maximum characters of rendered transcript to send to the summarizer model.
 /// Bounds the cost/latency of compaction summarization on very large windows.
 const MODEL_SUMMARY_MAX_TRANSCRIPT_CHARS: usize = 24_000;
@@ -742,6 +770,43 @@ fn model_summarize_removed<C: ApiClient>(
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are compacting a long coding-agent conversation. Produce a concise, factual summary that preserves: the active objective, decisions made, files and symbols touched, important tool results (successes and failures), and concrete pending next steps. Do not invent details. Output only the summary text.";
 
 const PLANNING_SYSTEM_PROMPT: &str = "You are the planning model for a coding agent. Given a complex task and a heuristic pre-plan, produce a short, concrete, ordered execution plan (3-7 steps). Be specific to the task, call out risks and dependencies, and recommend an order. Do not write code or take actions; output only the plan as a short markdown list.";
+
+const STRUCTURED_PLAN_SYSTEM_PROMPT: &str = "You are the planning model for a coding agent. Decompose the task into a small DAG of execution steps and return STRICT JSON only (no markdown, no prose). Each step needs a unique kebab-case id and a title; depends_on lists ids of steps that must finish first; parallelizable marks steps that can run alongside siblings; acceptance lists shell commands that must pass for the step to be considered done. Keep it to 2-7 steps.";
+
+/// Extract the first balanced top-level JSON object from text that may include
+/// prose or ```json code fences around it. Returns `None` if no `{...}` span is
+/// found. Used to recover a structured plan from a chatty model response.
+fn extract_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, &byte) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[start..=offset].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 /// Render messages into a compact, role-tagged transcript for summarization,
 /// truncating to a bounded length to keep summarization cheap.
@@ -2228,14 +2293,17 @@ where
         // Complexity signal used to bias model routing toward higher-quality
         // routes for harder tasks (difficulty-aware routing).
         let mut task_complexity: Option<u8> = None;
+        // Validated structured plan (model-derived DAG) when this turn is
+        // eligible; consumed by later stages to dispatch node-by-node.
+        let mut structured_plan: Option<crate::structured_execution::ValidatedStructuredPlan> =
+            None;
         if let Some(initial_plan) =
             self.build_initial_decisioning_plan(&runtime_task_id, &user_input)
         {
             task_complexity = Some(initial_plan.task.complexity);
             // Stage 0: assess whether this turn is eligible for structured DAG
-            // execution. The decision is recorded for observability but does
-            // not yet divert control flow — later stages consume it. When the
-            // gate is off (default) this is always Disabled.
+            // execution. The decision is recorded for observability. Stage 1
+            // builds the model-derived structured plan when eligible.
             let feasibility = crate::structured_execution::assess_feasibility(
                 self.decisioning_config.enabled(),
                 self.decisioning_config.structured_execution_threshold(),
@@ -2243,7 +2311,23 @@ where
                 &initial_plan.snapshot.plan,
             );
             self.record_structured_feasibility(&runtime_task_id, &feasibility);
+            if feasibility.is_eligible() {
+                structured_plan = self.maybe_build_structured_plan(
+                    &runtime_task_id,
+                    &user_input,
+                    &initial_plan.task,
+                );
+                if let Some(validated) = &structured_plan {
+                    effective_system_prompt.push(format_structured_plan_prompt(validated));
+                }
+            }
             effective_system_prompt.push(Self::format_initial_decisioning_prompt(&initial_plan));
+        }
+        // Stage 1 records the structured plan into the registry and injects it
+        // as advisory context; Stage 2 will dispatch it node-by-node. Read it
+        // here so the binding is live and traceable until then.
+        if let Some(validated) = &structured_plan {
+            self.record_structured_plan_ready(&runtime_task_id, validated.plan.steps.len());
         }
         if let Some(memory_override) = format_user_memory_override(&user_memory_facts) {
             effective_system_prompt.push(memory_override);
@@ -3393,6 +3477,54 @@ where
         }
     }
 
+    /// When structured execution is eligible, ask the planning model for a
+    /// machine-readable plan (JSON), validate it, and record the resulting DAG.
+    /// Returns the validated plan so Stage 2 can dispatch it. On any failure
+    /// (gate off, below threshold, malformed/invalid JSON) returns `None` and
+    /// the turn proceeds on the heuristic plan / single-shot loop.
+    fn maybe_build_structured_plan(
+        &mut self,
+        task_id: &str,
+        user_input: &str,
+        task: &Task,
+    ) -> Option<crate::structured_execution::ValidatedStructuredPlan> {
+        if !self
+            .decisioning_config
+            .uses_structured_execution(task.complexity)
+        {
+            return None;
+        }
+        let route = self.select_model_route_for_task_with_complexity(
+            task_id,
+            crate::ModelRoutePhase::Planning,
+            Some(task.complexity),
+        );
+        let request = ApiRequest {
+            system_prompt: vec![STRUCTURED_PLAN_SYSTEM_PROMPT.to_string()],
+            messages: vec![ConversationMessage::user_text(format!(
+                "Task (complexity {}/5): {user_input}\n\nReturn ONLY a JSON object: {{\"steps\":[{{\"id\":\"kebab-id\",\"title\":\"...\",\"depends_on\":[\"other-id\"],\"parallelizable\":false,\"estimated_effort\":1,\"acceptance\":[\"shell command that must pass\"],\"capabilities\":[\"read\"]}}],\"notes\":[\"...\"]}}. 2-7 steps. depends_on must reference declared ids only. No prose outside the JSON.",
+                task.complexity
+            ))],
+            model_route: Some(route),
+        };
+        let events = self.api_client.stream(request).ok()?;
+        let mut text = String::new();
+        for event in events {
+            if let AssistantEvent::TextDelta(delta) = event {
+                text.push_str(&delta);
+            }
+        }
+        let json = extract_json_object(&text)?;
+        let validated = crate::structured_execution::parse_structured_plan(task_id, &json)?;
+        // Record the structured DAG so it is observable and persisted; Stage 2
+        // dispatches it.
+        let dag =
+            crate::structured_execution::build_structured_dag(task_id, user_input, &validated);
+        let execution = PlanExecution::new(&dag);
+        let _ = self.task_registry.record_plan(task_id, dag, execution);
+        Some(validated)
+    }
+
     fn format_initial_decisioning_prompt(plan: &DecisioningTurnPlan) -> String {
         let selected_tools = plan
             .snapshot
@@ -3512,6 +3644,16 @@ where
         );
         attributes.insert("reason".to_string(), Value::String(feasibility.reason()));
         session_tracer.record("structured_execution_feasibility", attributes);
+    }
+
+    fn record_structured_plan_ready(&self, task_id: &str, node_count: usize) {
+        let Some(session_tracer) = &self.session_tracer else {
+            return;
+        };
+        let mut attributes = Map::new();
+        attributes.insert("task_id".to_string(), Value::String(task_id.to_string()));
+        attributes.insert("node_count".to_string(), Value::from(node_count as u64));
+        session_tracer.record("structured_plan_ready", attributes);
     }
 
     fn record_decisioning_snapshot(&self, snapshot: &DecisioningSnapshot) {
@@ -6537,5 +6679,90 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    #[test]
+    fn extract_json_object_recovers_object_from_prose_and_fences() {
+        let fenced = "Here is the plan:\n```json\n{\"steps\":[{\"id\":\"a\"}]}\n```\nDone.";
+        let extracted = super::extract_json_object(fenced).expect("json");
+        assert_eq!(extracted, "{\"steps\":[{\"id\":\"a\"}]}");
+        // Braces inside strings must not confuse the balance scan.
+        let tricky = "{\"title\":\"a } b\",\"n\":1}";
+        assert_eq!(super::extract_json_object(tricky).unwrap(), tricky);
+        assert!(super::extract_json_object("no object here").is_none());
+    }
+
+    #[test]
+    fn structured_execution_builds_model_dag_when_enabled() {
+        use std::sync::{Arc, Mutex};
+
+        // Returns a JSON structured plan on the Planning route; finishes with
+        // plain text on the Coding route so the turn completes.
+        #[derive(Clone)]
+        struct StructuredPlanApi {
+            saw_structured_request: Arc<Mutex<bool>>,
+        }
+        impl ApiClient for StructuredPlanApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let is_planning = request
+                    .model_route
+                    .as_ref()
+                    .is_some_and(|route| format!("{:?}", route.phase) == "Planning");
+                if is_planning {
+                    *self
+                        .saw_structured_request
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "{\"steps\":[{\"id\":\"design\",\"title\":\"Design\"},{\"id\":\"impl\",\"title\":\"Implement\",\"depends_on\":[\"design\"]}],\"notes\":[\"plan\"]}".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(false)
+                .with_structured_execution_threshold(3),
+        );
+        let saw = Arc::new(Mutex::new(false));
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            StructuredPlanApi {
+                saw_structured_request: saw.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+
+        // High-complexity multi-capability prompt clears the threshold.
+        let _ = runtime
+            .run_turn(
+                "implement, refactor, write, test and verify the new billing module",
+                None,
+            )
+            .expect("turn should succeed");
+
+        assert!(
+            *saw.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "structured plan request should have been issued on the Planning route"
+        );
+        // The structured DAG was recorded for the task.
+        assert!(runtime
+            .task_registry()
+            .list(None)
+            .iter()
+            .any(|task| task.plan.is_some()));
     }
 }
