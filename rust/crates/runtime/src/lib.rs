@@ -56,6 +56,7 @@ pub mod summary_compression;
 pub mod task_execution_engine;
 pub mod task_packet;
 pub mod task_registry;
+pub mod team_convergence;
 pub mod team_coordinator;
 pub mod team_cron_registry;
 pub mod team_execution;

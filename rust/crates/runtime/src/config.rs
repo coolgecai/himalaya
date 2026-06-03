@@ -174,6 +174,12 @@ pub struct DecisioningConfig {
     /// single-shot). Requires `enabled`. Opt-in so behavior is unchanged by
     /// default.
     structured_execution_threshold: u8,
+    /// Node estimated-effort (1..=5) at or above which a structured-execution
+    /// node runs the multi-role convergence loop (Architect -> Executor ->
+    /// Reviewer, re-driving on rejection) instead of a single Executor
+    /// sub-turn. `0` disables it. Only meaningful when structured execution is
+    /// active. Opt-in so behavior is unchanged by default.
+    team_convergence_threshold: u8,
 }
 
 impl Default for DecisioningConfig {
@@ -189,6 +195,8 @@ impl Default for DecisioningConfig {
             planning_complexity_threshold: 0,
             // Off by default: structured DAG execution is opt-in.
             structured_execution_threshold: 0,
+            // Off by default: multi-role convergence is opt-in.
+            team_convergence_threshold: 0,
         }
     }
 }
@@ -709,6 +717,12 @@ impl DecisioningConfig {
     }
 
     #[must_use]
+    pub fn with_team_convergence_threshold(mut self, threshold: u8) -> Self {
+        self.team_convergence_threshold = threshold;
+        self
+    }
+
+    #[must_use]
     pub fn with_safety_thresholds(mut self, review_percent: u8, deny_percent: u8) -> Self {
         self.safety_policy = self
             .safety_policy
@@ -757,6 +771,20 @@ impl DecisioningConfig {
         self.enabled
             && self.structured_execution_threshold > 0
             && complexity >= self.structured_execution_threshold
+    }
+
+    #[must_use]
+    pub fn team_convergence_threshold(&self) -> u8 {
+        self.team_convergence_threshold
+    }
+
+    /// Whether a node of the given estimated effort should run the multi-role
+    /// convergence loop. Only sensible inside the structured execution path.
+    #[must_use]
+    pub fn uses_team_convergence(&self, node_effort: u8) -> bool {
+        self.enabled
+            && self.team_convergence_threshold > 0
+            && node_effort >= self.team_convergence_threshold
     }
 
     #[must_use]
