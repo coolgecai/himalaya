@@ -35,9 +35,10 @@ use api::{
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
-    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
+    handle_skills_slash_command, handle_skills_slash_command_json, is_stub_slash_command,
+    render_slash_command_help, render_slash_command_help_filtered, resolve_skill_invocation,
+    resume_supported_slash_commands, slash_command_specs, slash_command_status,
+    validate_slash_command_input, SkillSlashDispatch, SlashCommand, SlashCommandStatus,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -112,14 +113,26 @@ type RuntimePluginStateBuildOutput = (
 fn main() {
     if let Err(error) = run() {
         let message = error.to_string();
-        // When --output-format json is active, emit errors as JSON so downstream
-        // tools can parse failures the same way they parse successes (ROADMAP #42).
+        // When a machine-readable output format is active, emit errors as JSON
+        // so downstream consumers can parse failures the same way they parse successes (ROADMAP #42).
         let argv: Vec<String> = std::env::args().collect();
         let json_output = argv
             .windows(2)
             .any(|w| w[0] == "--output-format" && w[1] == "json")
             || argv.iter().any(|a| a == "--output-format=json");
-        if json_output {
+        let stream_json_output = argv
+            .windows(2)
+            .any(|w| w[0] == "--output-format" && w[1] == "stream-json")
+            || argv.iter().any(|a| a == "--output-format=stream-json");
+        if stream_json_output {
+            eprintln!(
+                "{}",
+                stream_json_event(serde_json::json!({
+                    "type": "error",
+                    "error": message,
+                }))
+            );
+        } else if json_output {
             eprintln!(
                 "{}",
                 serde_json::json!({
@@ -718,6 +731,9 @@ enum WorkerCliCommand {
     },
     Terminate {
         worker_id: String,
+    },
+    Cleanup {
+        include_stale: bool,
     },
     Supervise,
 }
@@ -1616,9 +1632,17 @@ fn parse_worker_cli_command(args: &[String]) -> Result<WorkerCliCommand, String>
         Some(("terminate" | "stop", [worker_id])) => Ok(WorkerCliCommand::Terminate {
             worker_id: worker_id.clone(),
         }),
+        Some(("cleanup", [])) => Ok(WorkerCliCommand::Cleanup {
+            include_stale: false,
+        }),
+        Some(("cleanup", [flag])) if matches!(flag.as_str(), "--stale" | "--include-stale") => {
+            Ok(WorkerCliCommand::Cleanup {
+                include_stale: true,
+            })
+        }
         Some(("supervise" | "tick", [])) => Ok(WorkerCliCommand::Supervise),
         Some((other, _)) => Err(format!(
-            "unknown workers command: {other}\nUsage: Himalaya workers [list|create|spawn [--cwd PATH] [--trusted-root PATH] [--isolate-worktree] [--worktree-root PATH] -- COMMAND...|probe <worker-id>|observe <worker-id> <screen>|ready <worker-id>|resolve-trust <worker-id>|prompt <worker-id> [prompt]|complete <worker-id> [finish-reason] [tokens-output]|restart <worker-id>|terminate <worker-id>|supervise]"
+            "unknown workers command: {other}\nUsage: Himalaya workers [list|create|spawn [--cwd PATH] [--trusted-root PATH] [--isolate-worktree] [--worktree-root PATH] -- COMMAND...|probe <worker-id>|observe <worker-id> <screen>|ready <worker-id>|resolve-trust <worker-id>|prompt <worker-id> [prompt]|complete <worker-id> [finish-reason] [tokens-output]|restart <worker-id>|terminate <worker-id>|cleanup [--stale]|supervise]"
         )),
     }
 }
@@ -1668,18 +1692,15 @@ fn parse_worker_cwd_and_trust_args(
     Ok((cwd, trusted_roots))
 }
 
-fn parse_worker_spawn_args(
-    args: &[String],
-) -> Result<
-    (
-        Option<PathBuf>,
-        Vec<String>,
-        bool,
-        Option<PathBuf>,
-        Vec<String>,
-    ),
-    String,
-> {
+type WorkerSpawnArgs = (
+    Option<PathBuf>,
+    Vec<String>,
+    bool,
+    Option<PathBuf>,
+    Vec<String>,
+);
+
+fn parse_worker_spawn_args(args: &[String]) -> Result<WorkerSpawnArgs, String> {
     let mut cwd = None;
     let mut trusted_roots = Vec::new();
     let mut isolate_worktree = false;
@@ -2199,7 +2220,7 @@ fn default_permission_mode() -> PermissionMode {
         .as_deref()
         .and_then(PermissionMode::parse_public)
         .or_else(config_permission_mode_for_current_dir)
-        .unwrap_or(PermissionMode::ReadOnly)
+        .unwrap_or(PermissionMode::Prompt)
 }
 
 fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
@@ -3539,12 +3560,17 @@ fn maturity_matrix_value() -> Value {
     let slash_commands = slash_command_specs()
         .iter()
         .map(|spec| {
-            let implemented = !STUB_COMMANDS.contains(&spec.name);
+            let status = slash_command_status(spec.name);
+            let implemented = status == SlashCommandStatus::Implemented;
             json!({
                 "name": spec.name,
                 "aliases": spec.aliases,
                 "argument_hint": spec.argument_hint,
-                "resume_supported": spec.resume_supported,
+                "resume_supported": spec.resume_supported && implemented,
+                "status": match status {
+                    SlashCommandStatus::Implemented => "implemented",
+                    SlashCommandStatus::Stub => "stub",
+                },
                 "implemented": implemented,
                 "maturity": if implemented { "implemented" } else { "stub" },
                 "summary": spec.summary,
@@ -3553,7 +3579,7 @@ fn maturity_matrix_value() -> Value {
         .collect::<Vec<_>>();
     let implemented_commands = slash_command_specs()
         .iter()
-        .filter(|spec| !STUB_COMMANDS.contains(&spec.name))
+        .filter(|spec| slash_command_status(spec.name) == SlashCommandStatus::Implemented)
         .count();
     json!({
         "type": "maturity_matrix",
@@ -3902,18 +3928,16 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
 
     let mut session = session;
     for raw_command in commands {
-        // Intercept spec commands that have no parse arm before calling
-        // SlashCommand::parse — they return Err(SlashCommandParseError) which
-        // formats as the confusing circular "Did you mean /X?" message.
-        // STUB_COMMANDS covers both completions-filtered stubs and parse-less
-        // spec entries; treat both as unsupported in resume mode.
+        // The commands crate owns the implemented/stub truth source. Intercept
+        // stubs before calling SlashCommand::parse so parse-less spec entries do
+        // not produce circular "Did you mean /X?" errors.
         {
             let cmd_root = raw_command
                 .trim_start_matches('/')
                 .split_whitespace()
                 .next()
                 .unwrap_or("");
-            if STUB_COMMANDS.contains(&cmd_root) {
+            if is_stub_slash_command(cmd_root) {
                 if output_format == CliOutputFormat::Json {
                     eprintln!(
                         "{}",
@@ -4126,10 +4150,11 @@ fn format_permissions_report(mode: &str) -> String {
         .map(|candidate| {
             let name = candidate.as_str();
             let description = match candidate {
-                PermissionMode::ReadOnly => "Read/search tools only",
-                PermissionMode::WorkspaceWrite => "Edit files inside the workspace",
-                PermissionMode::DangerFullAccess => "Unrestricted tool access",
-                PermissionMode::Prompt | PermissionMode::Allow => {
+                PermissionMode::Prompt => "Claude default: read/search tools run automatically; writes, shell, MCP, and elevated actions ask first",
+                PermissionMode::ReadOnly => "Plan mode: read/search tools only",
+                PermissionMode::WorkspaceWrite => "Accept edits / auto: edit files inside the workspace",
+                PermissionMode::DangerFullAccess => "Bypass permissions: unrestricted tool access",
+                PermissionMode::Allow => {
                     unreachable!("public modes exclude internal aliases")
                 }
             };
@@ -4997,17 +5022,16 @@ fn run_repl_ndjson(
                     match load_files_as_content_blocks(&file_paths, &cli.model) {
                         Ok(blocks) => {
                             if let Err(error) = cli.inject_file_blocks(blocks) {
-                                println!(
-                                    "{}",
-                                    serde_json::json!({"type":"error","error":error.to_string()})
+                                print_stream_json_event(
+                                    json!({"type":"error","error":error.to_string()}),
                                 );
-                                println!("{}", serde_json::json!({"type":"done","iterations":0}));
+                                print_stream_json_event(json!({"type":"done","iterations":0}));
                                 continue;
                             }
                         }
                         Err(error) => {
-                            println!("{}", serde_json::json!({"type":"error","error":error}));
-                            println!("{}", serde_json::json!({"type":"done","iterations":0}));
+                            print_stream_json_event(json!({"type":"error","error":error}));
+                            print_stream_json_event(json!({"type":"done","iterations":0}));
                             continue;
                         }
                     }
@@ -5015,11 +5039,8 @@ fn run_repl_ndjson(
                 match cli.run_prompt_stream_json(text) {
                     Ok(()) => {}
                     Err(e) => {
-                        println!(
-                            "{}",
-                            serde_json::json!({"type":"error","error":e.to_string()})
-                        );
-                        println!("{}", serde_json::json!({"type":"done","iterations":0}));
+                        print_stream_json_event(json!({"type":"error","error":e.to_string()}));
+                        print_stream_json_event(json!({"type":"done","iterations":0}));
                     }
                 }
             }
@@ -7619,17 +7640,27 @@ fn render_route_feedback_summary_text(value: &Value) -> String {
     let feedback_count = value["feedback_count"].as_u64().unwrap_or(0);
     let summaries = value["summaries"].as_array().cloned().unwrap_or_default();
     if summaries.is_empty() {
-        return format!("Route feedback summary\n  Feedback entries  {feedback_count}\n  Routes            none");
+        return format!(
+            "Route feedback summary
+  Feedback entries  {feedback_count}
+  Routes            none"
+        );
     }
     let mut lines = vec![format!(
-        "Route feedback summary\n  Feedback entries  {feedback_count}\n  Routes            {}",
+        "Route feedback summary
+  Feedback entries  {feedback_count}
+  Routes            {}
+
+  Phase        Provider      Model       Total  Success  Fail  Recovery  Latency  Tokens  Cost",
         summaries.len()
     )];
     for summary in summaries {
         let phase = summary["phase"].as_str().unwrap_or("unknown");
+        let provider = summary["provider"].as_str().unwrap_or("default");
         let model = summary["model"].as_str().unwrap_or("unknown");
         let total = summary["total"].as_u64().unwrap_or(0);
         let failures = summary["failures"].as_u64().unwrap_or(0);
+        let recovery = summary["recovery_triggered"].as_u64().unwrap_or(0);
         let success_rate = summary["success_rate"].as_f64().unwrap_or(0.0) * 100.0;
         let latency = summary["avg_latency_ms"]
             .as_f64()
@@ -7640,11 +7671,19 @@ fn render_route_feedback_summary_text(value: &Value) -> String {
         let cost = summary["avg_cost_usd"]
             .as_f64()
             .map_or("n/a".to_string(), |value| format!("${value:.4}"));
+        let risk = if failures > 0 || recovery > 0 {
+            "!"
+        } else {
+            " "
+        };
         lines.push(format!(
-            "  - {phase}/{model}: total={total}, failures={failures}, success={success_rate:.0}%, avg_latency={latency}, avg_tokens={tokens}, avg_cost={cost}"
+            "  {risk} {phase:<11} {provider:<12} {model:<10} {total:>5}  {success_rate:>6.0}%  {failures:>4}  {recovery:>8}  {latency:>7}  {tokens:>6}  {cost:>8}"
         ));
     }
-    lines.join("\n")
+    lines.join(
+        "
+",
+    )
 }
 
 fn run_route_command(
@@ -7851,6 +7890,32 @@ fn run_worker_command(
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_worker_output(
                         json!({"type":"worker_terminate","worker":worker}),
+                        output_format,
+                    )?;
+                }
+            }
+        }
+        WorkerCliCommand::Cleanup { include_stale } => {
+            let registry = load_worker_registry()?;
+            let report = if include_stale {
+                let now = std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs());
+                registry.cleanup_stale(now)
+            } else {
+                registry.cleanup_finished()
+            };
+            save_worker_registry(&registry)?;
+            match output_format {
+                CliOutputFormat::Text => println!(
+                    "removed {} workers; retained {}; removed {} worktrees",
+                    report.removed_workers.len(),
+                    report.retained_workers,
+                    report.removed_worktrees.len()
+                ),
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_worker_output(
+                        json!({"type":"worker_cleanup","include_stale":include_stale,"report":report}),
                         output_format,
                     )?;
                 }
@@ -8675,7 +8740,7 @@ fn render_repl_help() -> String {
         "  Browse sessions      /session list".to_string(),
         "  Show prompt history  /history [count]".to_string(),
         String::new(),
-        render_slash_command_help_filtered(STUB_COMMANDS),
+        render_slash_command_help_filtered(),
     ]
     .join(
         "
@@ -10398,13 +10463,20 @@ fn build_runtime_with_plugin_state(
     }
     let RuntimePluginState {
         feature_config,
-        tool_registry,
+        mut tool_registry,
         plugin_registry,
         mcp_state,
     } = runtime_plugin_state;
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let workspace_root = session
+        .workspace_root()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    tool_registry = tool_registry.with_enforcer(
+        runtime::permission_enforcer::PermissionEnforcer::new(policy.clone()),
+    );
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -11242,112 +11314,6 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
         .collect()
 }
 
-/// Slash commands that are registered in the spec list but not yet implemented
-/// in this build. Used to filter both REPL completions and help output so the
-/// discovery surface only shows commands that actually work (ROADMAP #39).
-const STUB_COMMANDS: &[&str] = &[
-    "login",
-    "logout",
-    "vim",
-    "upgrade",
-    "share",
-    "feedback",
-    "files",
-    "fast",
-    "exit",
-    "summary",
-    "desktop",
-    "brief",
-    "advisor",
-    "stickers",
-    "insights",
-    "thinkback",
-    "release-notes",
-    "security-review",
-    "keybindings",
-    "privacy-settings",
-    "theme",
-    "voice",
-    "usage",
-    "rename",
-    "copy",
-    "hooks",
-    "context",
-    "color",
-    "effort",
-    "branch",
-    "rewind",
-    "ide",
-    "tag",
-    "output-style",
-    "add-dir",
-    // Spec entries with no parse arm — produce circular "Did you mean" error
-    // without this guard. Adding here routes them to the proper unsupported
-    // message and excludes them from REPL completions / help.
-    // NOTE: do NOT add "stats", "tokens", "cache" — they are implemented.
-    "allowed-tools",
-    "bookmarks",
-    "reasoning",
-    "budget",
-    "rate-limit",
-    "changelog",
-    "metrics",
-    "tool-details",
-    "focus",
-    "unfocus",
-    "pin",
-    "unpin",
-    "language",
-    "profile",
-    "max-tokens",
-    "temperature",
-    "system-prompt",
-    "notifications",
-    "telemetry",
-    "env",
-    "project",
-    "terminal-setup",
-    "api-key",
-    "reset",
-    "undo",
-    "stop",
-    "retry",
-    "paste",
-    "screenshot",
-    "image",
-    "search",
-    "listen",
-    "speak",
-    "format",
-    "run",
-    "git",
-    "stash",
-    "blame",
-    "log",
-    "team",
-    "migrate",
-    "templates",
-    "explain",
-    "refactor",
-    "docs",
-    "fix",
-    "perf",
-    "chat",
-    "web",
-    "map",
-    "symbols",
-    "references",
-    "definition",
-    "hover",
-    "autofix",
-    "multi",
-    "macro",
-    "alias",
-    "parallel",
-    "subagent",
-    "agent",
-];
-
 fn slash_command_completion_candidates_with_sessions(
     model: &str,
     active_session_id: Option<&str>,
@@ -11356,12 +11322,12 @@ fn slash_command_completion_candidates_with_sessions(
     let mut completions = BTreeSet::new();
 
     for spec in slash_command_specs() {
-        if STUB_COMMANDS.contains(&spec.name) {
+        if is_stub_slash_command(spec.name) {
             continue;
         }
         completions.insert(format!("/{}", spec.name));
         for alias in spec.aliases {
-            if !STUB_COMMANDS.contains(alias) {
+            if !is_stub_slash_command(alias) {
                 completions.insert(format!("/{alias}"));
             }
         }
@@ -12151,6 +12117,9 @@ impl ToolExecutor for CliToolExecutor {
         let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
+            self.tool_registry
+                .enforce_tool_permission(tool_name, &value)
+                .map_err(ToolError::new)?;
             self.execute_runtime_tool(tool_name, value)
         } else {
             self.tool_registry
@@ -12382,12 +12351,12 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  Himalaya [--model MODEL] [--output-format text|json] prompt TEXT"
+        "  Himalaya [--model MODEL] [--output-format text|json|stream-json] prompt TEXT"
     )?;
     writeln!(out, "      Send one prompt and exit")?;
     writeln!(
         out,
-        "  Himalaya [--model MODEL] [--output-format text|json] TEXT"
+        "  Himalaya [--model MODEL] [--output-format text|json|stream-json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
@@ -12424,7 +12393,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Himalaya workers [list|create|spawn [--cwd PATH] [--trusted-root PATH] [--isolate-worktree] [--worktree-root PATH] -- COMMAND...|probe <worker-id>|observe|ready|resolve-trust|prompt|complete|restart|terminate|supervise]"
+        "  Himalaya workers [list|create|spawn [--cwd PATH] [--trusted-root PATH] [--isolate-worktree] [--worktree-root PATH] -- COMMAND...|probe <worker-id>|observe|ready|resolve-trust|prompt|complete|restart|terminate|cleanup [--stale]|supervise]"
     )?;
     writeln!(
         out,
@@ -12480,7 +12449,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --output-format FORMAT     Non-interactive output format: text or json"
+        "  --output-format FORMAT     Non-interactive output format: text, json, or stream-json"
     )?;
     writeln!(
         out,
@@ -12488,7 +12457,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access"
+        "  --permission-mode MODE     Set default, plan, acceptEdits, auto, or bypassPermissions"
     )?;
     writeln!(
         out,
@@ -12501,7 +12470,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out)?;
     writeln!(out, "Interactive slash commands:")?;
-    writeln!(out, "{}", render_slash_command_help_filtered(STUB_COMMANDS))?;
+    writeln!(out, "{}", render_slash_command_help_filtered())?;
     writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
         .into_iter()
@@ -12596,13 +12565,14 @@ mod tests {
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, status_context, stream_json_event,
-        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, CronCliCommand, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, RouteCliCommand, SlashCommand, StatusUsage, TaskCliCommand,
-        TaskDaemonCliCommand, TaskPacketCliCommand, TaskSchedulerCliCommand, WorkerCliCommand,
-        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STREAM_PROTOCOL_VERSION, STUB_COMMANDS,
+        slash_command_completion_candidates_with_sessions, slash_command_status, status_context,
+        stream_json_event, summarize_tool_payload_for_markdown, validate_no_args,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, CronCliCommand,
+        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, PromptHistoryEntry, RouteCliCommand, SlashCommand, SlashCommandStatus,
+        StatusUsage, TaskCliCommand, TaskDaemonCliCommand, TaskPacketCliCommand,
+        TaskSchedulerCliCommand, WorkerCliCommand, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        STREAM_PROTOCOL_VERSION,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -13875,6 +13845,13 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+        assert_eq!(
+            parse_worker_cli_command(&["cleanup".to_string(), "--stale".to_string()])
+                .expect("workers cleanup --stale should parse"),
+            WorkerCliCommand::Cleanup {
+                include_stale: true,
+            }
+        );
         assert!(parse_worker_cli_command(&["spawn".to_string()]).is_err());
         assert!(parse_worker_cli_command(&["probe".to_string()]).is_err());
         assert!(
@@ -13918,7 +13895,7 @@ mod tests {
             }
         );
         assert!(
-            !STUB_COMMANDS.contains(&"plan"),
+            slash_command_status("plan") == SlashCommandStatus::Implemented,
             "/plan should be implemented, not hidden as a stub"
         );
         let plan_value = build_plan_output("fix tests and update docs", PermissionMode::ReadOnly)
@@ -14783,7 +14760,7 @@ mod tests {
         assert!(help.contains("/status"));
         assert!(help.contains("/sandbox"));
         assert!(help.contains("/model [model]"));
-        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
+        assert!(help.contains("/permissions [default|plan|acceptEdits|auto|bypassPermissions]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
@@ -14922,10 +14899,11 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
-        // Now with 135+ slash commands, verify minimum resume support
+        // After Phase 3 cleanup: stubs are excluded from resume-safe by the
+        // commands crate. Verify the minimum still holds.
         assert!(
-            names.len() >= 39,
-            "expected at least 39 resume-supported commands, got {}",
+            names.len() >= 27,
+            "expected at least 27 resume-supported commands, got {}",
             names.len()
         );
         // Verify key resume commands still exist
@@ -14975,9 +14953,11 @@ mod tests {
         assert!(report.contains("Permissions"));
         assert!(report.contains("Active mode      workspace-write"));
         assert!(report.contains("Modes"));
-        assert!(report.contains("read-only          ○ available Read/search tools only"));
-        assert!(report.contains("workspace-write    ● current   Edit files inside the workspace"));
-        assert!(report.contains("danger-full-access ○ available Unrestricted tool access"));
+        assert!(report.contains("read-only"));
+        assert!(report.contains("workspace-write"));
+        assert!(report.contains("danger-full-access"));
+        assert!(report.contains("● current"));
+        assert!(report.contains("○ available"));
     }
 
     #[test]
@@ -14996,6 +14976,9 @@ mod tests {
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
         assert!(help.contains("Himalaya help"));
+        assert!(help.contains("[--output-format text|json|stream-json] prompt TEXT"));
+        assert!(help.contains("[--output-format text|json|stream-json] TEXT"));
+        assert!(help.contains("Non-interactive output format: text, json, or stream-json"));
         assert!(help.contains("Himalaya version"));
         assert!(help.contains("Himalaya status"));
         assert!(help.contains("Himalaya sandbox"));
@@ -16390,7 +16373,7 @@ UU conflicted.rs",
     fn stub_commands_absent_from_repl_completions() {
         let candidates =
             slash_command_completion_candidates_with_sessions("Himalaya-3-5-sonnet", None, vec![]);
-        for stub in STUB_COMMANDS {
+        for stub in commands::stub_slash_commands() {
             let with_slash = format!("/{stub}");
             assert!(
                 !candidates.contains(&with_slash),
