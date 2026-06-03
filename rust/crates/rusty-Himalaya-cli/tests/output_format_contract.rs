@@ -288,7 +288,7 @@ fn task_scheduler_tick_persists_durable_status() {
   "scope": "rust/crates/rusty-Himalaya-cli",
   "repo": ".",
   "branch_policy": "use current branch",
-  "acceptance_tests": [],
+  "acceptance_tests": ["python3 --version"],
   "commit_policy": "do not commit automatically",
   "reporting_contract": "return scheduler status",
   "escalation_policy": "ask the user if blocked"
@@ -363,7 +363,10 @@ fn task_scheduler_tick_persists_durable_status() {
     );
     assert_eq!(daemon["type"], "task_scheduler_daemon_run");
     assert_eq!(daemon["command"], "start");
-    assert!(daemon["runs"].as_array().expect("daemon runs array").len() >= 1);
+    assert!(!daemon["runs"]
+        .as_array()
+        .expect("daemon runs array")
+        .is_empty());
     assert_eq!(daemon["state"]["tick_count"], 1);
     assert!(daemon["state_path"]
         .as_str()
@@ -412,6 +415,170 @@ fn task_scheduler_tick_persists_durable_status() {
 }
 
 #[test]
+fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
+    let root = unique_temp_dir("daemon-worker-scheduler-smoke");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+    let packet_path = root.join("packet.json");
+    fs::write(
+        &packet_path,
+        r#"{
+  "objective": "Complete a worker-dispatched durable task",
+  "scope": "rust/crates/rusty-Himalaya-cli",
+  "repo": ".",
+  "branch_policy": "use current branch",
+  "acceptance_tests": ["python3 --version"],
+  "commit_policy": "do not commit automatically",
+  "reporting_contract": "return scheduler status",
+  "escalation_policy": "ask the user if blocked"
+}
+"#,
+    )
+    .expect("packet fixture should write");
+
+    let packet_arg = packet_path.to_str().expect("packet path should be utf8");
+    let created = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "packet",
+            "create",
+            packet_arg,
+        ],
+    );
+    let task_id = created["task"]["task_id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+
+    let first_tick = assert_json_command(
+        &root,
+        &["--output-format", "json", "tasks", "scheduler", "tick"],
+    );
+    assert_eq!(first_tick["type"], "task_scheduler_tick");
+    assert_eq!(first_tick["tick"]["selected_task_id"], task_id);
+    assert_eq!(first_tick["tick"]["status"], "running");
+    assert!(first_tick["tick"]["outcome"]["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .any(|step| step["kind"] == "dispatch_worker"));
+
+    let workers = assert_json_command(&root, &["--output-format", "json", "workers", "list"]);
+    assert_eq!(workers["type"], "worker_list");
+    let worker_id = workers["workers"][0]["worker_id"]
+        .as_str()
+        .expect("worker id")
+        .to_string();
+    assert_eq!(workers["workers"][0]["status"], "prompt_accepted");
+
+    let completed_worker = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "workers",
+            "complete",
+            &worker_id,
+            "stop",
+            "7",
+        ],
+    );
+    assert_eq!(completed_worker["type"], "worker_complete");
+    assert_eq!(completed_worker["worker"]["status"], "finished");
+
+    let daemon_dispatch = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "daemon",
+            "start",
+            "--once",
+        ],
+    );
+    assert_eq!(daemon_dispatch["type"], "task_scheduler_daemon_run");
+    assert_eq!(daemon_dispatch["runs"][0]["tick"]["status"], "running");
+
+    let completed_workers = complete_active_workers(&root);
+    assert!(
+        !completed_workers.is_empty(),
+        "daemon should have dispatched additional workers"
+    );
+
+    let daemon_waiting = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "daemon",
+            "start",
+            "--max-ticks",
+            "8",
+        ],
+    );
+    assert_eq!(daemon_waiting["type"], "task_scheduler_daemon_run");
+    assert_eq!(
+        daemon_waiting["state"]["last_tick"]["task"]["status"],
+        "waiting_for_verification"
+    );
+
+    let verification = assert_json_command(
+        &root,
+        &["--output-format", "json", "tasks", "verify", &task_id],
+    );
+    assert_eq!(verification["type"], "task_verification");
+    assert_eq!(verification["result"]["passed"], true);
+
+    let daemon_completed = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "daemon",
+            "start",
+            "--once",
+        ],
+    );
+    assert_eq!(daemon_completed["type"], "task_scheduler_daemon_run");
+    assert_eq!(daemon_completed["runs"][0]["tick"]["status"], "completed");
+    assert_eq!(
+        daemon_completed["state"]["last_tick"]["status"],
+        "completed"
+    );
+
+    let task = assert_json_command(
+        &root,
+        &["--output-format", "json", "tasks", "show", &task_id],
+    );
+    assert_eq!(task["type"], "task_show");
+    assert_eq!(task["task"]["status"], "completed");
+
+    let logs = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "daemon",
+            "logs",
+            "--limit",
+            "5",
+        ],
+    );
+    assert_eq!(logs["type"], "task_scheduler_daemon_logs");
+    assert!(logs["events"]
+        .as_array()
+        .expect("daemon events")
+        .iter()
+        .any(|event| event["selected_task_id"] == task_id));
+}
+
+#[test]
 fn route_feedback_summary_emits_metric_summaries() {
     let root = unique_temp_dir("route-feedback-summary-json");
     fs::create_dir_all(root.join(".Himalaya/routes")).expect("route feedback dir should exist");
@@ -419,6 +586,26 @@ fn route_feedback_summary_emits_metric_summaries() {
         root.join(".Himalaya/routes/feedback.json"),
         r#"{
   "feedback": [
+    {
+      "task_id": "task-3",
+      "route": {
+        "phase": "verification",
+        "model": "opus",
+        "provider": null,
+        "reason": "test",
+        "confidence": 0.9,
+        "fallback_model": null
+      },
+      "succeeded": true,
+      "latency_ms": 500,
+      "input_tokens": 400,
+      "output_tokens": 100,
+      "cost_usd": 0.005,
+      "verification_passed": true,
+      "recovery_triggered": false,
+      "timestamp": 3,
+      "note": null
+    },
     {
       "task_id": "task-1",
       "route": {
@@ -471,7 +658,7 @@ fn route_feedback_summary_emits_metric_summaries() {
     );
 
     assert_eq!(summary["type"], "route_feedback_summary");
-    assert_eq!(summary["feedback_count"], 2);
+    assert_eq!(summary["feedback_count"], 3);
     let route = &summary["summaries"][0];
     assert_eq!(route["phase"], "coding");
     assert_eq!(route["model"], "sonnet");
@@ -481,6 +668,19 @@ fn route_feedback_summary_emits_metric_summaries() {
     assert_eq!(route["avg_latency_ms"], 2000.0);
     assert_eq!(route["avg_tokens"], 3000.0);
     assert_eq!(route["avg_cost_usd"], 0.02);
+    assert_eq!(summary["summaries"][1]["phase"], "verification");
+
+    let output = run_Himalaya(&root, &["routes", "feedback", "summary"], &[]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("text output should be utf8");
+    assert!(stdout.contains("Phase"));
+    assert!(stdout.contains("Success"));
+    assert!(stdout.contains("Recovery"));
+    assert!(stdout.contains("! coding"));
+    assert!(stdout.contains("50%"));
+    assert!(stdout.contains("2000ms"));
+    assert!(stdout.contains("3000"));
+    assert!(stdout.contains("$0.0200"));
 }
 
 #[test]
@@ -870,6 +1070,51 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
 }
 
 #[test]
+fn worker_cleanup_removes_finished_workers_from_registry() {
+    let root = unique_temp_dir("worker-cleanup-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let created = assert_json_command(&root, &["--output-format", "json", "workers", "create"]);
+    assert_eq!(created["type"], "worker_create");
+    let worker_id = created["worker"]["worker_id"]
+        .as_str()
+        .expect("worker id")
+        .to_string();
+
+    let terminated = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "workers",
+            "terminate",
+            &worker_id,
+        ],
+    );
+    assert_eq!(terminated["type"], "worker_terminate");
+    assert_eq!(terminated["worker"]["status"], "finished");
+
+    let cleanup = assert_json_command(&root, &["--output-format", "json", "workers", "cleanup"]);
+    assert_eq!(cleanup["type"], "worker_cleanup");
+    assert_eq!(cleanup["include_stale"], false);
+    assert_eq!(
+        cleanup["report"]["removed_workers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        cleanup["report"]["removed_workers"][0]["worker_id"],
+        worker_id
+    );
+    assert_eq!(cleanup["report"]["retained_workers"], 0);
+
+    let workers = assert_json_command(&root, &["--output-format", "json", "workers", "list"]);
+    assert_eq!(workers["workers"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn local_commands_emit_structured_json_when_requested() {
     let root = unique_temp_dir("local-command-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
@@ -942,6 +1187,33 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
     );
     assert_eq!(init["kind"], "init");
     assert!(root.join("Himalaya.md").exists());
+}
+
+fn complete_active_workers(root: &Path) -> Vec<String> {
+    let workers = assert_json_command(root, &["--output-format", "json", "workers", "list"]);
+    let mut completed = Vec::new();
+    for worker in workers["workers"].as_array().expect("workers array") {
+        let status = worker["status"].as_str().unwrap_or_default();
+        if !matches!(status, "prompt_accepted" | "running" | "ready_for_prompt") {
+            continue;
+        }
+        let worker_id = worker["worker_id"].as_str().expect("worker id");
+        let result = assert_json_command(
+            root,
+            &[
+                "--output-format",
+                "json",
+                "workers",
+                "complete",
+                worker_id,
+                "stop",
+                "7",
+            ],
+        );
+        assert_eq!(result["type"], "worker_complete");
+        completed.push(worker_id.to_string());
+    }
+    completed
 }
 
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {

@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -68,6 +69,7 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "worker_terminate",
         "worker_supervisor_tick",
         "error",
+        "context_event",
     ]
     .into_iter()
     .map(String::from)
@@ -85,6 +87,23 @@ fn stream_json_schema_covers_known_event_types() {
     .expect("stream-json schema should parse");
 
     assert_eq!(schema["properties"]["protocol_version"]["const"], 1);
+    let root_required = schema["required"]
+        .as_array()
+        .expect("schema root required fields should exist")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    assert!(root_required.contains("type"));
+    assert!(root_required.contains("protocol_version"));
+
+    let base_required = schema["$defs"]["baseEvent"]["required"]
+        .as_array()
+        .expect("base event required fields should exist")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    assert!(base_required.contains("type"));
+    assert!(base_required.contains("protocol_version"));
 
     let schema_event_types = schema["$defs"]["eventType"]["enum"]
         .as_array()
@@ -758,6 +777,56 @@ fn stream_json_model_routing_config_switches_after_feedback() {
                 .as_str()
                 .is_some_and(|reason| reason.contains("adaptive route selected"))
     }));
+}
+
+#[test]
+fn repl_error_and_done_events_include_protocol_version() {
+    let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-repl-error"));
+    workspace.create();
+    let missing_file = workspace.root.join("missing-fixture.txt");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_Himalaya"))
+        .current_dir(&workspace.root)
+        .env_clear()
+        .env("ANTHROPIC_API_KEY", "test-stream-json-key")
+        .env("Himalaya_CONFIG_HOME", &workspace.config_home)
+        .env("HOME", &workspace.home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args([
+            "--model",
+            "Himalaya-sonnet-4-6",
+            "--permission-mode",
+            "read-only",
+            "--repl",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Himalaya repl should launch");
+
+    {
+        let stdin = child.stdin.as_mut().expect("stdin should be piped");
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "type": "prompt",
+                "text": "try to load a missing file",
+                "files": [missing_file],
+            })
+        )
+        .expect("prompt command should write");
+        writeln!(stdin, "{}", json!({ "type": "exit" })).expect("exit command should write");
+    }
+
+    let output = child.wait_with_output().expect("repl should exit");
+    assert_success(&output);
+    let events = parse_stream_json_stdout(&output.stdout);
+    assert_all_events_are_versioned(&events);
+    assert!(events.iter().any(|event| event["type"] == "error"));
+    assert!(events.iter().any(|event| event["type"] == "done"));
 }
 
 fn run_stream_json_case(

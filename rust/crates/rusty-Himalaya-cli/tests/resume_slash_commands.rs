@@ -304,7 +304,7 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     assert_eq!(parsed["kind"], "status");
     // model is null in resume mode (not known without --model flag)
     assert!(parsed["model"].is_null());
-    assert_eq!(parsed["permission_mode"], "read-only");
+    assert_eq!(parsed["permission_mode"], "prompt");
     assert_eq!(parsed["usage"]["messages"], 1);
     assert!(parsed["usage"]["turns"].is_number());
     assert!(parsed["workspace"]["cwd"].as_str().is_some());
@@ -622,13 +622,10 @@ fn resumed_plan_emits_structured_json() {
     let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
     assert_eq!(parsed["type"], "plan");
     assert_eq!(parsed["task"]["description"], "fix tests and update docs");
-    assert!(
-        parsed["selected_tools"]
-            .as_array()
-            .expect("selected tools")
-            .len()
-            > 0
-    );
+    assert!(!parsed["selected_tools"]
+        .as_array()
+        .expect("selected tools")
+        .is_empty());
     assert!(parsed["plan"]["steps"].as_array().expect("steps").len() >= 2);
 }
 

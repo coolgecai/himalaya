@@ -5,7 +5,8 @@
   "description": "Schema for one NDJSON line emitted by the Himalaya CLI when --output-format stream-json is enabled.",
   "type": "object",
   "required": [
-    "type"
+    "type",
+    "protocol_version"
   ],
   "additionalProperties": true,
   "properties": {
@@ -167,6 +168,9 @@
         },
         {
           "$ref": "#/$defs/errorEvent"
+        },
+        {
+          "$ref": "#/$defs/contextEvent"
         }
       ]
     }
@@ -230,13 +234,15 @@
         "worker_restart",
         "worker_terminate",
         "worker_supervisor_tick",
-        "error"
+        "error",
+        "context_event"
       ]
     },
     "baseEvent": {
       "type": "object",
       "required": [
-        "type"
+        "type",
+        "protocol_version"
       ],
       "additionalProperties": true,
       "properties": {
@@ -1398,6 +1404,43 @@
             },
             "summary": {
               "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "contextEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "type": {
+              "const": "context_event"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "context_read",
+                "context_write",
+                "context_compact"
+              ]
+            },
+            "total_entries": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "removed_entries": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "deduped_entries": {
+              "type": "integer",
+              "minimum": 0
             }
           }
         }
