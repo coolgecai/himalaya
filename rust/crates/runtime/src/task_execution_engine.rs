@@ -334,6 +334,7 @@ impl TaskExecutionEngine {
         self.verification_runner.run(&request)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn advance_worker_node(
         &self,
         task_id: &str,
@@ -405,6 +406,7 @@ impl TaskExecutionEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn advance_running_worker(
         &self,
         task_id: &str,

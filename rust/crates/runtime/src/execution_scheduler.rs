@@ -149,10 +149,7 @@ impl SchedulerDaemon {
         fs::create_dir_all(&self.state_dir)?;
         let lock = SchedulerDaemonLock::acquire(self.lock_path())?;
         let previous_state = self.load_state().ok();
-        let tick = self
-            .scheduler
-            .tick()
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        let tick = self.scheduler.tick().map_err(io::Error::other)?;
         let now = scheduler_now_secs();
         let status = SchedulerDaemonStatus::from_tick_status(tick.status);
         let state = SchedulerDaemonState {

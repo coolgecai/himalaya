@@ -445,16 +445,16 @@ fn complete_running_benchmark_workers(workers: &WorkerRegistry, worker_completio
         if matches!(
             worker.status,
             WorkerStatus::PromptAccepted | WorkerStatus::Running
-        ) {
-            if workers
-                .observe_completion(&worker.worker_id, "stop", 1)
-                .is_ok()
-            {
-                *worker_completions += 1;
-            }
+        ) && workers
+            .observe_completion(&worker.worker_id, "stop", 1)
+            .is_ok()
+        {
+            *worker_completions += 1;
         }
     }
 }
+
+#[allow(clippy::too_many_arguments)]
 fn benchmark_task(
     id: &str,
     title: &str,

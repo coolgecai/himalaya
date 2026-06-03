@@ -176,6 +176,58 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+fn enrich_feedback_from_task_signals(task: &Task, feedback: &mut ModelRouteFeedback) {
+    if let Some(result) = task.verification_result.as_ref() {
+        feedback.succeeded = Some(result.passed);
+        feedback.verification_passed = Some(result.passed);
+        feedback.note = Some(result.summary.clone());
+    }
+    if !task.recovery_events.is_empty() || !task.recovery_action_executions.is_empty() {
+        feedback.recovery_triggered = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enrich_latest_route_feedback(
+    task: &mut Task,
+    succeeded: Option<bool>,
+    verification_passed: Option<bool>,
+    latency_ms: Option<u32>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cost_usd: Option<f64>,
+    recovery_triggered: Option<bool>,
+    note: Option<String>,
+) {
+    let Some(feedback) = task.route_feedback.last_mut() else {
+        return;
+    };
+    if let Some(succeeded) = succeeded {
+        feedback.succeeded = Some(succeeded);
+    }
+    if let Some(verification_passed) = verification_passed {
+        feedback.verification_passed = Some(verification_passed);
+    }
+    if latency_ms.is_some() {
+        feedback.latency_ms = latency_ms;
+    }
+    if input_tokens.is_some() {
+        feedback.input_tokens = input_tokens;
+    }
+    if output_tokens.is_some() {
+        feedback.output_tokens = output_tokens;
+    }
+    if cost_usd.is_some() {
+        feedback.cost_usd = cost_usd;
+    }
+    if let Some(recovery_triggered) = recovery_triggered {
+        feedback.recovery_triggered |= recovery_triggered;
+    }
+    if note.is_some() {
+        feedback.note = note;
+    }
+}
+
 fn push_ledger_entry(
     inner: &mut RegistryInner,
     task_id: &str,
@@ -565,6 +617,7 @@ impl TaskRegistry {
             .ok_or_else(|| format!("task not found: {task_id}"))?;
         let ts = now_secs();
         task.recovery_events.push(event);
+        enrich_latest_route_feedback(task, None, None, None, None, None, None, Some(true), None);
         task.updated_at = ts;
         let updated = task.clone();
         push_ledger_entry(
@@ -631,7 +684,7 @@ impl TaskRegistry {
     pub fn record_route_feedback(
         &self,
         task_id: &str,
-        feedback: ModelRouteFeedback,
+        mut feedback: ModelRouteFeedback,
     ) -> Result<Task, String> {
         let mut inner = self.inner.lock().expect("registry lock poisoned");
         let task = inner
@@ -639,7 +692,42 @@ impl TaskRegistry {
             .get_mut(task_id)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
         let ts = now_secs();
+        enrich_feedback_from_task_signals(task, &mut feedback);
         task.route_feedback.push(feedback);
+        task.updated_at = ts;
+        let updated = task.clone();
+        push_ledger_entry(
+            &mut inner,
+            task_id,
+            "route_feedback_recorded",
+            updated.status,
+            None,
+            ts,
+        );
+        Ok(updated)
+    }
+
+    pub fn update_latest_route_feedback(
+        &self,
+        task_id: &str,
+        mut feedback: ModelRouteFeedback,
+    ) -> Result<Task, String> {
+        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let task = inner
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        let ts = now_secs();
+        enrich_feedback_from_task_signals(task, &mut feedback);
+        if let Some(existing) = task.route_feedback.iter_mut().rev().find(|existing| {
+            existing.route.phase == feedback.route.phase
+                && existing.route.model == feedback.route.model
+                && existing.route.provider == feedback.route.provider
+        }) {
+            existing.merge_observations(&feedback);
+        } else {
+            task.route_feedback.push(feedback);
+        }
         task.updated_at = ts;
         let updated = task.clone();
         push_ledger_entry(
@@ -853,6 +941,17 @@ impl TaskRegistry {
             .ok_or_else(|| format!("task not found: {task_id}"))?;
         let ts = now_secs();
         task.verification_result = Some(result.clone());
+        enrich_latest_route_feedback(
+            task,
+            Some(result.passed),
+            Some(result.passed),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(result.summary.clone()),
+        );
         task.updated_at = ts;
         let updated = task.clone();
         push_ledger_entry(
@@ -1426,12 +1525,63 @@ mod tests {
             )
             .expect("route feedback should record");
 
+        registry
+            .record_verification(
+                &task.task_id,
+                VerificationResult {
+                    task_id: task.task_id.clone(),
+                    passed: true,
+                    observed_green_level: Some(crate::green_contract::GreenLevel::Workspace),
+                    summary: "verified".to_string(),
+                    evidence: vec!["cargo test".to_string()],
+                },
+            )
+            .expect("verification should record");
+
         let loaded = registry.get(&task.task_id).expect("task should exist");
         assert!(loaded.plan.is_some());
         assert_eq!(loaded.checkpoints.len(), 2);
         assert_eq!(loaded.recovery_events.len(), 1);
         assert_eq!(loaded.team_events.len(), 1);
         assert_eq!(loaded.route_feedback.len(), 1);
+        assert_eq!(loaded.route_feedback[0].succeeded, Some(true));
+        assert_eq!(loaded.route_feedback[0].verification_passed, Some(true));
+        assert!(loaded.route_feedback[0].recovery_triggered);
+        assert_eq!(loaded.route_feedback[0].note.as_deref(), Some("verified"));
+    }
+
+    #[test]
+    fn update_latest_route_feedback_merges_runtime_metrics() {
+        let registry = TaskRegistry::new();
+        let task = registry.create("Route metrics", None);
+        let route = crate::ModelRouteDecision {
+            phase: crate::ModelRoutePhase::Coding,
+            model: "sonnet".to_string(),
+            provider: None,
+            reason: "test".to_string(),
+            confidence: Some(0.8),
+            fallback_model: None,
+        };
+        registry
+            .record_route_feedback(
+                &task.task_id,
+                ModelRouteFeedback::pending(task.task_id.clone(), route.clone(), now_secs()),
+            )
+            .expect("pending route feedback should record");
+        registry
+            .update_latest_route_feedback(
+                &task.task_id,
+                ModelRouteFeedback::pending(task.task_id.clone(), route, now_secs())
+                    .with_metrics(Some(42), Some(100), Some(25), Some(0.001))
+                    .with_outcome(true, None, false, None),
+            )
+            .expect("route feedback metrics should update");
+
+        let loaded = registry.get(&task.task_id).expect("task should exist");
+        assert_eq!(loaded.route_feedback.len(), 1);
+        assert_eq!(loaded.route_feedback[0].latency_ms, Some(42));
+        assert_eq!(loaded.route_feedback[0].total_tokens(), Some(125));
+        assert_eq!(loaded.route_feedback[0].succeeded, Some(true));
     }
 
     #[test]

@@ -605,6 +605,29 @@ pub fn generate_file(path: &str, format: &str, content: &str) -> io::Result<Gene
     })
 }
 
+/// Generate a binary document file with workspace boundary enforcement.
+pub fn generate_file_in_workspace(
+    path: &str,
+    format: &str,
+    content: &str,
+    workspace_root: &Path,
+) -> io::Result<GenerateFileOutput> {
+    let absolute_path = normalize_workspace_path_allow_missing(path, workspace_root)?;
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    validate_workspace_boundary(&absolute_path, &canonical_root)?;
+    if let Some(parent) = absolute_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    file_generate::generate_file(&absolute_path, format, content)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(GenerateFileOutput {
+        file_path: absolute_path.to_string_lossy().into_owned(),
+        format: format.to_owned(),
+    })
+}
+
 fn normalize_path(path: &str) -> io::Result<PathBuf> {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
@@ -637,6 +660,41 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     Ok(candidate)
 }
 
+fn normalize_workspace_path(path: &str, workspace_root: &Path) -> io::Result<PathBuf> {
+    let candidate = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        workspace_root.join(path)
+    };
+    candidate.canonicalize()
+}
+
+fn normalize_workspace_path_allow_missing(
+    path: &str,
+    workspace_root: &Path,
+) -> io::Result<PathBuf> {
+    let candidate = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        workspace_root.join(path)
+    };
+
+    if let Ok(canonical) = candidate.canonicalize() {
+        return Ok(canonical);
+    }
+
+    if let Some(parent) = candidate.parent() {
+        let canonical_parent = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        if let Some(name) = candidate.file_name() {
+            return Ok(canonical_parent.join(name));
+        }
+    }
+
+    Ok(candidate)
+}
+
 /// Read a file with workspace boundary enforcement.
 #[allow(dead_code)]
 pub fn read_file_in_workspace(
@@ -645,12 +703,12 @@ pub fn read_file_in_workspace(
     limit: Option<usize>,
     workspace_root: &Path,
 ) -> io::Result<ReadFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = normalize_workspace_path(path, workspace_root)?;
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    read_file(path, offset, limit)
+    read_file(absolute_path.to_string_lossy().as_ref(), offset, limit)
 }
 
 /// Write a file with workspace boundary enforcement.
@@ -660,12 +718,12 @@ pub fn write_file_in_workspace(
     content: &str,
     workspace_root: &Path,
 ) -> io::Result<WriteFileOutput> {
-    let absolute_path = normalize_path_allow_missing(path)?;
+    let absolute_path = normalize_workspace_path_allow_missing(path, workspace_root)?;
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    write_file(path, content)
+    write_file(absolute_path.to_string_lossy().as_ref(), content)
 }
 
 /// Edit a file with workspace boundary enforcement.
@@ -677,12 +735,17 @@ pub fn edit_file_in_workspace(
     replace_all: bool,
     workspace_root: &Path,
 ) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = normalize_workspace_path(path, workspace_root)?;
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    edit_file(path, old_string, new_string, replace_all)
+    edit_file(
+        absolute_path.to_string_lossy().as_ref(),
+        old_string,
+        new_string,
+        replace_all,
+    )
 }
 
 /// Check whether a path is a symlink that resolves outside the workspace.
@@ -726,9 +789,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        edit_file, edit_file_in_workspace, expand_braces, glob_search, grep_search,
-        is_symlink_escape, read_file, read_file_in_workspace, write_file, write_file_in_workspace,
-        GrepSearchInput, MAX_WRITE_SIZE,
+        edit_file, edit_file_in_workspace, expand_braces, generate_file_in_workspace, glob_search,
+        grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
+        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -781,6 +844,25 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn generate_file_in_workspace_writes_relative_paths_inside_workspace() {
+        let workspace = temp_path("generate-workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+
+        let output = generate_file_in_workspace(
+            "docs/report.docx",
+            "docx",
+            "# Report\n\nGenerated safely.",
+            &workspace,
+        )
+        .expect("relative generate path should stay inside workspace");
+
+        let generated = std::path::PathBuf::from(output.file_path);
+        assert!(generated.starts_with(&workspace));
+        assert!(generated.exists());
+        std::fs::remove_dir_all(workspace).expect("cleanup workspace");
     }
 
     #[test]

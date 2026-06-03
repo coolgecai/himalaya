@@ -230,6 +230,31 @@ impl ModelRouteFeedback {
         self
     }
 
+    pub fn merge_observations(&mut self, observation: &Self) {
+        if observation.succeeded.is_some() {
+            self.succeeded = observation.succeeded;
+        }
+        if observation.latency_ms.is_some() {
+            self.latency_ms = observation.latency_ms;
+        }
+        if observation.input_tokens.is_some() {
+            self.input_tokens = observation.input_tokens;
+        }
+        if observation.output_tokens.is_some() {
+            self.output_tokens = observation.output_tokens;
+        }
+        if observation.cost_usd.is_some() {
+            self.cost_usd = observation.cost_usd;
+        }
+        if observation.verification_passed.is_some() {
+            self.verification_passed = observation.verification_passed;
+        }
+        self.recovery_triggered |= observation.recovery_triggered;
+        if observation.note.is_some() {
+            self.note = observation.note.clone();
+        }
+    }
+
     #[must_use]
     pub fn total_tokens(&self) -> Option<u64> {
         match (self.input_tokens, self.output_tokens) {
@@ -289,11 +314,21 @@ impl ModelRouter {
         let scored = candidates
             .iter()
             .map(|route| {
-                let stats = RouteFeedbackStats::for_route(phase, &route.model, feedback);
+                let stats = RouteFeedbackStats::for_route(
+                    phase,
+                    route.provider.as_deref(),
+                    &route.model,
+                    feedback,
+                );
                 (route, stats, adaptive_route_score(route, &stats))
             })
             .collect::<Vec<_>>();
-        let primary_stats = RouteFeedbackStats::for_route(phase, &primary.model, feedback);
+        let primary_stats = RouteFeedbackStats::for_route(
+            phase,
+            primary.provider.as_deref(),
+            &primary.model,
+            feedback,
+        );
         let primary_failure_rate = primary_stats.failure_rate();
         let threshold = f32::from(self.policy.switch_failure_threshold_percent) / 100.0;
         let should_switch = primary_stats.total >= self.policy.min_feedback_samples
@@ -302,15 +337,18 @@ impl ModelRouter {
         if should_switch {
             if let Some((route, stats, _score)) = scored
                 .iter()
-                .filter(|(route, _, _)| route.model != primary.model)
+                .filter(|(route, _, _)| {
+                    route.model != primary.model || route.provider != primary.provider
+                })
                 .max_by(|left, right| left.2.total_cmp(&right.2))
             {
                 let mut decision = self.decision_for_route(
                     phase,
                     route,
                     &format!(
-                        "adaptive route selected from route feedback after {:.0}% failure/recovery rate for {}",
+                        "adaptive route selected from route feedback after {:.0}% failure/recovery rate for {}/{}",
                         primary_failure_rate * 100.0,
+                        primary.provider.as_deref().unwrap_or("default"),
                         primary.model
                     ),
                     Some((1.0 - stats.failure_rate()).clamp(0.35, 0.95)),
@@ -328,8 +366,10 @@ impl ModelRouter {
         );
         if primary_stats.total > 0 && primary_failure_rate >= threshold {
             decision.reason = format!(
-                "{}; route feedback shows {:.0}% recent failure/recovery rate",
+                "{}; route feedback for {}/{} shows {:.0}% recent failure/recovery rate",
                 decision.reason,
+                primary.provider.as_deref().unwrap_or("default"),
+                primary.model,
                 primary_failure_rate * 100.0
             );
         }
@@ -383,12 +423,18 @@ struct RouteFeedbackStats {
 }
 
 impl RouteFeedbackStats {
-    fn for_route(phase: ModelRoutePhase, model: &str, feedback: &[ModelRouteFeedback]) -> Self {
+    fn for_route(
+        phase: ModelRoutePhase,
+        provider: Option<&str>,
+        model: &str,
+        feedback: &[ModelRouteFeedback],
+    ) -> Self {
         let related = feedback
             .iter()
             .filter(|entry| {
                 entry.route.phase == phase
                     && entry.route.model == model
+                    && entry.route.provider.as_deref() == provider
                     && entry.succeeded.is_some()
             })
             .collect::<Vec<_>>();
@@ -520,6 +566,54 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_feedback_keeps_provider_routes_separate() {
+        let policy = MoERoutingPolicy::new(
+            "sonnet",
+            vec![
+                ModelRoute::new(ModelRoutePhase::Verification, "shared")
+                    .with_provider("anthropic")
+                    .with_weights(1, 1, 5),
+                ModelRoute::new(ModelRoutePhase::Verification, "shared")
+                    .with_provider("openai")
+                    .with_weights(1, 1, 4),
+            ],
+        )
+        .with_adaptive(true, 2, 50);
+        let router = ModelRouter::new(policy);
+        let primary = router.select(ModelRoutePhase::Verification);
+        assert_eq!(primary.provider.as_deref(), Some("anthropic"));
+        let failed_primary = ModelRouteDecision {
+            provider: Some("anthropic".to_string()),
+            ..primary.clone()
+        };
+        let healthy_same_model_other_provider = ModelRouteDecision {
+            provider: Some("openai".to_string()),
+            ..primary.clone()
+        };
+        let feedback = vec![
+            ModelRouteFeedback::pending("task-1", failed_primary.clone(), 1).with_outcome(
+                false,
+                Some(false),
+                true,
+                Some("failed".to_string()),
+            ),
+            ModelRouteFeedback::pending("task-2", failed_primary, 2).with_outcome(
+                false,
+                Some(false),
+                true,
+                Some("failed".to_string()),
+            ),
+            ModelRouteFeedback::pending("task-3", healthy_same_model_other_provider, 3)
+                .with_outcome(true, Some(true), false, None),
+        ];
+
+        let decision = router.select_with_feedback(ModelRoutePhase::Verification, &feedback);
+
+        assert_eq!(decision.model, "shared");
+        assert_eq!(decision.provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
     fn adaptive_score_penalizes_expensive_slow_routes() {
         let fast_route = ModelRoute::new(ModelRoutePhase::Coding, "fast").with_weights(5, 5, 3);
         let slow_route = ModelRoute::new(ModelRoutePhase::Coding, "slow").with_weights(5, 5, 3);
@@ -547,8 +641,10 @@ mod tests {
                 .with_metrics(Some(5_000), Some(8_000), Some(4_000), Some(0.25))
                 .with_outcome(true, Some(true), false, None),
         ];
-        let fast_stats = RouteFeedbackStats::for_route(ModelRoutePhase::Coding, "fast", &feedback);
-        let slow_stats = RouteFeedbackStats::for_route(ModelRoutePhase::Coding, "slow", &feedback);
+        let fast_stats =
+            RouteFeedbackStats::for_route(ModelRoutePhase::Coding, None, "fast", &feedback);
+        let slow_stats =
+            RouteFeedbackStats::for_route(ModelRoutePhase::Coding, None, "slow", &feedback);
 
         assert!(
             adaptive_route_score(&fast_route, &fast_stats)
