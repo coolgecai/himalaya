@@ -22,6 +22,7 @@ pub enum ConfigSource {
 /// Effective permission mode after decoding config values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedPermissionMode {
+    Prompt,
     ReadOnly,
     WorkspaceWrite,
     DangerFullAccess,
@@ -31,6 +32,7 @@ impl ResolvedPermissionMode {
     #[must_use]
     pub fn as_permission_mode(self) -> PermissionMode {
         match self {
+            Self::Prompt => PermissionMode::Prompt,
             Self::ReadOnly => PermissionMode::ReadOnly,
             Self::WorkspaceWrite => PermissionMode::WorkspaceWrite,
             Self::DangerFullAccess => PermissionMode::DangerFullAccess,
@@ -1220,6 +1222,7 @@ fn parse_permission_mode_label(
     context: &str,
 ) -> Result<ResolvedPermissionMode, ConfigError> {
     match PermissionMode::parse_public(mode) {
+        Some(PermissionMode::Prompt) => Ok(ResolvedPermissionMode::Prompt),
         Some(PermissionMode::ReadOnly) => Ok(ResolvedPermissionMode::ReadOnly),
         Some(PermissionMode::WorkspaceWrite) => Ok(ResolvedPermissionMode::WorkspaceWrite),
         Some(PermissionMode::DangerFullAccess) => Ok(ResolvedPermissionMode::DangerFullAccess),

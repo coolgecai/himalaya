@@ -113,9 +113,10 @@ pub use execution_scheduler::{
 };
 pub use failure_classifier::{FailureClassification, FailureClassifier};
 pub use file_ops::{
-    edit_file, generate_file, glob_search, grep_search, read_file, write_file, EditFileOutput,
-    GenerateFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput,
-    StructuredPatchHunk, TextFilePayload, WriteFileOutput,
+    edit_file, edit_file_in_workspace, generate_file, generate_file_in_workspace, glob_search,
+    grep_search, read_file, read_file_in_workspace, write_file, write_file_in_workspace,
+    EditFileOutput, GenerateFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
+    ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
@@ -239,10 +240,11 @@ pub use verifier::{
     VerificationDecision, VerificationPolicy, VerificationRequest, VerificationResult,
 };
 pub use worker_boot::{
-    Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
-    WorkerIsolation, WorkerIsolationKind, WorkerIsolationSpec, WorkerProcess, WorkerProcessHandle,
-    WorkerProcessSpec, WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus,
-    WorkerTrustResolution, DEFAULT_WORKER_LEASE_SECS, DEFAULT_WORKER_MAX_RESTARTS,
+    Worker, WorkerCleanupReport, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure,
+    WorkerFailureKind, WorkerIsolation, WorkerIsolationKind, WorkerIsolationSpec, WorkerProcess,
+    WorkerProcessHandle, WorkerProcessSpec, WorkerPromptTarget, WorkerReadySnapshot,
+    WorkerRegistry, WorkerStatus, WorkerTrustResolution, DEFAULT_WORKER_LEASE_SECS,
+    DEFAULT_WORKER_MAX_RESTARTS,
 };
 pub use worker_supervisor::{
     WorkerEventIndexEntry, WorkerSupervisor, WorkerSupervisorCapacity, WorkerSupervisorStatus,

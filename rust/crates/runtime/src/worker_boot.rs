@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -195,6 +195,13 @@ pub struct Worker {
     pub events: Vec<WorkerEvent>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerCleanupReport {
+    pub removed_workers: Vec<Worker>,
+    pub retained_workers: usize,
+    pub removed_worktrees: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkerRegistrySnapshot {
     version: u32,
@@ -219,6 +226,60 @@ pub struct WorkerRegistry {
 pub struct WorkerProcessHandle {
     pub worker: Worker,
     pub child: Child,
+    /// Thread-safe buffer of lines recently read from the child's stdout.
+    pub stdout_buffer: Arc<Mutex<Vec<String>>>,
+}
+
+impl WorkerProcessHandle {
+    /// Write a prompt line to the child's stdin if a piped handle exists.
+    pub fn send_prompt(&mut self, prompt: &str) -> io::Result<()> {
+        let Some(stdin) = self.child.stdin.as_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "worker process stdin is not available (process may have exited)",
+            ));
+        };
+        stdin.write_all(prompt.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()
+    }
+
+    /// Drain any available lines from the child's stdout into the buffer.
+    pub fn drain_stdout(&mut self) -> io::Result<Vec<String>> {
+        let mut new_lines = Vec::new();
+        if let Some(stdout) = self.child.stdout.as_mut() {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim_end_matches(['\n', '\r']).to_string();
+                        if !trimmed.is_empty() {
+                            new_lines.push(trimmed);
+                        }
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        if !new_lines.is_empty() {
+            let mut buf = self
+                .stdout_buffer
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            buf.extend(new_lines.clone());
+        }
+        Ok(new_lines)
+    }
+
+    /// Consume the handle and return the Child for final wait/exit-status collection.
+    #[must_use]
+    pub fn into_child(self) -> Child {
+        self.child
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,9 +394,9 @@ impl WorkerRegistry {
         command
             .args(&spec.command[1..])
             .current_dir(&effective_cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -388,7 +449,11 @@ impl WorkerRegistry {
             );
             worker = stored.clone();
         }
-        Ok(WorkerProcessHandle { worker, child })
+        Ok(WorkerProcessHandle {
+            worker,
+            child,
+            stdout_buffer: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     #[must_use]
@@ -498,6 +563,51 @@ impl WorkerRegistry {
         let mut workers = inner.workers.values().cloned().collect::<Vec<_>>();
         workers.sort_by_key(|worker| (worker.created_at, worker.worker_id.clone()));
         workers
+    }
+
+    #[must_use]
+    pub fn cleanup_finished(&self) -> WorkerCleanupReport {
+        self.cleanup(false, now_secs())
+    }
+
+    #[must_use]
+    pub fn cleanup_stale(&self, now: u64) -> WorkerCleanupReport {
+        self.cleanup(true, now)
+    }
+
+    fn cleanup(&self, include_stale: bool, now: u64) -> WorkerCleanupReport {
+        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let mut removed_workers = Vec::new();
+        let mut removed_worktrees = Vec::new();
+        let remove_ids = inner
+            .workers
+            .iter()
+            .filter_map(|(worker_id, worker)| {
+                if should_cleanup_worker(worker, include_stale, now) {
+                    Some(worker_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for worker_id in remove_ids {
+            if let Some(worker) = inner.workers.remove(&worker_id) {
+                if let Some(isolation) = worker.isolation.as_ref() {
+                    cleanup_worker_isolation(Some(isolation));
+                    removed_worktrees.push(isolation.worktree_path.clone());
+                }
+                removed_workers.push(worker);
+            }
+        }
+
+        removed_workers.sort_by_key(|worker| (worker.created_at, worker.worker_id.clone()));
+        removed_worktrees.sort();
+        WorkerCleanupReport {
+            removed_workers,
+            retained_workers: inner.workers.len(),
+            removed_worktrees,
+        }
     }
 
     pub fn save_to_dir(&self, dir: &Path) -> io::Result<()> {
@@ -976,10 +1086,9 @@ fn create_git_worktree_isolation(
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("failed to create worker git worktree: {stderr}"),
-        ));
+        return Err(io::Error::other(format!(
+            "failed to create worker git worktree: {stderr}"
+        )));
     }
 
     Ok((
@@ -1027,6 +1136,22 @@ fn refresh_worker_lease(worker: &mut Worker, now: u64, lease_secs: u64) {
 
 fn is_terminal(status: WorkerStatus) -> bool {
     matches!(status, WorkerStatus::Finished | WorkerStatus::Failed)
+}
+
+fn should_cleanup_worker(worker: &Worker, include_stale: bool, now: u64) -> bool {
+    is_terminal(worker.status)
+        || (include_stale
+            && worker.status != WorkerStatus::TrustRequired
+            && worker.lease_expires_at > 0
+            && now > worker.lease_expires_at
+            && !worker_has_live_process(worker))
+}
+
+fn worker_has_live_process(worker: &Worker) -> bool {
+    worker
+        .process
+        .as_ref()
+        .is_some_and(|process| process.exited_at.is_none() && process_is_alive(process.pid))
 }
 
 fn restart_stale_worker(worker: &mut Worker, now: u64, lease_secs: u64) -> Option<Worker> {
@@ -1953,8 +2078,27 @@ mod tests {
             .events
             .iter()
             .any(|event| event.kind == WorkerEventKind::WorktreeCreated));
-        cleanup_worker_isolation(observed.isolation.as_ref());
+        let report = registry.cleanup_finished();
+        assert_eq!(report.removed_workers.len(), 1);
+        assert_eq!(report.removed_worktrees.len(), 1);
+        assert!(!std::path::Path::new(&isolation.worktree_path).exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_stale_removes_expired_worker_without_live_process() {
+        let registry = WorkerRegistry::new();
+        let worker = registry.create("/tmp/repo-cleanup-stale", &[], true);
+        let expired = registry
+            .expire_lease_for_test(&worker.worker_id)
+            .expect("lease should expire");
+
+        let report = registry.cleanup_stale(expired.lease_expires_at + 1);
+
+        assert_eq!(report.removed_workers.len(), 1);
+        assert_eq!(report.removed_workers[0].worker_id, worker.worker_id);
+        assert_eq!(report.retained_workers, 0);
+        assert!(registry.get(&worker.worker_id).is_none());
     }
 
     #[test]

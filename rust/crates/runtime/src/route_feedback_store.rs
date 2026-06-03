@@ -14,6 +14,7 @@ pub struct RouteFeedbackSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteFeedbackSummary {
     pub phase: ModelRoutePhase,
+    pub provider: Option<String>,
     pub model: String,
     pub total: usize,
     pub failures: usize,
@@ -57,28 +58,24 @@ impl RouteFeedbackStore {
             feedback: self.feedback.clone(),
         })
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        fs::write(dir.join("feedback.json"), format!("{json}\n"))
+        let path = dir.join("feedback.json");
+        let tmp = dir.join("feedback.json.tmp");
+        fs::write(&tmp, format!("{json}\n"))?;
+        fs::rename(&tmp, &path)
     }
 
     pub fn record(&mut self, feedback: ModelRouteFeedback) {
-        let exists = self.feedback.iter().any(|entry| {
+        if let Some(existing) = self.feedback.iter_mut().find(|entry| {
             entry.task_id == feedback.task_id
                 && entry.timestamp == feedback.timestamp
                 && entry.route.phase == feedback.route.phase
                 && entry.route.model == feedback.route.model
                 && entry.route.provider == feedback.route.provider
-                && entry.succeeded == feedback.succeeded
-                && entry.latency_ms == feedback.latency_ms
-                && entry.input_tokens == feedback.input_tokens
-                && entry.output_tokens == feedback.output_tokens
-                && entry.cost_usd == feedback.cost_usd
-                && entry.verification_passed == feedback.verification_passed
-                && entry.recovery_triggered == feedback.recovery_triggered
-                && entry.note == feedback.note
-        });
-        if !exists {
-            self.feedback.push(feedback);
+        }) {
+            existing.merge_observations(&feedback);
+            return;
         }
+        self.feedback.push(feedback);
     }
 
     #[must_use]
@@ -91,7 +88,9 @@ impl RouteFeedbackStore {
         let mut summaries = Vec::new();
         for entry in &self.feedback {
             if summaries.iter().any(|summary: &RouteFeedbackSummary| {
-                summary.phase == entry.route.phase && summary.model == entry.route.model
+                summary.phase == entry.route.phase
+                    && summary.provider == entry.route.provider
+                    && summary.model == entry.route.model
             }) {
                 continue;
             }
@@ -100,6 +99,7 @@ impl RouteFeedbackStore {
                 .iter()
                 .filter(|candidate| {
                     candidate.route.phase == entry.route.phase
+                        && candidate.route.provider == entry.route.provider
                         && candidate.route.model == entry.route.model
                 })
                 .collect::<Vec<_>>();
@@ -126,6 +126,7 @@ impl RouteFeedbackStore {
                 average_f64(related.iter().filter_map(|candidate| candidate.cost_usd));
             summaries.push(RouteFeedbackSummary {
                 phase: entry.route.phase,
+                provider: entry.route.provider.clone(),
                 model: entry.route.model.clone(),
                 total,
                 failures,
@@ -140,6 +141,22 @@ impl RouteFeedbackStore {
                 avg_cost_usd,
             });
         }
+        summaries.sort_by(|left, right| {
+            left.success_rate
+                .partial_cmp(&right.success_rate)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.failures.cmp(&left.failures))
+                .then_with(|| right.recovery_triggered.cmp(&left.recovery_triggered))
+                .then_with(|| {
+                    right
+                        .avg_latency_ms
+                        .partial_cmp(&left.avg_latency_ms)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.phase.cmp(&right.phase))
+                .then_with(|| left.provider.cmp(&right.provider))
+                .then_with(|| left.model.cmp(&right.model))
+        });
         summaries
     }
 }
@@ -190,6 +207,31 @@ mod tests {
     }
 
     #[test]
+    fn record_merges_replayed_route_observations() {
+        let route = ModelRouteDecision {
+            phase: ModelRoutePhase::Verification,
+            model: "opus".to_string(),
+            provider: Some("anthropic".to_string()),
+            reason: "test".to_string(),
+            confidence: Some(0.8),
+            fallback_model: Some("sonnet".to_string()),
+        };
+        let mut store = RouteFeedbackStore::new();
+        store.record(ModelRouteFeedback::pending("task-1", route.clone(), 7));
+        store.record(
+            ModelRouteFeedback::pending("task-1", route, 7)
+                .with_metrics(Some(900), Some(1_000), Some(200), Some(0.02))
+                .with_outcome(true, Some(true), false, Some("verified".to_string())),
+        );
+
+        assert_eq!(store.feedback().len(), 1);
+        let feedback = &store.feedback()[0];
+        assert_eq!(feedback.succeeded, Some(true));
+        assert_eq!(feedback.verification_passed, Some(true));
+        assert_eq!(feedback.total_tokens(), Some(1_200));
+    }
+
+    #[test]
     fn saves_and_loads_feedback_snapshot() {
         let dir = std::env::temp_dir().join(format!(
             "Himalaya-route-feedback-store-{}",
@@ -222,30 +264,48 @@ mod tests {
     }
 
     #[test]
-    fn summarizes_feedback_by_phase_and_model() {
-        let route = ModelRouteDecision {
+    fn summarizes_feedback_by_phase_provider_and_model() {
+        let anthropic_route = ModelRouteDecision {
             phase: ModelRoutePhase::Coding,
             model: "sonnet".to_string(),
-            provider: None,
+            provider: Some("anthropic".to_string()),
             reason: "test".to_string(),
             confidence: Some(0.8),
             fallback_model: None,
         };
+        let openai_route = ModelRouteDecision {
+            provider: Some("openai".to_string()),
+            ..anthropic_route.clone()
+        };
         let store = RouteFeedbackStore::from_feedback(vec![
-            ModelRouteFeedback::pending("task-1", route.clone(), 1)
+            ModelRouteFeedback::pending("task-1", anthropic_route.clone(), 1)
                 .with_metrics(Some(1_000), Some(1_500), Some(500), Some(0.01))
                 .with_outcome(true, None, false, None),
-            ModelRouteFeedback::pending("task-2", route, 2)
+            ModelRouteFeedback::pending("task-2", anthropic_route, 2)
                 .with_metrics(Some(3_000), Some(2_500), Some(1_500), Some(0.03))
                 .with_outcome(false, None, true, None),
+            ModelRouteFeedback::pending("task-3", openai_route, 3)
+                .with_metrics(Some(500), Some(700), Some(300), Some(0.005))
+                .with_outcome(true, None, false, None),
         ]);
-        let summary = store.summaries().pop().expect("summary");
+        let summaries = store.summaries();
+        assert_eq!(summaries.len(), 2);
+        let anthropic = summaries
+            .iter()
+            .find(|summary| summary.provider.as_deref() == Some("anthropic"))
+            .expect("anthropic summary");
 
-        assert_eq!(summary.total, 2);
-        assert_eq!(summary.failures, 1);
-        assert_eq!(summary.recovery_triggered, 1);
-        assert_eq!(summary.avg_latency_ms, Some(2_000.0));
-        assert_eq!(summary.avg_tokens, Some(3_000.0));
-        assert_eq!(summary.avg_cost_usd, Some(0.02));
+        assert_eq!(anthropic.total, 2);
+        assert_eq!(anthropic.failures, 1);
+        assert_eq!(anthropic.recovery_triggered, 1);
+        assert_eq!(anthropic.avg_latency_ms, Some(2_000.0));
+        assert_eq!(anthropic.avg_tokens, Some(3_000.0));
+        assert_eq!(anthropic.avg_cost_usd, Some(0.02));
+        let openai = summaries
+            .iter()
+            .find(|summary| summary.provider.as_deref() == Some("openai"))
+            .expect("openai summary");
+        assert_eq!(openai.total, 1);
+        assert_eq!(openai.failures, 0);
     }
 }

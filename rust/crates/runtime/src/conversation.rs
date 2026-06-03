@@ -272,14 +272,28 @@ impl LongTermMemory {
         if topic.trim().is_empty() || note.trim().is_empty() {
             return;
         }
-        let entry = MemoryEntry {
-            kind,
-            topic,
-            note,
-            confidence: confidence.clamp(0.0, 1.0),
-            ts_ms: current_time_millis(),
-        };
-        self.entries.push(entry);
+        let confidence = confidence.clamp(0.0, 1.0);
+        let now = current_time_millis();
+
+        // Upsert: if an existing entry has the same kind + topic + normalised note,
+        // update its confidence and timestamp instead of appending a duplicate.
+        let normalized_note = note.trim().to_lowercase();
+        if let Some(existing) = self.entries.iter_mut().find(|entry| {
+            entry.kind == kind
+                && entry.topic == topic
+                && entry.note.trim().to_lowercase() == normalized_note
+        }) {
+            existing.confidence = confidence.max(existing.confidence);
+            existing.ts_ms = now;
+        } else {
+            self.entries.push(MemoryEntry {
+                kind,
+                topic,
+                note,
+                confidence,
+                ts_ms: now,
+            });
+        }
         let _ = self.save();
     }
 
@@ -360,11 +374,12 @@ impl LongTermMemory {
 
     pub fn save(&self) -> Result<(), std::io::Error> {
         if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent)?;
         }
-        let serialized =
-            serde_json::to_string_pretty(&self.entries).unwrap_or_else(|_| "[]".to_string());
-        fs::write(&self.path, serialized)
+        let json = serde_json::to_string_pretty(&self.entries).unwrap_or_else(|_| "[]".to_string());
+        let tmp = self.path.with_extension("tmp");
+        fs::write(&tmp, &json)?;
+        fs::rename(&tmp, &self.path)
     }
 }
 
@@ -529,6 +544,107 @@ impl TurnTaskState {
         }
         lines.join("\n")
     }
+}
+
+fn push_capabilities(capabilities: &mut Vec<String>, values: &[&str]) {
+    capabilities.extend(values.iter().map(|value| (*value).to_string()));
+}
+
+fn infer_prompt_capabilities(user_input: &str) -> Vec<String> {
+    let lower = user_input.to_lowercase();
+    let mut capabilities = Vec::new();
+
+    if user_requests_current_workspace_analysis(user_input)
+        || [
+            "codebase",
+            "source code",
+            "directory structure",
+            "repo",
+            "repository",
+            "当前工程",
+            "源码",
+            "目录结构",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        push_capabilities(
+            &mut capabilities,
+            &[
+                "search",
+                "read",
+                "file",
+                "grep",
+                "glob",
+                "workspace",
+                "evidence",
+                "source-analysis",
+            ],
+        );
+    }
+
+    if [
+        "modify",
+        "implement",
+        "fix",
+        "refactor",
+        "edit",
+        "write",
+        "修改",
+        "实现",
+        "修复",
+        "重构",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        push_capabilities(&mut capabilities, &["read", "edit", "write", "test"]);
+    }
+
+    if ["test", "verify", "validate", "run", "测试", "验证", "运行"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        push_capabilities(&mut capabilities, &["shell", "test", "verification"]);
+    }
+
+    if [
+        "research",
+        "web",
+        "fetch",
+        "search online",
+        "查阅",
+        "联网",
+        "调研",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        push_capabilities(&mut capabilities, &["web", "research", "search", "fetch"]);
+    }
+
+    if [
+        "agent",
+        "worker",
+        "parallel",
+        "multi-agent",
+        "多agent",
+        "并行",
+        "分解",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        push_capabilities(&mut capabilities, &["agent", "worker", "team", "planning"]);
+    }
+
+    if capabilities.is_empty() {
+        push_capabilities(&mut capabilities, &["read", "analysis", "planning"]);
+    }
+
+    capabilities.sort();
+    capabilities.dedup();
+    capabilities
 }
 
 fn workspace_evidence_tools_available(available_tool_names: &BTreeSet<String>) -> bool {
@@ -1958,6 +2074,11 @@ where
             record_user_memory(&mut memory, &user_memory_facts);
         }
         let mut effective_system_prompt = self.system_prompt.clone();
+        if let Some(initial_plan) =
+            self.build_initial_decisioning_plan(&runtime_task_id, &user_input)
+        {
+            effective_system_prompt.push(Self::format_initial_decisioning_prompt(&initial_plan));
+        }
         if let Some(memory_override) = format_user_memory_override(&user_memory_facts) {
             effective_system_prompt.push(memory_override);
         }
@@ -1989,6 +2110,7 @@ where
 
             let model_route =
                 self.select_model_route_for_task(&runtime_task_id, crate::ModelRoutePhase::Coding);
+            let model_started_at = std::time::Instant::now();
             let request = ApiRequest {
                 system_prompt: {
                     let mut prompt = effective_system_prompt.clone();
@@ -2014,7 +2136,17 @@ where
                     }
                 };
             if let Some(usage) = usage {
+                let model_latency_ms = model_started_at
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u32::MAX)) as u32;
                 self.usage_tracker.record(usage);
+                self.enrich_latest_route_feedback_from_usage(
+                    &runtime_task_id,
+                    usage,
+                    model_latency_ms,
+                    None,
+                );
             }
             prompt_cache_events.extend(turn_prompt_cache_events);
 
@@ -2472,7 +2604,7 @@ where
                     .task_registry
                     .set_status(&runtime_task_id, terminal_status);
                 self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
-                let _ = self.task_registry.record_route_feedback(
+                let _ = self.task_registry.update_latest_route_feedback(
                     &runtime_task_id,
                     crate::ModelRouteFeedback::pending(
                         runtime_task_id.clone(),
@@ -2510,7 +2642,7 @@ where
                     .set_status(&runtime_task_id, crate::TaskStatus::Failed);
                 self.emit_task_ledger_events(&runtime_task_id, task_ledger_offset);
                 let error = RuntimeError::new("verification is required before task completion");
-                let _ = self.task_registry.record_route_feedback(
+                let _ = self.task_registry.update_latest_route_feedback(
                     &runtime_task_id,
                     crate::ModelRouteFeedback::pending(
                         runtime_task_id.clone(),
@@ -2528,7 +2660,7 @@ where
                 return Err(error);
             }
             VerificationDecision::NotRequired | VerificationDecision::Passed => {
-                let _ = self.task_registry.record_route_feedback(
+                let _ = self.task_registry.update_latest_route_feedback(
                     &runtime_task_id,
                     crate::ModelRouteFeedback::pending(
                         runtime_task_id.clone(),
@@ -2794,7 +2926,6 @@ where
         user_input: &str,
         pending_tool_uses: &[(String, String, String)],
     ) -> Vec<Tool> {
-        let recent_history = self.collect_recent_tool_history();
         let mut tools = BTreeMap::new();
 
         for tool in self.tool_executor.available_tools() {
@@ -2807,6 +2938,7 @@ where
                 .or_insert_with(|| tool_from_profile(tool_name, None, None));
         }
 
+        let recent_history = self.collect_recent_tool_history();
         for tool in tools.values_mut() {
             let matching_history = recent_history
                 .iter()
@@ -2859,7 +2991,9 @@ where
         pending_tool_uses: &[(String, String, String)],
         reasoning_context: &ReasoningContext,
     ) -> Task {
-        let mut required_capabilities = if user_requests_current_workspace_analysis(user_input) {
+        let mut required_capabilities = if pending_tool_uses.is_empty() {
+            infer_prompt_capabilities(user_input)
+        } else if user_requests_current_workspace_analysis(user_input) {
             vec![
                 "search".to_string(),
                 "read".to_string(),
@@ -2882,7 +3016,11 @@ where
         Task::new(
             task_id.to_string(),
             user_input.to_string(),
-            pending_tool_uses.len().clamp(1, 5) as u8,
+            if pending_tool_uses.is_empty() {
+                required_capabilities.len().clamp(1, 5)
+            } else {
+                pending_tool_uses.len().clamp(1, 5)
+            } as u8,
             required_capabilities,
             reasoning_context.active_constraints.clone(),
         )
@@ -2899,6 +3037,95 @@ where
             ToolSelector::new(available_tools, reasoning_context),
             crate::TaskPlanner::new(self.decisioning_config.max_parallelism()),
             safety,
+        )
+    }
+
+    fn build_initial_decisioning_plan(
+        &self,
+        task_id: &str,
+        user_input: &str,
+    ) -> Option<DecisioningTurnPlan> {
+        if !self.decisioning_config.enabled() {
+            return None;
+        }
+
+        let reasoning_context = self.build_reasoning_context(None);
+        let decisioning_task =
+            self.build_decisioning_task(task_id, user_input, &[], &reasoning_context);
+        let decisioning_engine = self.build_decisioning_engine(
+            self.build_decisioning_tools(user_input, &[]),
+            reasoning_context,
+        );
+        let snapshot = decisioning_engine.analyze(&decisioning_task);
+        let dag = crate::build_plan_dag(&snapshot.task, &snapshot.plan, &snapshot.selected_tools);
+        let execution = PlanExecution::new(&dag);
+        let mut next_execution_event_offset = 0;
+        if self.decisioning_config.emit_events() {
+            self.record_decisioning_snapshot(&snapshot);
+            self.emit_decisioning_events(&snapshot);
+            self.emit_plan_execution_events(&execution, next_execution_event_offset);
+            next_execution_event_offset = execution.events.len();
+        }
+        let _ = self
+            .task_registry
+            .record_plan(task_id, dag.clone(), execution.clone());
+
+        let selected_positions = snapshot
+            .selected_tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| (tool.name.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+
+        Some(DecisioningTurnPlan {
+            engine: decisioning_engine,
+            task: decisioning_task,
+            snapshot,
+            dag,
+            execution,
+            next_execution_event_offset,
+            selected_positions,
+            workspace_evidence_stage_active: user_requests_current_workspace_analysis(user_input),
+        })
+    }
+
+    fn format_initial_decisioning_prompt(plan: &DecisioningTurnPlan) -> String {
+        let selected_tools = plan
+            .snapshot
+            .selected_tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        let steps = plan
+            .snapshot
+            .plan
+            .steps
+            .iter()
+            .take(8)
+            .map(|step| {
+                let tools = if step.candidate_tools.is_empty() {
+                    "no preferred tool".to_string()
+                } else {
+                    step.candidate_tools.join(", ")
+                };
+                format!("- {}: {} (tools: {tools})", step.id, step.title)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let selected_summary = if selected_tools.is_empty() {
+            "none".to_string()
+        } else {
+            selected_tools.join(", ")
+        };
+        format!(
+            "# Advisory task plan\nThis capability-aware plan was generated before the first model step. Treat it as guidance, not permission escalation. Follow workspace evidence and permission requirements before answering.\n- Task id: {}\n- Execution mode: {}\n- Confidence: {:.0}%\n- Safety outcome: {:?} (risk {:.0}%)\n- Preferred tools: {}\n\n{}",
+            plan.task.id,
+            plan.snapshot.plan.execution_mode.label(),
+            plan.snapshot.plan.confidence * 100.0,
+            plan.snapshot.risk.outcome,
+            plan.snapshot.risk.score * 100.0,
+            selected_summary,
+            steps,
         )
     }
 
@@ -3041,6 +3268,48 @@ where
             }
             self.emit_runtime_event(RuntimeEvent::TaskLedger(event));
         }
+    }
+
+    fn enrich_latest_route_feedback_from_usage(
+        &self,
+        task_id: &str,
+        usage: TokenUsage,
+        latency_ms: u32,
+        succeeded: Option<bool>,
+    ) {
+        if usage.total_tokens() == 0 && succeeded.is_none() {
+            return;
+        }
+        let route = self.task_registry.get(task_id).and_then(|task| {
+            task.route_feedback
+                .last()
+                .map(|feedback| feedback.route.clone())
+        });
+        let Some(route) = route else {
+            return;
+        };
+        let input_tokens = usage
+            .input_tokens
+            .saturating_add(usage.cache_creation_input_tokens)
+            .saturating_add(usage.cache_read_input_tokens);
+        let cost = usage.estimate_cost_usd().total_cost_usd();
+        let mut feedback = crate::ModelRouteFeedback::pending(
+            task_id.to_string(),
+            route,
+            current_time_millis() / 1_000,
+        )
+        .with_metrics(
+            (latency_ms > 0).then_some(latency_ms),
+            (input_tokens > 0).then_some(u64::from(input_tokens)),
+            (usage.output_tokens > 0).then_some(u64::from(usage.output_tokens)),
+            (cost > 0.0).then_some(cost),
+        );
+        if let Some(succeeded) = succeeded {
+            feedback.succeeded = Some(succeeded);
+        }
+        let _ = self
+            .task_registry
+            .update_latest_route_feedback(task_id, feedback);
     }
 
     fn select_model_route_for_task(
@@ -4352,6 +4621,85 @@ mod tests {
             emitted_events[0].kind,
             crate::DecisioningEventKind::ToolSelection
         ));
+    }
+
+    #[test]
+    fn initial_decisioning_plan_is_recorded_before_first_model_call() {
+        struct InspectInitialPlanApi;
+
+        impl ApiClient for InspectInitialPlanApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert!(request
+                    .system_prompt
+                    .iter()
+                    .any(|part| part.contains("# Advisory task plan")));
+                assert!(request
+                    .system_prompt
+                    .iter()
+                    .any(|part| part.contains("Preferred tools")));
+                Ok(vec![
+                    AssistantEvent::TextDelta("planned".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(true)
+                .with_max_parallelism(2),
+        );
+        struct RecordingRuntimeReporter {
+            events: Arc<Mutex<Vec<crate::RuntimeEvent>>>,
+        }
+        impl crate::RuntimeEventReporter for RecordingRuntimeReporter {
+            fn emit_runtime_event(&self, event: &crate::RuntimeEvent) {
+                self.events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event.clone());
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            InspectInitialPlanApi,
+            StaticToolExecutor::new()
+                .register("read_file", |_input| Ok("contents".to_string()))
+                .register("grep_search", |_input| Ok("matches".to_string()))
+                .register("edit_file", |_input| Ok("edited".to_string())),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+            &feature_config,
+        )
+        .with_runtime_event_reporter(RecordingRuntimeReporter {
+            events: events.clone(),
+        });
+
+        runtime
+            .run_turn("please plan a refactor", None)
+            .expect("initial decisioning turn should complete");
+
+        assert!(runtime
+            .task_registry()
+            .list(None)
+            .iter()
+            .any(|task| task.plan.is_some()));
+        let events = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let first_model_route = events
+            .iter()
+            .position(|event| matches!(event, crate::RuntimeEvent::ModelRoute(_)))
+            .expect("model route should be emitted");
+        let first_decisioning = events
+            .iter()
+            .position(|event| matches!(event, crate::RuntimeEvent::Decisioning(_)))
+            .expect("initial decisioning should be emitted");
+        assert!(first_decisioning < first_model_route);
     }
 
     #[test]
