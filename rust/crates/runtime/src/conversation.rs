@@ -773,6 +773,8 @@ const PLANNING_SYSTEM_PROMPT: &str = "You are the planning model for a coding ag
 
 const STRUCTURED_PLAN_SYSTEM_PROMPT: &str = "You are the planning model for a coding agent. Decompose the task into a small DAG of execution steps and return STRICT JSON only (no markdown, no prose). Each step needs a unique kebab-case id and a title; depends_on lists ids of steps that must finish first; parallelizable marks steps that can run alongside siblings; acceptance lists shell commands that must pass for the step to be considered done. Keep it to 2-7 steps.";
 
+const STRUCTURED_NODE_SYSTEM_PROMPT: &str = "You are executing one step of a larger structured plan for a coding agent. Focus only on the named step and its goal; do not attempt the whole task. Produce a concise, concrete result for this step that downstream steps can build on.";
+
 /// Extract the first balanced top-level JSON object from text that may include
 /// prose or ```json code fences around it. Returns `None` if no `{...}` span is
 /// found. Used to recover a structured plan from a chatty model response.
@@ -2323,11 +2325,16 @@ where
             }
             effective_system_prompt.push(Self::format_initial_decisioning_prompt(&initial_plan));
         }
-        // Stage 1 records the structured plan into the registry and injects it
-        // as advisory context; Stage 2 will dispatch it node-by-node. Read it
-        // here so the binding is live and traceable until then.
-        if let Some(validated) = &structured_plan {
-            self.record_structured_plan_ready(&runtime_task_id, validated.plan.steps.len());
+        // Stage 2: dispatch the structured plan node-by-node in dependency
+        // order before the main turn. Each node runs a focused model sub-turn;
+        // results are folded into the system prompt so the main loop completes
+        // the user-facing answer with the structured work already done.
+        if let Some(validated) = structured_plan.take() {
+            if let Some(node_report) =
+                self.dispatch_structured_plan(&runtime_task_id, &user_input, &validated)
+            {
+                effective_system_prompt.push(node_report);
+            }
         }
         if let Some(memory_override) = format_user_memory_override(&user_memory_facts) {
             effective_system_prompt.push(memory_override);
@@ -3525,6 +3532,103 @@ where
         Some(validated)
     }
 
+    /// Stage 2: dispatch a validated structured plan node-by-node in dependency
+    /// order. Each node runs one focused model sub-turn; the per-node outcomes
+    /// are recorded as plan-execution events and summarized back into a report
+    /// the main turn uses to finish. Returns `None` if nothing was dispatched.
+    fn dispatch_structured_plan(
+        &mut self,
+        task_id: &str,
+        user_input: &str,
+        validated: &crate::structured_execution::ValidatedStructuredPlan,
+    ) -> Option<String> {
+        let dag = crate::structured_execution::build_structured_dag(task_id, user_input, validated);
+        let mut execution = PlanExecution::new(&dag);
+        let mut event_offset = 0usize;
+        let mut reports: Vec<String> = Vec::new();
+
+        // Bound total node dispatches as a runaway guard.
+        let max_nodes = dag.nodes.len().saturating_add(1);
+        let outcome =
+            crate::structured_execution::dispatch_plan(&dag, &mut execution, max_nodes, |node| {
+                let summary = self.execute_structured_node(task_id, user_input, node);
+                match summary {
+                    Some(text) => {
+                        reports.push(format!("- {} ({}): {}", node.id, node.title, text));
+                        crate::structured_execution::NodeExecutionResult::success(text)
+                    }
+                    None => {
+                        reports.push(format!("- {} ({}): no output", node.id, node.title));
+                        crate::structured_execution::NodeExecutionResult::failure("node_no_output")
+                    }
+                }
+            });
+
+        // Emit the plan-execution events the dispatch produced and persist the
+        // final execution state.
+        self.emit_plan_execution_events(&execution, event_offset);
+        event_offset = execution.events.len();
+        let _ = event_offset;
+        let _ = self
+            .task_registry
+            .record_plan(task_id, dag.clone(), execution);
+
+        if outcome.dispatched == 0 {
+            return None;
+        }
+        let mut report = format!(
+            "# Structured execution results\n{} of {} node(s) completed, {} failed. Use these results to finish the task; do not redo completed work.\n",
+            outcome.completed.len(),
+            outcome.dispatched,
+            outcome.failed.len(),
+        );
+        report.push_str(&reports.join("\n"));
+        Some(report)
+    }
+
+    /// Run a single structured-plan node as a focused model sub-turn. Returns
+    /// the node's text output, or `None` on failure. The node is routed by its
+    /// estimated effort as a complexity hint (difficulty-aware routing extends
+    /// this in Stage 4).
+    fn execute_structured_node(
+        &mut self,
+        task_id: &str,
+        user_input: &str,
+        node: &crate::structured_execution::ExecutionNode,
+    ) -> Option<String> {
+        let route = self.select_model_route_for_task_with_complexity(
+            task_id,
+            crate::ModelRoutePhase::Coding,
+            Some(node.estimated_effort.max(1)),
+        );
+        let deps = if node.depends_on.is_empty() {
+            "none".to_string()
+        } else {
+            node.depends_on.join(", ")
+        };
+        let request = ApiRequest {
+            system_prompt: vec![STRUCTURED_NODE_SYSTEM_PROMPT.to_string()],
+            messages: vec![ConversationMessage::user_text(format!(
+                "Overall task: {user_input}\n\nFocus only on this step:\n- id: {}\n- goal: {}\n- depends on: {deps}\n\nProduce the concrete result/output for this step in a few sentences.",
+                node.id, node.title
+            ))],
+            model_route: Some(route),
+        };
+        let events = self.api_client.stream(request).ok()?;
+        let mut text = String::new();
+        for event in events {
+            if let AssistantEvent::TextDelta(delta) = event {
+                text.push_str(&delta);
+            }
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        }
+    }
+
     fn format_initial_decisioning_prompt(plan: &DecisioningTurnPlan) -> String {
         let selected_tools = plan
             .snapshot
@@ -3644,16 +3748,6 @@ where
         );
         attributes.insert("reason".to_string(), Value::String(feasibility.reason()));
         session_tracer.record("structured_execution_feasibility", attributes);
-    }
-
-    fn record_structured_plan_ready(&self, task_id: &str, node_count: usize) {
-        let Some(session_tracer) = &self.session_tracer else {
-            return;
-        };
-        let mut attributes = Map::new();
-        attributes.insert("task_id".to_string(), Value::String(task_id.to_string()));
-        attributes.insert("node_count".to_string(), Value::from(node_count as u64));
-        session_tracer.record("structured_plan_ready", attributes);
     }
 
     fn record_decisioning_snapshot(&self, snapshot: &DecisioningSnapshot) {
@@ -6764,5 +6858,90 @@ mod tests {
             .list(None)
             .iter()
             .any(|task| task.plan.is_some()));
+    }
+
+    #[test]
+    fn structured_execution_dispatches_each_node_through_the_model() {
+        use std::sync::{Arc, Mutex};
+
+        // Records the step ids that get dispatched as node sub-turns (their
+        // prompts contain "Focus only on this step:\n- id: <id>").
+        #[derive(Clone)]
+        struct NodeDispatchApi {
+            node_ids: Arc<Mutex<Vec<String>>>,
+        }
+        impl ApiClient for NodeDispatchApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let phase = request
+                    .model_route
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.phase))
+                    .unwrap_or_default();
+                if phase == "Planning" {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "{\"steps\":[{\"id\":\"first\",\"title\":\"First\"},{\"id\":\"second\",\"title\":\"Second\",\"depends_on\":[\"first\"]}]}".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                // Node sub-turn? Capture the step id from the prompt.
+                let user_text = request
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.blocks.iter())
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                if let Some(idx) = user_text.find("- id: ") {
+                    let id: String = user_text[idx + 6..]
+                        .chars()
+                        .take_while(|c| !c.is_whitespace())
+                        .collect();
+                    self.node_ids
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(id);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(false)
+                .with_structured_execution_threshold(3),
+        );
+        let node_ids = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            NodeDispatchApi {
+                node_ids: node_ids.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+
+        let _ = runtime
+            .run_turn(
+                "implement, refactor, write, test and verify the new billing module",
+                None,
+            )
+            .expect("turn should succeed");
+
+        let dispatched = node_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // Both nodes ran, dependency before dependent.
+        assert_eq!(dispatched, vec!["first".to_string(), "second".to_string()]);
     }
 }

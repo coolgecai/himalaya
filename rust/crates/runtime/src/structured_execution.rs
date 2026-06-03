@@ -321,6 +321,152 @@ pub fn build_structured_dag(
     }
 }
 
+/// What a node executor reports back for a single node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeExecutionResult {
+    pub succeeded: bool,
+    /// Short human-readable outcome (success summary or failure class).
+    pub summary: String,
+}
+
+impl NodeExecutionResult {
+    #[must_use]
+    pub fn success(summary: impl Into<String>) -> Self {
+        Self {
+            succeeded: true,
+            summary: summary.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn failure(summary: impl Into<String>) -> Self {
+        Self {
+            succeeded: false,
+            summary: summary.into(),
+        }
+    }
+}
+
+/// Outcome of dispatching a whole structured plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchOutcome {
+    pub completed: Vec<String>,
+    pub failed: Vec<String>,
+    pub dispatched: usize,
+}
+
+impl DispatchOutcome {
+    #[must_use]
+    pub fn all_succeeded(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
+/// Drive a structured plan's DAG to completion in dependency order, calling
+/// `execute_node(node)` for each ready node. The executor returns whether the
+/// node succeeded; success unlocks dependents, failure skips them. This is the
+/// deterministic scheduling core — the runtime supplies an `execute_node`
+/// closure that runs a focused model sub-turn (Stage 2) and, later, verifies
+/// the node (Stage 3). Kept pure so the topological logic is unit-testable
+/// without a live model.
+///
+/// `max_nodes` bounds total dispatches as a runaway guard.
+pub fn dispatch_plan<F>(
+    dag: &PlanDag,
+    execution: &mut crate::PlanExecution,
+    max_nodes: usize,
+    mut execute_node: F,
+) -> DispatchOutcome
+where
+    F: FnMut(&ExecutionNode) -> NodeExecutionResult,
+{
+    let node_lookup = node_index(dag);
+    let mut completed = Vec::new();
+    let mut failed = Vec::new();
+    let mut dispatched = 0usize;
+
+    // The root/Task node is structural, not executable — succeed it up front so
+    // its children can proceed. `succeed_node` only accepts Ready/Running and is
+    // a no-op (ignored error) otherwise. Without this the root stays Ready
+    // forever and the loop never finishes.
+    let _ = execution.succeed_node(dag, &dag.root_id, Some("root".to_string()));
+
+    while !execution.is_finished() && dispatched < max_nodes {
+        let ready = execution
+            .ready_nodes()
+            .into_iter()
+            .filter(|id| id != &dag.root_id)
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            break;
+        }
+        // Deterministic order: DAG node order.
+        let mut ordered = ready;
+        ordered.sort_by_key(|id| node_lookup.get(id).copied().unwrap_or(usize::MAX));
+
+        for node_id in ordered {
+            if dispatched >= max_nodes {
+                break;
+            }
+            let Some(node) = build_execution_node(dag, &node_id) else {
+                // Non-step node that is somehow ready — mark it done structurally
+                // so it cannot wedge the loop.
+                let _ = execution.succeed_node(dag, &node_id, Some("structural".to_string()));
+                continue;
+            };
+            if execution.start_node(&node_id).is_err() {
+                continue;
+            }
+            dispatched += 1;
+            let result = execute_node(&node);
+            if result.succeeded {
+                let _ = execution.succeed_node(dag, &node_id, Some(result.summary));
+                completed.push(node_id);
+            } else {
+                let _ = execution.fail_node(dag, &node_id, result.summary);
+                failed.push(node_id);
+            }
+        }
+    }
+
+    DispatchOutcome {
+        completed,
+        failed,
+        dispatched,
+    }
+}
+
+fn node_index(dag: &PlanDag) -> std::collections::HashMap<String, usize> {
+    dag.nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.clone(), index))
+        .collect()
+}
+
+/// Reconstruct an `ExecutionNode` (with resolved dependencies) for a single DAG
+/// step node by id. Returns `None` for the root/task node or unknown ids.
+fn build_execution_node(dag: &PlanDag, node_id: &str) -> Option<ExecutionNode> {
+    let node = dag.nodes.iter().find(|n| n.id == node_id)?;
+    if node.kind != PlanNodeKind::Step {
+        return None;
+    }
+    let depends_on = dag
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == PlanDagEdgeKind::DependsOn && edge.to == node_id)
+        .map(|edge| edge.from.clone())
+        .collect::<Vec<_>>();
+    Some(ExecutionNode {
+        id: node.id.clone(),
+        title: node.title.clone(),
+        depends_on,
+        parallelizable: node.parallelizable,
+        estimated_effort: node.estimated_effort,
+        acceptance: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +627,66 @@ mod tests {
             .edges
             .iter()
             .any(|e| e.from == "a" && e.to == "b" && e.kind == crate::PlanDagEdgeKind::DependsOn));
+    }
+
+    fn validated_chain() -> ValidatedStructuredPlan {
+        // a -> b -> c (strict chain)
+        let json = r#"{"steps":[
+            {"id":"a","title":"A"},
+            {"id":"b","title":"B","depends_on":["a"]},
+            {"id":"c","title":"C","depends_on":["b"]}
+        ]}"#;
+        parse_structured_plan("task", json).expect("valid chain")
+    }
+
+    #[test]
+    fn dispatch_runs_nodes_in_dependency_order() {
+        let validated = validated_chain();
+        let dag = build_structured_dag("task", "Chain", &validated);
+        let mut execution = crate::PlanExecution::new(&dag);
+        let mut order = Vec::new();
+        let outcome = dispatch_plan(&dag, &mut execution, 100, |node| {
+            order.push(node.id.clone());
+            NodeExecutionResult::success("ok")
+        });
+        assert!(outcome.all_succeeded());
+        assert_eq!(order, vec!["a", "b", "c"]);
+        assert_eq!(outcome.completed.len(), 3);
+        assert!(execution.is_finished());
+    }
+
+    #[test]
+    fn dispatch_skips_dependents_of_a_failed_node() {
+        let validated = validated_chain();
+        let dag = build_structured_dag("task", "Chain", &validated);
+        let mut execution = crate::PlanExecution::new(&dag);
+        let mut executed = Vec::new();
+        let outcome = dispatch_plan(&dag, &mut execution, 100, |node| {
+            executed.push(node.id.clone());
+            if node.id == "a" {
+                NodeExecutionResult::failure("boom")
+            } else {
+                NodeExecutionResult::success("ok")
+            }
+        });
+        // Only 'a' runs; b and c are skipped because their dependency failed.
+        assert_eq!(executed, vec!["a"]);
+        assert!(!outcome.all_succeeded());
+        assert_eq!(outcome.failed, vec!["a"]);
+    }
+
+    #[test]
+    fn dispatch_honors_max_nodes_guard() {
+        let validated = validated_chain();
+        let dag = build_structured_dag("task", "Chain", &validated);
+        let mut execution = crate::PlanExecution::new(&dag);
+        let mut count = 0usize;
+        let outcome = dispatch_plan(&dag, &mut execution, 1, |_node| {
+            count += 1;
+            NodeExecutionResult::success("ok")
+        });
+        assert_eq!(count, 1);
+        assert_eq!(outcome.dispatched, 1);
+        assert!(!execution.is_finished());
     }
 }
