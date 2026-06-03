@@ -11,7 +11,7 @@ use runtime::{
 };
 use serde_json::{json, Value};
 
-const PERMISSIONS_ARGUMENT_HINT: &str = "[read-only|workspace-write|danger-full-access]";
+const PERMISSIONS_ARGUMENT_HINT: &str = "[default|plan|acceptEdits|auto|bypassPermissions]";
 
 fn public_permission_labels() -> String {
     let labels = PermissionMode::public_labels();
@@ -60,6 +60,118 @@ pub struct SlashCommandSpec {
     pub argument_hint: Option<&'static str>,
     pub resume_supported: bool,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashCommandStatus {
+    Implemented,
+    Stub,
+}
+
+/// Slash commands that are registered in the spec list but not yet implemented
+/// in this build. This commands-crate list is the single truth source used by
+/// help, REPL completions, maturity reporting, and resume-safe filtering.
+const STUB_SLASH_COMMANDS: &[&str] = &[
+    "login",
+    "logout",
+    "vim",
+    "upgrade",
+    "share",
+    "feedback",
+    "files",
+    "fast",
+    "exit",
+    "summary",
+    "desktop",
+    "brief",
+    "advisor",
+    "stickers",
+    "insights",
+    "thinkback",
+    "release-notes",
+    "security-review",
+    "keybindings",
+    "privacy-settings",
+    "theme",
+    "voice",
+    "usage",
+    "rename",
+    "copy",
+    "hooks",
+    "context",
+    "color",
+    "effort",
+    "branch",
+    "rewind",
+    "ide",
+    "tag",
+    "output-style",
+    "add-dir",
+    // Spec entries with no parse arm — produce circular "Did you mean" errors
+    // without this guard. Adding here routes them to the proper unsupported
+    // message and excludes them from REPL completions / help.
+    // NOTE: do NOT add "stats", "tokens", "cache" — they are implemented.
+    "allowed-tools",
+    "bookmarks",
+    "reasoning",
+    "budget",
+    "rate-limit",
+    "changelog",
+    "metrics",
+    "tool-details",
+    "focus",
+    "unfocus",
+    "pin",
+    "unpin",
+    "language",
+    "profile",
+    "max-tokens",
+    "temperature",
+    "system-prompt",
+    "notifications",
+    "telemetry",
+    "env",
+    "project",
+    "terminal-setup",
+    "api-key",
+    "reset",
+    "undo",
+    "stop",
+    "retry",
+    "paste",
+    "screenshot",
+    "image",
+    "search",
+    "listen",
+    "speak",
+    "format",
+    "run",
+    "git",
+    "stash",
+    "blame",
+    "log",
+    "team",
+    "migrate",
+    "templates",
+    "explain",
+    "refactor",
+    "docs",
+    "fix",
+    "perf",
+    "chat",
+    "web",
+    "map",
+    "symbols",
+    "references",
+    "definition",
+    "hover",
+    "autofix",
+    "multi",
+    "macro",
+    "alias",
+    "parallel",
+    "subagent",
+    "agent",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillSlashDispatch {
@@ -1922,10 +2034,40 @@ pub fn slash_command_specs() -> &'static [SlashCommandSpec] {
 }
 
 #[must_use]
+pub fn slash_command_status(name: &str) -> SlashCommandStatus {
+    if STUB_SLASH_COMMANDS.contains(&name) {
+        SlashCommandStatus::Stub
+    } else {
+        SlashCommandStatus::Implemented
+    }
+}
+
+#[must_use]
+pub fn is_stub_slash_command(name: &str) -> bool {
+    slash_command_status(name) == SlashCommandStatus::Stub
+}
+
+#[must_use]
+pub fn stub_slash_commands() -> &'static [&'static str] {
+    STUB_SLASH_COMMANDS
+}
+
+#[must_use]
+pub fn implemented_slash_command_specs() -> Vec<&'static SlashCommandSpec> {
+    slash_command_specs()
+        .iter()
+        .filter(|spec| slash_command_status(spec.name) == SlashCommandStatus::Implemented)
+        .collect()
+}
+
+#[must_use]
 pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
     slash_command_specs()
         .iter()
-        .filter(|spec| spec.resume_supported)
+        .filter(|spec| {
+            spec.resume_supported
+                && slash_command_status(spec.name) == SlashCommandStatus::Implemented
+        })
         .collect()
 }
 
@@ -2017,6 +2159,7 @@ pub fn suggest_slash_commands(input: &str, limit: usize) -> Vec<String> {
 
     let mut suggestions = slash_command_specs()
         .iter()
+        .filter(|spec| slash_command_status(spec.name) == SlashCommandStatus::Implemented)
         .filter_map(|spec| {
             let best = std::iter::once(spec.name)
                 .chain(spec.aliases.iter().copied())
@@ -2053,11 +2196,17 @@ pub fn suggest_slash_commands(input: &str, limit: usize) -> Vec<String> {
         .collect()
 }
 
+/// Render the slash-command help section using the commands crate implementation
+/// status as the source of truth, excluding registered stubs by default.
+pub fn render_slash_command_help_filtered() -> String {
+    render_slash_command_help_filtered_with_exclusions(stub_slash_commands())
+}
+
 #[must_use]
-/// Render the slash-command help section, optionally excluding stub commands
-/// (commands that are registered in the spec list but not yet implemented).
-/// Pass an empty slice to include all commands.
-pub fn render_slash_command_help_filtered(exclude: &[&str]) -> String {
+/// Render the slash-command help section with explicit extra exclusions. Most
+/// callers should use `render_slash_command_help_filtered()` so implementation
+/// status remains the single truth source.
+pub fn render_slash_command_help_filtered_with_exclusions(exclude: &[&str]) -> String {
     let mut lines = vec![
         "Slash commands".to_string(),
         "  Start here        /status, /diff, /agents, /skills, /commit".to_string(),
@@ -4135,8 +4284,9 @@ mod tests {
         render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
         render_skills_report, render_slash_command_help, render_slash_command_help_detail,
         resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
-        suggest_slash_commands, validate_slash_command_input, DefinitionSource, SkillOrigin,
-        SkillRoot, SkillSlashDispatch, SlashCommand,
+        slash_command_status, stub_slash_commands, suggest_slash_commands,
+        validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch,
+        SlashCommand, SlashCommandStatus,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{
@@ -4530,11 +4680,9 @@ mod tests {
         let error = parse_error_message(input);
 
         // then
+        assert!(error.contains("Unsupported /permissions mode 'admin'."));
         assert!(error.contains(
-            "Unsupported /permissions mode 'admin'. Use read-only, workspace-write, or danger-full-access."
-        ));
-        assert!(error.contains(
-            "  Usage            /permissions [read-only|workspace-write|danger-full-access]"
+            "  Usage            /permissions [default|plan|acceptEdits|auto|bypassPermissions]"
         ));
     }
 
@@ -4638,7 +4786,7 @@ mod tests {
         assert!(help.contains("/teleport <symbol-or-path>"));
         assert!(help.contains("/debug-tool-call"));
         assert!(help.contains("/model [model]"));
-        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
+        assert!(help.contains("/permissions [default|plan|acceptEdits|auto|bypassPermissions]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
@@ -4659,7 +4807,44 @@ mod tests {
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
         assert_eq!(slash_command_specs().len(), 141);
-        assert!(resume_supported_slash_commands().len() >= 39);
+        assert!(resume_supported_slash_commands().len() >= 27);
+    }
+
+    #[test]
+    fn slash_command_status_filters_resume_safe_stubs() {
+        assert_eq!(
+            slash_command_status("plan"),
+            SlashCommandStatus::Implemented
+        );
+        assert_eq!(slash_command_status("login"), SlashCommandStatus::Stub);
+        assert!(stub_slash_commands().contains(&"login"));
+
+        let resume_names = resume_supported_slash_commands()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        for name in stub_slash_commands() {
+            assert!(
+                !resume_names.contains(name),
+                "stub command /{name} must not be advertised as resume-safe"
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_help_excludes_registered_stubs() {
+        let help = super::render_slash_command_help_filtered();
+        for name in stub_slash_commands() {
+            let advertised = help.lines().any(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|usage| usage == format!("/{name}"))
+            });
+            assert!(
+                !advertised,
+                "filtered help must not advertise stub command /{name}"
+            );
+        }
     }
 
     #[test]
