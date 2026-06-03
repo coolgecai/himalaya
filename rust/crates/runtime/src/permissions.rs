@@ -185,6 +185,25 @@ pub enum PermissionOutcome {
     Deny { reason: String },
 }
 
+/// Static disposition of a tool request before any interactive prompt is run.
+///
+/// Distinguishes requests that are unconditionally allowed, requests that an
+/// interactive prompter must resolve (promptable escalations), and requests
+/// that are hard-denied regardless of prompting (deny-rules and mode
+/// mismatches a prompt can never satisfy). The dispatch-level
+/// [`crate::permission_enforcer::PermissionEnforcer`] uses this to act as a
+/// safety net for hard denials without re-denying escalations the
+/// interactive prompter already approved upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionDisposition {
+    /// Allowed outright; no prompt required.
+    Allow,
+    /// Requires an interactive approval the prompter owns.
+    RequiresPrompt { reason: String },
+    /// Denied regardless of prompting.
+    Deny { reason: String },
+}
+
 /// Evaluates permission mode requirements plus allow/deny/ask rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionPolicy {
@@ -259,6 +278,108 @@ impl PermissionPolicy {
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
         self.authorize_with_context(tool_name, input, &PermissionContext::default(), prompter)
+    }
+
+    /// Statically classify a tool request without running any interactive
+    /// prompt. Returns whether the request is allowed outright, requires an
+    /// interactive approval (a promptable escalation), or is hard-denied.
+    ///
+    /// This shares the same rule evaluation as [`Self::authorize_with_context`]
+    /// but never consults a prompter, so it is safe to call from a
+    /// dispatch-level enforcer that runs downstream of the interactive prompt.
+    #[must_use]
+    pub fn classify(&self, tool_name: &str, input: &str) -> PermissionDisposition {
+        self.classify_with_context(tool_name, input, &PermissionContext::default())
+    }
+
+    /// Context-aware variant of [`Self::classify`].
+    #[must_use]
+    pub fn classify_with_context(
+        &self,
+        tool_name: &str,
+        input: &str,
+        context: &PermissionContext,
+    ) -> PermissionDisposition {
+        if let Some(rule) = Self::find_matching_rule(&self.deny_rules, tool_name, input) {
+            return PermissionDisposition::Deny {
+                reason: format!(
+                    "Permission to use {tool_name} has been denied by rule '{}'",
+                    rule.raw
+                ),
+            };
+        }
+
+        let current_mode = self.active_mode();
+        let required_mode = self.required_mode_for(tool_name);
+        let ask_rule = Self::find_matching_rule(&self.ask_rules, tool_name, input);
+        let allow_rule = Self::find_matching_rule(&self.allow_rules, tool_name, input);
+
+        match context.override_decision() {
+            Some(PermissionOverride::Deny) => {
+                return PermissionDisposition::Deny {
+                    reason: context.override_reason().map_or_else(
+                        || format!("tool '{tool_name}' denied by hook"),
+                        ToOwned::to_owned,
+                    ),
+                };
+            }
+            Some(PermissionOverride::Ask) => {
+                return PermissionDisposition::RequiresPrompt {
+                    reason: context.override_reason().map_or_else(
+                        || format!("tool '{tool_name}' requires approval due to hook guidance"),
+                        ToOwned::to_owned,
+                    ),
+                };
+            }
+            Some(PermissionOverride::Allow) => {
+                if let Some(rule) = ask_rule {
+                    return PermissionDisposition::RequiresPrompt {
+                        reason: format!(
+                            "tool '{tool_name}' requires approval due to ask rule '{}'",
+                            rule.raw
+                        ),
+                    };
+                }
+                if allow_rule.is_some() || current_mode.satisfies(required_mode) {
+                    return PermissionDisposition::Allow;
+                }
+            }
+            None => {}
+        }
+
+        if let Some(rule) = ask_rule {
+            return PermissionDisposition::RequiresPrompt {
+                reason: format!(
+                    "tool '{tool_name}' requires approval due to ask rule '{}'",
+                    rule.raw
+                ),
+            };
+        }
+
+        if allow_rule.is_some() || current_mode.satisfies(required_mode) {
+            return PermissionDisposition::Allow;
+        }
+
+        if current_mode == PermissionMode::Prompt
+            || (current_mode == PermissionMode::WorkspaceWrite
+                && required_mode == PermissionMode::DangerFullAccess)
+        {
+            return PermissionDisposition::RequiresPrompt {
+                reason: format!(
+                    "tool '{tool_name}' requires approval to escalate from {} to {}",
+                    current_mode.as_str(),
+                    required_mode.as_str()
+                ),
+            };
+        }
+
+        PermissionDisposition::Deny {
+            reason: format!(
+                "tool '{tool_name}' requires {} permission; current mode is {}",
+                required_mode.as_str(),
+                current_mode.as_str()
+            ),
+        }
     }
 
     #[must_use]

@@ -6,7 +6,12 @@
 //! Permission enforcement layer that gates tool execution based on the
 //! active `PermissionPolicy`.
 
-use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
+use std::path::Path;
+
+use crate::bash_validation::{validate_command, ValidationResult};
+use crate::permissions::{
+    PermissionDisposition, PermissionMode, PermissionOutcome, PermissionPolicy,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +56,35 @@ impl PermissionEnforcer {
         self.evaluate_policy(tool_name, input)
     }
 
+    /// Dispatch-time safety net that runs *downstream* of the interactive
+    /// prompter in [`crate::ConversationRuntime::run_turn`].
+    ///
+    /// Unlike [`Self::check`], a promptable escalation (e.g. workspace-write to
+    /// danger-full-access, or `prompt` mode) is treated as **allowed** here:
+    /// the prompter already resolved it before the tool was dispatched, so
+    /// re-denying it would double-gate an approval the user granted. Only
+    /// hard denials — deny-rules and mode mismatches a prompt can never
+    /// satisfy (e.g. read-only escalations) — are blocked. This keeps the
+    /// enforcer as a real safety net for direct/bypassing call paths without
+    /// contradicting an upstream approval.
+    pub fn check_allowing_prompted_escalation(
+        &self,
+        tool_name: &str,
+        input: &str,
+    ) -> EnforcementResult {
+        match self.policy.classify(tool_name, input) {
+            PermissionDisposition::Allow | PermissionDisposition::RequiresPrompt { .. } => {
+                EnforcementResult::Allowed
+            }
+            PermissionDisposition::Deny { reason } => EnforcementResult::Denied {
+                tool: tool_name.to_owned(),
+                active_mode: self.policy.active_mode().as_str().to_owned(),
+                required_mode: self.policy.required_mode_for(tool_name).as_str().to_owned(),
+                reason,
+            },
+        }
+    }
+
     fn evaluate_policy(&self, tool_name: &str, input: &str) -> EnforcementResult {
         let outcome = self.policy.authorize(tool_name, input, None);
 
@@ -82,9 +116,20 @@ impl PermissionEnforcer {
     /// Classify a file operation against workspace boundaries. Evaluates the
     /// full permission policy first, then applies workspace boundary checks.
     pub fn check_file_write(&self, path: &str, workspace_root: &str) -> EnforcementResult {
+        self.check_file_write_for_tool("write_file", path, workspace_root)
+    }
+
+    /// Classify a file operation for a specific tool against workspace boundaries.
+    /// Evaluates the full permission policy first, then applies workspace checks.
+    pub fn check_file_write_for_tool(
+        &self,
+        tool_name: &str,
+        path: &str,
+        workspace_root: &str,
+    ) -> EnforcementResult {
         // Always evaluate the full permission policy first so deny/allow/ask
         // rules are honoured for file-write tools.
-        let policy_result = self.evaluate_policy("write_file", path);
+        let policy_result = self.evaluate_policy(tool_name, path);
         if let EnforcementResult::Denied { .. } = &policy_result {
             return policy_result;
         }
@@ -92,7 +137,7 @@ impl PermissionEnforcer {
         let mode = self.policy.active_mode();
         match mode {
             PermissionMode::ReadOnly => EnforcementResult::Denied {
-                tool: "write_file".to_owned(),
+                tool: tool_name.to_owned(),
                 active_mode: mode.as_str().to_owned(),
                 required_mode: PermissionMode::WorkspaceWrite.as_str().to_owned(),
                 reason: format!("file writes are not allowed in '{}' mode", mode.as_str()),
@@ -102,7 +147,7 @@ impl PermissionEnforcer {
                     policy_result
                 } else {
                     EnforcementResult::Denied {
-                        tool: "write_file".to_owned(),
+                        tool: tool_name.to_owned(),
                         active_mode: mode.as_str().to_owned(),
                         required_mode: PermissionMode::DangerFullAccess.as_str().to_owned(),
                         reason: format!(
@@ -114,7 +159,7 @@ impl PermissionEnforcer {
             }
             PermissionMode::Allow | PermissionMode::DangerFullAccess => policy_result,
             PermissionMode::Prompt => EnforcementResult::Denied {
-                tool: "write_file".to_owned(),
+                tool: tool_name.to_owned(),
                 active_mode: mode.as_str().to_owned(),
                 required_mode: PermissionMode::WorkspaceWrite.as_str().to_owned(),
                 reason: "file write requires confirmation in prompt mode".to_owned(),
@@ -125,6 +170,17 @@ impl PermissionEnforcer {
     /// Check if a bash command should be allowed. Evaluates the full
     /// permission policy first, then applies read-only heuristics.
     pub fn check_bash(&self, command: &str) -> EnforcementResult {
+        self.check_bash_in_workspace(command, ".")
+    }
+
+    /// Check if a bash command should be allowed in a workspace. Evaluates the
+    /// full permission policy first, then runs the bash validation pipeline for
+    /// mode, destructive command, sed, and path checks.
+    pub fn check_bash_in_workspace(
+        &self,
+        command: &str,
+        workspace_root: &str,
+    ) -> EnforcementResult {
         // Always evaluate the full permission policy first so deny/allow/ask
         // rules are honoured for bash.
         let policy_result = self.evaluate_policy("bash", command);
@@ -133,29 +189,47 @@ impl PermissionEnforcer {
         }
 
         let mode = self.policy.active_mode();
-        match mode {
-            PermissionMode::ReadOnly => {
-                if is_read_only_command(command) {
-                    policy_result
-                } else {
-                    EnforcementResult::Denied {
-                        tool: "bash".to_owned(),
-                        active_mode: mode.as_str().to_owned(),
-                        required_mode: PermissionMode::WorkspaceWrite.as_str().to_owned(),
-                        reason: format!(
-                            "command may modify state; not allowed in '{}' mode",
-                            mode.as_str()
-                        ),
-                    }
-                }
-            }
-            PermissionMode::Prompt => EnforcementResult::Denied {
+        if mode == PermissionMode::Prompt {
+            return EnforcementResult::Denied {
                 tool: "bash".to_owned(),
                 active_mode: mode.as_str().to_owned(),
                 required_mode: PermissionMode::DangerFullAccess.as_str().to_owned(),
                 reason: "bash requires confirmation in prompt mode".to_owned(),
-            },
-            _ => policy_result,
+            };
+        }
+
+        if command.trim().is_empty() {
+            return EnforcementResult::Denied {
+                tool: "bash".to_owned(),
+                active_mode: mode.as_str().to_owned(),
+                required_mode: PermissionMode::ReadOnly.as_str().to_owned(),
+                reason: "bash command is empty".to_owned(),
+            };
+        }
+
+        match validate_command(command, mode, Path::new(workspace_root)) {
+            ValidationResult::Allow => policy_result,
+            ValidationResult::Warn { .. }
+                if matches!(
+                    mode,
+                    PermissionMode::DangerFullAccess | PermissionMode::Allow
+                ) =>
+            {
+                policy_result
+            }
+            ValidationResult::Block { reason } | ValidationResult::Warn { message: reason } => {
+                let required_mode = if mode == PermissionMode::ReadOnly {
+                    PermissionMode::WorkspaceWrite
+                } else {
+                    PermissionMode::DangerFullAccess
+                };
+                EnforcementResult::Denied {
+                    tool: "bash".to_owned(),
+                    active_mode: mode.as_str().to_owned(),
+                    required_mode: required_mode.as_str().to_owned(),
+                    reason,
+                }
+            }
         }
     }
 }
@@ -163,8 +237,6 @@ impl PermissionEnforcer {
 /// Workspace boundary check with path canonicalization to prevent
 /// traversal attacks (e.g. `/workspace/../../etc/passwd`).
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
-    use std::path::Path;
-
     let root_path = Path::new(workspace_root);
     let resolved_root = root_path
         .canonicalize()
@@ -188,139 +260,6 @@ fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
     });
 
     resolved_path.starts_with(&resolved_root)
-}
-
-fn contains_bare_command(command: &str, target: &str) -> bool {
-    command
-        .split_whitespace()
-        .map(|part| part.trim_matches(|ch: char| matches!(ch, '|' | ';' | '&' | '(' | ')')))
-        .any(|part| part.rsplit('/').next().unwrap_or(part) == target)
-}
-
-fn contains_inline_code_execution(command: &str) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    for (idx, part) in parts.iter().enumerate() {
-        let cmd = part.rsplit('/').next().unwrap_or(part);
-        if !matches!(cmd, "python3" | "python" | "node" | "ruby" | "perl" | "php") {
-            continue;
-        }
-
-        for arg in parts.iter().skip(idx + 1) {
-            if *arg == "-c" || *arg == "-e" || arg.starts_with("-c") || arg.starts_with("-e") {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn contains_sed_in_place(command: &str) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    for (idx, part) in parts.iter().enumerate() {
-        if part.rsplit('/').next().unwrap_or(part) != "sed" {
-            continue;
-        }
-
-        for arg in parts.iter().skip(idx + 1) {
-            if *arg == "-i" || *arg == "--in-place" || arg.starts_with("-i") {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Conservative heuristic: is this bash command read-only?
-fn is_read_only_command(command: &str) -> bool {
-    let first_token = command
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .rsplit('/')
-        .next()
-        .unwrap_or("");
-
-    let is_read_only_binary = matches!(
-        first_token,
-        "cat"
-            | "head"
-            | "tail"
-            | "less"
-            | "more"
-            | "wc"
-            | "ls"
-            | "find"
-            | "grep"
-            | "rg"
-            | "awk"
-            | "sed"
-            | "echo"
-            | "printf"
-            | "which"
-            | "where"
-            | "whoami"
-            | "pwd"
-            | "env"
-            | "printenv"
-            | "date"
-            | "cal"
-            | "df"
-            | "du"
-            | "free"
-            | "uptime"
-            | "uname"
-            | "file"
-            | "stat"
-            | "diff"
-            | "sort"
-            | "uniq"
-            | "tr"
-            | "cut"
-            | "paste"
-            | "xargs"
-            | "test"
-            | "true"
-            | "false"
-            | "type"
-            | "readlink"
-            | "realpath"
-            | "basename"
-            | "dirname"
-            | "sha256sum"
-            | "md5sum"
-            | "b3sum"
-            | "xxd"
-            | "hexdump"
-            | "od"
-            | "strings"
-            | "tree"
-            | "jq"
-            | "yq"
-            | "git"
-            | "gh"
-    );
-    if !is_read_only_binary {
-        return false;
-    }
-
-    if contains_inline_code_execution(command) {
-        return false;
-    }
-
-    if contains_bare_command(command, "tee") {
-        return false;
-    }
-
-    if contains_sed_in_place(command) {
-        return false;
-    }
-
-    // Deny output redirects that create or overwrite files.
-    if command.contains('>') {
-        return false;
-    }
-
-    true
 }
 
 #[cfg(test)]
@@ -412,7 +351,6 @@ mod tests {
         let enforcer = make_enforcer(PermissionMode::Prompt);
         let result = enforcer.check_bash("echo test");
         assert!(matches!(result, EnforcementResult::Denied { .. }));
-
         let result = enforcer.check_file_write("/workspace/file.rs", "/workspace");
         assert!(matches!(result, EnforcementResult::Denied { .. }));
     }
@@ -465,18 +403,34 @@ mod tests {
     }
 
     #[test]
-    fn read_only_command_heuristic() {
-        assert!(is_read_only_command("cat file.txt"));
-        assert!(is_read_only_command("grep pattern file"));
-        assert!(is_read_only_command("git log --oneline"));
-        assert!(!is_read_only_command("rm file.txt"));
-        assert!(!is_read_only_command("echo test > file.txt"));
-        assert!(!is_read_only_command("sed -i 's/a/b/' file"));
+    fn read_only_bash_validation_allows_read_commands() {
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::ReadOnly);
+        let enforcer = PermissionEnforcer::new(policy);
+
+        assert_eq!(
+            enforcer.check_bash("cat file.txt"),
+            EnforcementResult::Allowed
+        );
+        assert_eq!(
+            enforcer.check_bash("grep pattern file"),
+            EnforcementResult::Allowed
+        );
+        assert_eq!(
+            enforcer.check_bash("git log --oneline"),
+            EnforcementResult::Allowed
+        );
     }
 
     #[test]
-    fn read_only_command_heuristic_blocks_shell_write_escape_patterns() {
+    fn read_only_bash_validation_blocks_shell_write_escape_patterns() {
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::ReadOnly);
+        let enforcer = PermissionEnforcer::new(policy);
         let cases = [
+            "rm file.txt",
+            "echo test > file.txt",
+            "sed -i 's/a/b/' file",
             "printf hello > out.txt",
             "cat Cargo.toml 2> errors.log",
             "echo hello | tee out.txt",
@@ -488,7 +442,10 @@ mod tests {
 
         for command in cases {
             assert!(
-                !is_read_only_command(command),
+                matches!(
+                    enforcer.check_bash(command),
+                    EnforcementResult::Denied { .. }
+                ),
                 "expected {command} to be blocked"
             );
         }
@@ -597,63 +554,67 @@ mod tests {
     }
 
     #[test]
-    fn bash_heuristic_full_path_prefix() {
-        // given
-        let full_path_command = "/usr/bin/cat Cargo.toml";
-        let git_path_command = "/usr/local/bin/git status";
+    fn bash_validation_handles_full_path_prefixes() {
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::ReadOnly);
+        let enforcer = PermissionEnforcer::new(policy);
 
-        // when
-        let cat_result = is_read_only_command(full_path_command);
-        let git_result = is_read_only_command(git_path_command);
-
-        // then
-        assert!(cat_result);
-        assert!(git_result);
+        assert_eq!(
+            enforcer.check_bash("/usr/bin/cat Cargo.toml"),
+            EnforcementResult::Allowed
+        );
+        assert_eq!(
+            enforcer.check_bash("/usr/local/bin/git status"),
+            EnforcementResult::Allowed
+        );
     }
 
     #[test]
-    fn bash_heuristic_redirects_block_read_only_commands() {
-        // given
-        let overwrite = "cat Cargo.toml > out.txt";
-        let append = "echo test >> out.txt";
+    fn bash_validation_redirects_block_read_only_commands() {
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::ReadOnly);
+        let enforcer = PermissionEnforcer::new(policy);
 
-        // when
-        let overwrite_result = is_read_only_command(overwrite);
-        let append_result = is_read_only_command(append);
-
-        // then
-        assert!(!overwrite_result);
-        assert!(!append_result);
+        assert!(matches!(
+            enforcer.check_bash("cat Cargo.toml > out.txt"),
+            EnforcementResult::Denied { .. }
+        ));
+        assert!(matches!(
+            enforcer.check_bash("echo test >> out.txt"),
+            EnforcementResult::Denied { .. }
+        ));
     }
 
     #[test]
-    fn bash_heuristic_in_place_flag_blocks() {
-        // given
-        let interactive_python = "python -i script.py";
-        let in_place_sed = "sed --in-place 's/a/b/' file.txt";
+    fn bash_validation_in_place_flag_blocks() {
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::ReadOnly);
+        let enforcer = PermissionEnforcer::new(policy);
 
-        // when
-        let interactive_result = is_read_only_command(interactive_python);
-        let in_place_result = is_read_only_command(in_place_sed);
-
-        // then
-        assert!(!interactive_result);
-        assert!(!in_place_result);
+        assert!(matches!(
+            enforcer.check_bash("python -c 'print(1)'"),
+            EnforcementResult::Denied { .. }
+        ));
+        assert!(matches!(
+            enforcer.check_bash("sed --in-place 's/a/b/' file.txt"),
+            EnforcementResult::Denied { .. }
+        ));
     }
 
     #[test]
-    fn bash_heuristic_empty_command() {
-        // given
-        let empty = "";
-        let whitespace = "   ";
+    fn bash_validation_empty_command_is_denied() {
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::ReadOnly);
+        let enforcer = PermissionEnforcer::new(policy);
 
-        // when
-        let empty_result = is_read_only_command(empty);
-        let whitespace_result = is_read_only_command(whitespace);
-
-        // then
-        assert!(!empty_result);
-        assert!(!whitespace_result);
+        assert!(matches!(
+            enforcer.check_bash(""),
+            EnforcementResult::Denied { .. }
+        ));
+        assert!(matches!(
+            enforcer.check_bash("   "),
+            EnforcementResult::Denied { .. }
+        ));
     }
 
     #[test]
@@ -709,5 +670,44 @@ mod tests {
             }
             other => panic!("expected denied result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prompted_escalation_check_defers_workspace_write_to_danger() {
+        // workspace-write -> danger-full-access is a promptable escalation that
+        // the interactive prompter owns. The dispatch-time safety net must
+        // defer to that upstream approval instead of re-denying it.
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+        let enforcer = PermissionEnforcer::new(policy);
+
+        // The strict check denies (no prompter), proving it is a real escalation.
+        assert!(matches!(
+            enforcer.check("bash", "{\"command\":\"echo hi\"}"),
+            EnforcementResult::Denied { .. }
+        ));
+
+        // The dispatch-time check defers to the upstream prompt and allows it.
+        assert_eq!(
+            enforcer.check_allowing_prompted_escalation("bash", "{\"command\":\"echo hi\"}"),
+            EnforcementResult::Allowed
+        );
+    }
+
+    #[test]
+    fn prompted_escalation_check_still_blocks_hard_denials() {
+        // read-only -> workspace-write is NOT promptable, so the dispatch-time
+        // safety net must still hard-deny it even when deferring to prompts.
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+        let enforcer = PermissionEnforcer::new(policy);
+
+        assert!(matches!(
+            enforcer.check_allowing_prompted_escalation(
+                "write_file",
+                "{\"path\":\"/tmp/x\",\"content\":\"x\"}"
+            ),
+            EnforcementResult::Denied { .. }
+        ));
     }
 }
