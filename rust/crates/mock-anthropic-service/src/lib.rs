@@ -104,6 +104,8 @@ enum Scenario {
     RepoReplayEval,
     ReasoningStep,
     RedactedThinking,
+    StructuredExecutionE2e,
+    TeamConvergenceE2e,
 }
 
 impl Scenario {
@@ -125,6 +127,8 @@ impl Scenario {
             "repo_replay_eval" => Some(Self::RepoReplayEval),
             "reasoning_step" => Some(Self::ReasoningStep),
             "redacted_thinking" => Some(Self::RedactedThinking),
+            "structured_execution_e2e" => Some(Self::StructuredExecutionE2e),
+            "team_convergence_e2e" => Some(Self::TeamConvergenceE2e),
             _ => None,
         }
     }
@@ -147,6 +151,8 @@ impl Scenario {
             Self::RepoReplayEval => "repo_replay_eval",
             Self::ReasoningStep => "reasoning_step",
             Self::RedactedThinking => "redacted_thinking",
+            Self::StructuredExecutionE2e => "structured_execution_e2e",
+            Self::TeamConvergenceE2e => "team_convergence_e2e",
         }
     }
 }
@@ -521,7 +527,43 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         }
         Scenario::ReasoningStep => reasoning_step_sse(),
         Scenario::RedactedThinking => redacted_thinking_sse(),
+        Scenario::StructuredExecutionE2e => structured_execution_sse(request, false),
+        Scenario::TeamConvergenceE2e => structured_execution_sse(request, true),
     }
+}
+
+/// Discriminate the structured/team E2E response by the role-specific system
+/// prompt the runtime sends for each sub-turn. `team` selects high-effort plan
+/// nodes so the runtime engages the Architect/Executor/Reviewer convergence
+/// loop; otherwise nodes use a single-Executor pass.
+fn structured_execution_sse(request: &MessageRequest, team: bool) -> String {
+    let system = request.system.as_deref().unwrap_or("");
+    // The planning model is asked for a machine-readable plan.
+    if system.contains("Decompose the task into a small DAG") {
+        let effort = if team { 5 } else { 1 };
+        let plan = format!(
+            "{{\"steps\":[{{\"id\":\"design\",\"title\":\"Design the change\",\"estimated_effort\":{effort}}},{{\"id\":\"implement\",\"title\":\"Implement it\",\"depends_on\":[\"design\"],\"estimated_effort\":{effort}}}]}}"
+        );
+        return final_text_sse(&plan);
+    }
+    // Team roles (high-effort nodes).
+    if system.contains("You are the Architect") {
+        return final_text_sse(
+            "Brief: split into design then implementation; watch the edge cases.",
+        );
+    }
+    if system.contains("You are the Executor") {
+        return final_text_sse("Implemented the step per the brief.");
+    }
+    if system.contains("You are the Reviewer") {
+        return final_text_sse("APPROVE");
+    }
+    // Single-Executor structured node (low-effort path).
+    if system.contains("executing one step of a larger structured plan") {
+        return final_text_sse("Step complete.");
+    }
+    // Main agentic loop: produce the final user-facing answer.
+    final_text_sse("Structured execution finished; task complete.")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -784,6 +826,10 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             },
             request_id: None,
         },
+        Scenario::StructuredExecutionE2e | Scenario::TeamConvergenceE2e => text_message_response(
+            "msg_structured_e2e",
+            "Structured execution finished; task complete.",
+        ),
     }
 }
 
@@ -805,6 +851,8 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::RepoReplayEval => "req_repo_replay_eval",
         Scenario::ReasoningStep => "req_reasoning_step",
         Scenario::RedactedThinking => "req_redacted_thinking",
+        Scenario::StructuredExecutionE2e => "req_structured_execution_e2e",
+        Scenario::TeamConvergenceE2e => "req_team_convergence_e2e",
     }
 }
 

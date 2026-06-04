@@ -829,6 +829,85 @@ fn repl_error_and_done_events_include_protocol_version() {
     assert!(events.iter().any(|event| event["type"] == "done"));
 }
 
+#[test]
+fn structured_execution_drives_dag_end_to_end() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-structured-e2e"));
+    workspace.create();
+    // Enable structured execution at a low complexity threshold so the
+    // high-capability prompt below engages the DAG pipeline.
+    fs::write(
+        workspace.config_home.join("settings.json"),
+        r#"{"decisioning":{"enabled":true,"emitEvents":true,"structuredExecutionThreshold":3}}"#,
+    )
+    .expect("settings should write");
+
+    // Scenario prefix selects the phase-aware mock; the rest of the prompt
+    // drives high complexity (implement/refactor/write/test/verify).
+    let prompt = format!(
+        "{SCENARIO_PREFIX}structured_execution_e2e implement, refactor, write, test and verify the billing module"
+    );
+    let events = run_stream_json_prompt(
+        &workspace,
+        server.base_url().as_str(),
+        &prompt,
+        "danger-full-access",
+        None,
+    );
+
+    assert_all_events_are_versioned(&events);
+    // The structured plan produced real plan-execution events (nodes driven
+    // through the scheduler), and the turn completed.
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "plan_execution_event"),
+        "expected plan_execution_event from DAG dispatch: {events:?}"
+    );
+    assert!(events.iter().any(|event| event["type"] == "done"));
+}
+
+#[test]
+fn team_convergence_drives_roles_end_to_end() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-team-e2e"));
+    workspace.create();
+    // Structured execution on, plus team convergence for high-effort nodes.
+    fs::write(
+        workspace.config_home.join("settings.json"),
+        r#"{"decisioning":{"enabled":true,"emitEvents":true,"structuredExecutionThreshold":3,"teamConvergenceThreshold":4}}"#,
+    )
+    .expect("settings should write");
+
+    let prompt = format!(
+        "{SCENARIO_PREFIX}team_convergence_e2e implement, refactor, write, test and verify the core engine"
+    );
+    let events = run_stream_json_prompt(
+        &workspace,
+        server.base_url().as_str(),
+        &prompt,
+        "danger-full-access",
+        None,
+    );
+
+    assert_all_events_are_versioned(&events);
+    // The multi-role convergence emitted team-execution dialogue events and
+    // the turn completed.
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "team_execution_event"),
+        "expected team_execution_event from role convergence: {events:?}"
+    );
+    assert!(events.iter().any(|event| event["type"] == "done"));
+}
+
 fn run_stream_json_case(
     workspace: &HarnessWorkspace,
     base_url: &str,

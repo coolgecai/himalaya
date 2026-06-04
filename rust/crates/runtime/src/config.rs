@@ -1358,6 +1358,27 @@ fn parse_optional_decisioning_config(root: &JsonValue) -> Result<DecisioningConf
     {
         config = config.with_max_parallelism(max_parallelism as usize);
     }
+    if let Some(threshold) = optional_u16(
+        decisioning,
+        "planningComplexityThreshold",
+        "merged settings.decisioning",
+    )? {
+        config = config.with_planning_complexity_threshold(threshold.min(255) as u8);
+    }
+    if let Some(threshold) = optional_u16(
+        decisioning,
+        "structuredExecutionThreshold",
+        "merged settings.decisioning",
+    )? {
+        config = config.with_structured_execution_threshold(threshold.min(255) as u8);
+    }
+    if let Some(threshold) = optional_u16(
+        decisioning,
+        "teamConvergenceThreshold",
+        "merged settings.decisioning",
+    )? {
+        config = config.with_team_convergence_threshold(threshold.min(255) as u8);
+    }
 
     if let Some(policy_value) = decisioning.get("safetyPolicy") {
         let policy = expect_object(policy_value, "merged settings.decisioning.safetyPolicy")?;
@@ -2080,6 +2101,45 @@ mod tests {
         assert_eq!(routing.routes()[0].role, ModelRoutePhase::Verification);
         assert_eq!(routing.routes()[0].model, "opus");
         assert_eq!(routing.routes()[0].quality_weight, 8);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_decisioning_thresholds_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".Himalaya");
+        fs::create_dir_all(cwd.join(".Himalaya")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".Himalaya").join("settings.json"),
+            r#"{
+              "decisioning": {
+                "enabled": true,
+                "planningComplexityThreshold": 3,
+                "structuredExecutionThreshold": 4,
+                "teamConvergenceThreshold": 5
+              }
+            }"#,
+        )
+        .expect("write decisioning settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let decisioning = loaded.feature_config().decisioning();
+
+        assert!(decisioning.enabled());
+        assert_eq!(decisioning.planning_complexity_threshold(), 3);
+        assert_eq!(decisioning.structured_execution_threshold(), 4);
+        assert_eq!(decisioning.team_convergence_threshold(), 5);
+        // Gating helpers honor the parsed thresholds.
+        assert!(decisioning.uses_structured_execution(4));
+        assert!(!decisioning.uses_structured_execution(3));
+        assert!(decisioning.uses_team_convergence(5));
+        assert!(!decisioning.uses_team_convergence(4));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

@@ -335,6 +335,18 @@ const DECISIONING_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Number,
     },
     FieldSpec {
+        name: "planningComplexityThreshold",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "structuredExecutionThreshold",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "teamConvergenceThreshold",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
         name: "safetyPolicy",
         expected: FieldType::Object,
     },
