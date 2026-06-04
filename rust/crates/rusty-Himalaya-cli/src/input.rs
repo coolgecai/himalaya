@@ -61,6 +61,11 @@ impl Completer for SlashCommandHelper {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        // @path file completion: extract the token under the cursor.
+        if let Some((completion_start, candidates)) = at_file_completions(line, pos) {
+            return Ok((completion_start, candidates));
+        }
+        // Slash command completion (existing behaviour).
         let Some(prefix) = slash_command_prefix(line, pos) else {
             return Ok((0, Vec::new()));
         };
@@ -208,6 +213,80 @@ fn slash_command_prefix(line: &str, pos: usize) -> Option<&str> {
     }
 
     Some(prefix)
+}
+
+/// Extract the token under the cursor from `line`, scanning backwards from
+/// `pos` to the previous whitespace (or start of line), and forwards to the
+/// next whitespace (or end of line). Returns the (start_index, token).
+fn token_at_cursor(line: &str, pos: usize) -> (usize, &str) {
+    let start = line[..pos]
+        .rfind(|c: char| c.is_whitespace())
+        .map_or(0, |i| i + 1);
+    let end = line[pos..]
+        .find(|c: char| c.is_whitespace())
+        .map_or(line.len(), |i| pos + i);
+    (start, &line[start..end])
+}
+
+/// File-system completion for `@path` tokens. When the token under the cursor
+/// starts with `@`, the part after `@` is treated as a path prefix and matched
+/// against the filesystem (via a simple glob). Returns the completion start
+/// position (the byte after `@`) and candidates as `@path` replacements.
+fn at_file_completions(line: &str, pos: usize) -> Option<(usize, Vec<Pair>)> {
+    let (token_start, token) = token_at_cursor(line, pos);
+    let path_prefix = token.strip_prefix('@')?;
+    if token_start + 1 >= token.len() {
+        return None; // just "@" with nothing after — no completion
+    }
+    let dir = std::path::Path::new(path_prefix);
+    let (search_dir, file_prefix) = if path_prefix.ends_with('/') || path_prefix.ends_with('\\') {
+        (dir.to_path_buf(), String::new())
+    } else if let Some(parent) = dir.parent() {
+        if parent.as_os_str().is_empty() {
+            (
+                std::path::PathBuf::from("."),
+                dir.to_string_lossy().to_string(),
+            )
+        } else {
+            (
+                parent.to_path_buf(),
+                dir.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        }
+    } else {
+        (std::path::PathBuf::from("."), path_prefix.to_string())
+    };
+
+    let Ok(entries) = std::fs::read_dir(&search_dir) else {
+        return None;
+    };
+
+    let mut matches: Vec<Pair> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.to_lowercase().starts_with(&file_prefix.to_lowercase()) {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let mut replacement = format!("@{}/", &name);
+        if path_prefix.contains('/') || path_prefix.contains('\\') {
+            // Preserve the directory prefix the user typed.
+            let dir_prefix = &path_prefix[..path_prefix.rfind(['/', '\\']).unwrap_or(0) + 1];
+            replacement = format!("@{dir_prefix}{}{}", &name, if is_dir { "/" } else { "" });
+        }
+        matches.push(Pair {
+            display: format!("{}{}", &name, if is_dir { "/" } else { "" }),
+            replacement,
+        });
+    }
+    if matches.is_empty() {
+        return None;
+    }
+    // Return the position right after "@" so rustyline replaces from there.
+    Some((token_start + 1, matches))
 }
 
 fn normalize_completions(completions: Vec<String>) -> Vec<String> {

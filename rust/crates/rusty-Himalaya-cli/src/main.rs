@@ -5199,9 +5199,16 @@ fn run_repl(
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
+                // Expand file://, file:, 附件:, 文件: prefix lines to @path before
+                // the main @file expansion pass (unified attachment syntax).
+                let expanded = expand_file_prefix_lines(&trimmed);
                 // Expand @file tokens before sending to the LLM.
-                match expand_at_file_syntax(&trimmed, &cli.model) {
+                match expand_at_file_syntax(&expanded, &cli.model) {
                     Ok((processed, file_blocks)) => {
+                        let summary = attachment_summary(&processed, &file_blocks);
+                        if !summary.is_empty() {
+                            eprintln!("{summary}");
+                        }
                         if !file_blocks.is_empty() {
                             if let Err(e) = cli.inject_file_blocks(file_blocks) {
                                 eprintln!("file injection error: {e}");
@@ -12365,6 +12372,68 @@ fn permission_policy(
 /// Text-extractable files are inlined into the returned prompt string.
 /// Image files (when the model supports vision) are returned as separate
 /// [`ContentBlock::Image`] blocks to be injected before the turn.
+/// Sensitive attachment checks shared with VS Code (attachmentPaths.ts). Both
+/// lists must stay in sync to keep the security story consistent across the
+/// CLI and the extension.
+fn is_attachment_blocked(path: &std::path::Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let blocked_extensions: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".kdbx"];
+    if blocked_extensions
+        .iter()
+        .any(|blocked| ext.ends_with(blocked.trim_start_matches('.')))
+    {
+        return true;
+    }
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let blocked_snippets: &[&str] = &["id_rsa", "id_ed25519", "credentials", "secret", "token"];
+    blocked_snippets
+        .iter()
+        .any(|snippet| filename.contains(snippet))
+}
+
+/// Preprocess `file:`, `附件:`, and `文件:` prefix lines (VS Code attachment
+/// syntax) into `@path` tokens so the unified CLI recognizer works with
+/// prompts written in both environments. Each such line is replaced with a
+/// `@path` reference that `expand_at_file_syntax` then expands.
+fn expand_file_prefix_lines(input: &str) -> String {
+    let prefixes: &[&str] = &["file:", "文件:", "附件:"];
+    let mut out = String::with_capacity(input.len());
+    for line in input.lines() {
+        let trimmed = line.trim();
+        let mut matched = false;
+        for prefix in prefixes {
+            if let Some(path) = trimmed
+                .strip_prefix(prefix)
+                .map(|rest| rest.trim())
+                .filter(|rest| !rest.is_empty())
+            {
+                // Strip surrounding quotes if present.
+                let clean = path
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .or_else(|| path.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                    .unwrap_or(path);
+                out.push_str(&format!("@{clean}\n"));
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.trim_end().to_string()
+}
+
 fn expand_at_file_syntax(input: &str, model: &str) -> Result<(String, Vec<ContentBlock>), String> {
     use file_extract::{extract_file, FileContent};
 
@@ -12390,7 +12459,24 @@ fn expand_at_file_syntax(input: &str, model: &str) -> Result<(String, Vec<Conten
         let path_str = &input[start..end];
         let path = std::path::Path::new(path_str);
 
-        if path_str.is_empty() || !path.exists() {
+        if path_str.is_empty() {
+            result.push(ch);
+            continue;
+        }
+        if !path.exists() {
+            eprintln!(
+                "Attachment warning: file not found — {}  (use --file <path> to attach from another directory)",
+                path.display()
+            );
+            result.push(ch);
+            continue;
+        }
+        // Block sensitive files (mirrors VS Code attachmentPaths.ts blocked list).
+        if is_attachment_blocked(path) {
+            eprintln!(
+                "Attachment blocked: {} is an excluded file type (credentials, keys, tokens)",
+                path.display()
+            );
             result.push(ch);
             continue;
         }
@@ -12428,6 +12514,30 @@ fn expand_at_file_syntax(input: &str, model: &str) -> Result<(String, Vec<Conten
     Ok((result.trim().to_string(), image_blocks))
 }
 
+/// Extract attachment names from the expanded prompt (`[File: ...]` markers)
+/// and image blocks, so the CLI can print a summary before the turn begins.
+fn attachment_summary(expanded_text: &str, image_blocks: &[ContentBlock]) -> String {
+    let mut files: Vec<String> = Vec::new();
+    // Text attachments are inlined as `[File: path]\n...`
+    let mut remaining = expanded_text;
+    while let Some(idx) = remaining.find("[File: ") {
+        remaining = &remaining[idx + 7..];
+        if let Some(end) = remaining.find(']') {
+            files.push(remaining[..end].to_string());
+        }
+    }
+    // Image blocks carry no inline marker, just a ContentBlock::Image.
+    for block in image_blocks {
+        if let ContentBlock::Image { media_type, .. } = block {
+            files.push(format!("(image, {media_type})"));
+        }
+    }
+    if files.is_empty() {
+        return String::new();
+    }
+    format!("\n  Attached {} file(s): {}", files.len(), files.join(", "))
+}
+
 /// Load files from `paths` and convert them to [`ContentBlock`]s.
 ///
 /// Uses [`api::model_supports_vision`] to decide whether images should be
@@ -12445,6 +12555,13 @@ fn load_files_as_content_blocks(
     let want_image = api::model_supports_vision_probed(model, base_url.as_deref());
     let mut blocks = Vec::new();
     for path in paths {
+        if is_attachment_blocked(path) {
+            eprintln!(
+                "Attachment blocked: {} is an excluded file type",
+                path.display()
+            );
+            continue;
+        }
         match extract_file(path, want_image) {
             Ok(FileContent::Text(text)) => {
                 if text.contains("[No extractable text was found in this PDF attachment") {
