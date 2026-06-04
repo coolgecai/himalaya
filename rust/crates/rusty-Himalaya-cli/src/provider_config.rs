@@ -4,6 +4,7 @@
 /// Model and base URL (non-secrets) are saved alongside the project config in
 /// `.Himalaya/provider.json`; the API key is stored in a permission-restricted
 /// credential file under the Himalaya config home (chmod 600 on Unix).
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 
@@ -18,6 +19,17 @@ struct ProviderConfig {
     base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
+    /// Named profiles saved by the wizard under user-specified names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    profiles: BTreeMap<String, ProviderProfile>,
+}
+
+/// A named profile bundling model + base URL (api key lives in credentials).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderProfile {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 /// The project-local file that stores the model wizard choice (model + base_url).
@@ -54,6 +66,7 @@ pub fn persist_wizard_selection(
         model: selection.model.clone(),
         base_url: selection.base_url.clone(),
         api_key: None, // never write the key into the project dir
+        profiles: BTreeMap::new(),
     };
     fs::write(
         &config_path,
@@ -91,18 +104,57 @@ pub fn load_wizard_selection(project_dir: &std::path::Path) -> Option<ModelSelec
     let config_path = provider_config_path(project_dir);
     let config: ProviderConfig =
         serde_json::from_str(&fs::read_to_string(&config_path).ok()?).ok()?;
-    let api_key = Some(provider_credentials_path())
-        .filter(|p| p.exists())
-        .and_then(|p| fs::read_to_string(&p).ok())
-        .and_then(|raw| {
-            serde_json::from_str::<serde_json::Value>(&raw)
-                .ok()
-                .and_then(|v| v.get("api_key")?.as_str().map(|s| s.to_string()))
-        });
+    let api_key = load_api_key_from_credentials();
 
     Some(ModelSelection {
         model: config.model,
         base_url: config.base_url,
+        api_key,
+    })
+}
+
+fn load_api_key_from_credentials() -> Option<String> {
+    let creds_path = provider_credentials_path();
+    if !creds_path.exists() {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&creds_path).ok()?)
+        .ok()
+        .and_then(|v| v.get("api_key")?.as_str().map(|s| s.to_string()))
+}
+
+/// List all saved profiles (including the last wizard selection as "default").
+/// Returns an empty map when no provider.json exists.
+pub fn list_profiles(project_dir: &std::path::Path) -> BTreeMap<String, ProviderProfile> {
+    let config_path = provider_config_path(project_dir);
+    let Ok(config): Result<ProviderConfig, _> =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap_or_default())
+    else {
+        return BTreeMap::new();
+    };
+    let mut profiles = config.profiles;
+    // Always include the last wizard selection as the "default" profile.
+    profiles
+        .entry("default".to_string())
+        .or_insert(ProviderProfile {
+            model: config.model,
+            base_url: config.base_url,
+        });
+    profiles
+}
+
+/// Apply a saved profile (by name) to the current environment and return the
+/// model to switch to. Returns `None` when the profile does not exist.
+pub fn apply_profile(name: &str, project_dir: &std::path::Path) -> Option<ModelSelection> {
+    if name == "default" {
+        return load_wizard_selection(project_dir);
+    }
+    let profiles = list_profiles(project_dir);
+    let profile = profiles.get(name)?;
+    let api_key = load_api_key_from_credentials();
+    Some(ModelSelection {
+        model: profile.model.clone(),
+        base_url: profile.base_url.clone(),
         api_key,
     })
 }

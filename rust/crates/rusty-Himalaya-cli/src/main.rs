@@ -4163,16 +4163,32 @@ fn format_model_report(model: &str, message_count: usize, turns: u32) -> String 
         "Model
   Current model    {model}
   Session messages {message_count}
-  Session turns    {turns}
-
-  Built-in aliases:",
+  Session turns    {turns}",
     );
+    // Saved profiles from provider.json (when present in the cwd).
+    if let Ok(cwd) = env::current_dir() {
+        let profiles = provider_config::list_profiles(&cwd);
+        if !profiles.is_empty() {
+            report.push_str("\n\n  Saved profiles (from provider.json):");
+            for (name, profile) in &profiles {
+                if let Some(ref url) = profile.base_url {
+                    report.push_str(&format!(
+                        "\n    /model use {name:<14} → {} ({url})",
+                        profile.model
+                    ));
+                } else {
+                    report.push_str(&format!("\n    /model use {name:<14} → {}", profile.model));
+                }
+            }
+        }
+    }
+    report.push_str("\n\n  Built-in aliases:");
     for (alias, resolved) in BUILTIN_ALIASES {
         report.push_str(&format!("\n    /model {alias:<16} → {resolved}"));
     }
     report.push_str(
         "\n\n  Add custom aliases in settings.json: {\"aliases\": {\"my-shortcut\": \"full-model-id\"}}
-  They override the built-in aliases above.\n\nUsage\n  Inspect current model with /model\n  Switch models with /model <name>",
+  They override the built-in aliases above.\n\nUsage\n  Inspect current model with /model\n  Switch models with /model <name>\n  Re-run wizard with /model wizard",
     );
     report
 }
@@ -6151,7 +6167,14 @@ impl LiveCli {
                 self.compact()?;
                 false
             }
-            SlashCommand::Model { model } => self.set_model(model)?,
+            SlashCommand::Model { model } => {
+                if model.as_deref() == Some("wizard") {
+                    self.run_model_wizard()?;
+                    false
+                } else {
+                    self.set_model(model)?
+                }
+            }
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
@@ -6468,6 +6491,47 @@ impl LiveCli {
             format_model_switch_report(&previous, &model, message_count)
         );
         Ok(true)
+    }
+
+    /// Re-run the interactive model selection wizard from the REPL (via
+    /// `/model wizard`) so the user can switch provider/model without
+    /// restarting the CLI. The selection is persisted and applied immediately.
+    fn run_model_wizard(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(selection) = model_selector::run_wizard() else {
+            println!("Model wizard cancelled.");
+            return Ok(());
+        };
+        if let Some(ref url) = selection.base_url {
+            env::set_var("OPENAI_BASE_URL", url);
+        }
+        if let Some(ref key) = selection.api_key {
+            env::set_var("OPENAI_API_KEY", key);
+        }
+        if let Ok(cwd) = env::current_dir() {
+            let _ = provider_config::persist_wizard_selection(&selection, &cwd);
+        }
+        let model = resolve_model_alias_with_config(&selection.model);
+        let previous = self.model.clone();
+        self.model = model.clone();
+        let session = self.runtime.session().clone();
+        let message_count = session.messages.len();
+        self.runtime = build_runtime(
+            session,
+            &self.session.id,
+            model.clone(),
+            self.system_prompt.clone(),
+            true,
+            true,
+            false,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+        )?;
+        println!(
+            "{}",
+            format_model_switch_report(&previous, &model, message_count)
+        );
+        Ok(())
     }
 
     fn set_permissions(
@@ -11506,6 +11570,7 @@ fn slash_command_completion_candidates_with_sessions(
         completions.insert(format!("/model {}", resolve_model_alias(model)));
         completions.insert(format!("/model {model}"));
     }
+    completions.insert("/model wizard".to_string());
 
     if let Some(active_session_id) = active_session_id.filter(|value| !value.trim().is_empty()) {
         completions.insert(format!("/resume {active_session_id}"));

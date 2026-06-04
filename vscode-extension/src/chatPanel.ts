@@ -1313,18 +1313,49 @@ export class HimalayaChatPanel {
       return;
     }
 
-    const cloudModel = await vscode.window.showInputBox({
+    // Offer a list of known models (mirrors the CLI built-in aliases) plus a
+    // "Custom…" entry that falls back to the InputBox for unknown models.
+    const KNOWN_CLOUD_MODELS = [
+      { label: 'Himalaya-opus-4-6', description: 'Himalaya Opus (high quality)', detail: 'Built-in' },
+      { label: 'Himalaya-sonnet-4-6', description: 'Himalaya Sonnet (balanced)', detail: 'Built-in' },
+      { label: 'Himalaya-haiku-4-5-20251213', description: 'Himalaya Haiku (fast)', detail: 'Built-in' },
+      { label: 'gpt-4o', description: 'OpenAI GPT-4o', detail: 'Common' },
+      { label: 'gpt-4o-mini', description: 'OpenAI GPT-4o Mini (fast)', detail: 'Common' },
+    ];
+
+    const defaultModel = this.currentOptions.cloudModel || this.currentOptions.model || this.currentBootstrap.config.defaultModel;
+    const knownMatch = KNOWN_CLOUD_MODELS.find(m => m.label === defaultModel);
+    const modelOptions = [
+      ...KNOWN_CLOUD_MODELS,
+      { label: 'Custom model name…', description: 'Enter a model name not in the list', detail: 'Other' }
+    ];
+    const modelPick = await vscode.window.showQuickPick(modelOptions, {
       title: 'Cloud model',
-      prompt: 'Enter the model name',
-      value: this.currentOptions.cloudModel || this.currentOptions.model || this.currentBootstrap.config.defaultModel,
-      ignoreFocusOut: true
+      placeHolder: `Select a model (default: ${defaultModel})`,
+      ignoreFocusOut: true,
+      matchOnDescription: true,
+      matchOnDetail: true
     });
 
-    if (cloudModel === undefined) {
+    if (modelPick === undefined) {
       return;
     }
 
-    const selectedModel = cloudModel.trim();
+    let selectedModel: string;
+    if (modelPick.label === 'Custom model name…') {
+      const custom = await vscode.window.showInputBox({
+        title: 'Cloud model',
+        prompt: 'Enter the model name',
+        value: defaultModel,
+        ignoreFocusOut: true
+      });
+      if (custom === undefined) {
+        return;
+      }
+      selectedModel = custom.trim();
+    } else {
+      selectedModel = modelPick.label.trim();
+    }
     if (!cloudBaseUrl.trim() || !cloudApiKey.trim() || !selectedModel) {
       void vscode.window.showWarningMessage('Cloud model setup requires a network address, API key, and model name.');
       return;
