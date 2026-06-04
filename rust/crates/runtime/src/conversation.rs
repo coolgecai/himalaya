@@ -2397,10 +2397,15 @@ where
             .or_else(|| detect_input_language(&user_input));
         task_state.set_output_language(active_language.clone());
         if let Some(language) = &active_language {
-            effective_system_prompt.push(format!(
-                "# Active output language\n{}",
-                language_output_contract(language)
-            ));
+            // Insert at the FRONT of the system prompt for maximum salience —
+            // weaker local models otherwise ignore a contract buried mid-prompt.
+            effective_system_prompt.insert(
+                0,
+                format!(
+                    "# Output language (MANDATORY)\nYou MUST write your entire response to the user in {language}. This overrides any default. {}",
+                    language_output_contract(language)
+                ),
+            );
         }
         if let Some(relevant_memory) =
             format_relevant_memory_context(&memory.relevant_entries(&user_input, 12))
@@ -5060,6 +5065,57 @@ mod tests {
     }
 
     #[test]
+    fn plain_chinese_input_injects_language_contract_without_explicit_preference() {
+        // A Chinese prompt with NO explicit "请用中文" preference and no stored
+        // memory must still default the output language to Chinese.
+        struct LangProbeApi {
+            saw_chinese_contract: std::rc::Rc<std::cell::Cell<bool>>,
+        }
+        impl ApiClient for LangProbeApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let system = request.system_prompt.join("\n");
+                if system.contains("Output-language contract: respond to the user in Chinese") {
+                    self.saw_chinese_contract.set(true);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("好的".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        // Isolated workspace so no stored language memory leaks in.
+        let root = std::env::temp_dir().join(format!(
+            "himalaya-lang-default-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join(".Himalaya")).expect("workspace");
+        fs::write(root.join(".Himalaya/long_term_memory.json"), "[]").expect("empty memory");
+
+        let saw = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut runtime = ConversationRuntime::new(
+            Session::new().with_workspace_root(root.clone()),
+            LangProbeApi {
+                saw_chinese_contract: saw.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let _ = runtime.run_turn("帮我把这个函数重构一下", None);
+        assert!(
+            saw.get(),
+            "plain Chinese input should inject the Chinese output-language contract"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn language_preference_persists_as_output_contract_across_turns() {
         struct InspectingLanguageApi {
             call_count: usize,
@@ -5083,7 +5139,7 @@ mod tests {
                         })
                 });
                 if is_workspace_analysis_turn {
-                    assert!(system.contains("# Active output language"));
+                    assert!(system.contains("# Output language (MANDATORY)"));
                     assert!(system.contains("- Output language: Chinese"));
                     assert!(system.contains("Task class: current workspace/source analysis"));
                 }
