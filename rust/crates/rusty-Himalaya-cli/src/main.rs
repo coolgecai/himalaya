@@ -9,6 +9,7 @@
 mod init;
 mod input;
 mod model_selector;
+mod provider_config;
 mod render;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -2277,13 +2278,30 @@ fn resolve_repl_model(cli_model: String) -> String {
     if let Some(config_model) = config_model_for_current_dir() {
         return resolve_model_alias_with_config(&config_model);
     }
+    // Check for a previously persisted wizard choice (P0-1: so the user does
+    // not have to re-run the wizard on every launch).
+    if let Ok(cwd) = env::current_dir() {
+        if let Some(saved) = provider_config::load_wizard_selection(&cwd) {
+            if let Some(url) = &saved.base_url {
+                env::set_var("OPENAI_BASE_URL", url);
+            }
+            if let Some(key) = &saved.api_key {
+                env::set_var("OPENAI_API_KEY", key);
+            }
+            return saved.model;
+        }
+    }
     // No model configured — run the interactive wizard when in a terminal.
     if let Some(selection) = model_selector::run_wizard() {
-        if let Some(url) = selection.base_url {
-            env::set_var("OPENAI_BASE_URL", &url);
+        if let Some(url) = &selection.base_url {
+            env::set_var("OPENAI_BASE_URL", url);
         }
-        if let Some(key) = selection.api_key {
-            env::set_var("OPENAI_API_KEY", &key);
+        if let Some(key) = &selection.api_key {
+            env::set_var("OPENAI_API_KEY", key);
+        }
+        // Persist the selection so the next launch skips the wizard.
+        if let Ok(cwd) = env::current_dir() {
+            let _ = provider_config::persist_wizard_selection(&selection, &cwd);
         }
         return selection.model;
     }
