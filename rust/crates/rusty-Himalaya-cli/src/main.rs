@@ -2171,6 +2171,9 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
     previous[right_chars.len()]
 }
 
+/// Built-in convenience aliases. These are checked AFTER any user-defined
+/// aliases in settings.json (`{"aliases": {"my-shortcut": "full-model-id"}}`),
+/// so a user alias always takes precedence over a built-in of the same name.
 fn resolve_model_alias(model: &str) -> &str {
     match model {
         "opus" => "Himalaya-opus-4-6",
@@ -4156,17 +4159,31 @@ fn format_unknown_slash_command_message(name: &str) -> String {
 }
 
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
-    format!(
+    let mut report = format!(
         "Model
   Current model    {model}
   Session messages {message_count}
   Session turns    {turns}
 
-Usage
-  Inspect current model with /model
-  Switch models with /model <name>"
-    )
+  Built-in aliases:",
+    );
+    for (alias, resolved) in BUILTIN_ALIASES {
+        report.push_str(&format!("\n    /model {alias:<16} → {resolved}"));
+    }
+    report.push_str(
+        "\n\n  Add custom aliases in settings.json: {\"aliases\": {\"my-shortcut\": \"full-model-id\"}}
+  They override the built-in aliases above.\n\nUsage\n  Inspect current model with /model\n  Switch models with /model <name>",
+    );
+    report
 }
+
+/// Built-in model aliases displayed in the report. User aliases in settings.json
+/// override these (see resolve_model_alias_with_config).
+const BUILTIN_ALIASES: &[(&str, &str)] = &[
+    ("opus", "Himalaya-opus-4-6"),
+    ("sonnet", "Himalaya-sonnet-4-6"),
+    ("haiku", "Himalaya-haiku-4-5-20251213"),
+];
 
 fn format_model_switch_report(previous: &str, next: &str, message_count: usize) -> String {
     format!(
@@ -15106,6 +15123,8 @@ mod tests {
         assert!(report.contains("Current model    Himalaya-sonnet"));
         assert!(report.contains("Session messages 12"));
         assert!(report.contains("Switch models with /model <name>"));
+        assert!(report.contains("Built-in aliases"));
+        assert!(report.contains("Add custom aliases in settings.json"));
     }
 
     #[test]
