@@ -548,6 +548,18 @@ test('stream protocol helpers behave as expected', async () => {
     assert.equal(isKnownStreamEventType(parsed.event.type), true);
   }
 
+  // Regression: events with explicit null optional fields (provider, message,
+  // fallback_model) must NOT be rejected as malformed. The CLI legitimately
+  // emits provider:null / message:null / fallback_model:null.
+  const nullFieldFixtures = [
+    '{"type":"task_ledger_event","task_ledger_event":{"seq":30,"task_id":"task_x","event":"status_changed","status":"running","message":null,"timestamp":1780576450000},"protocol_version":1}',
+    '{"type":"model_route_event","model_route_event":{"phase":"coding","model":"qwen3.6:35b","provider":null,"reason":"selected coding","confidence":0.95,"fallback_model":"qwen3.6:35b"},"protocol_version":1}',
+  ];
+  for (const line of nullFieldFixtures) {
+    const parsed = parseStreamEventLine(line);
+    assert.equal(parsed.ok, true, `null optional fields should parse: ${line.slice(0, 60)}`);
+  }
+
   const ok = parseStreamEventLine('{"type":"text_delta","text":"hi","protocol_version":1}');
   assert.equal(ok.ok, true);
   assert.equal(ok.event.type, 'text_delta');

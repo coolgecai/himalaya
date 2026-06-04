@@ -1471,6 +1471,34 @@ fn language_output_contract(language: &str) -> String {
     }
 }
 
+/// Detect the dominant natural language of free-text user input by script, so
+/// the agent can default its output language to match the user's input when no
+/// explicit preference is configured. Conservative: only returns a language for
+/// a clear script signal (CJK → Chinese), else `None` (caller defaults to no
+/// contract, i.e. model default / English).
+fn detect_input_language(text: &str) -> Option<String> {
+    let mut cjk = 0usize;
+    let mut latin = 0usize;
+    for ch in text.chars() {
+        // CJK Unified Ideographs (covers the common Han range) — treat as Chinese.
+        if ('\u{4E00}'..='\u{9FFF}').contains(&ch)
+            || ('\u{3400}'..='\u{4DBF}').contains(&ch)
+            || ('\u{F900}'..='\u{FAFF}').contains(&ch)
+        {
+            cjk += 1;
+        } else if ch.is_ascii_alphabetic() {
+            latin += 1;
+        }
+    }
+    // Require a meaningful number of CJK characters and that they are a
+    // non-trivial share of the alphabetic content, so an English prompt that
+    // quotes one Chinese identifier does not flip the whole response.
+    if cjk >= 2 && cjk * 2 >= latin {
+        return Some("Chinese".to_string());
+    }
+    None
+}
+
 fn latest_language_preference(memory: &LongTermMemory) -> Option<String> {
     memory
         .entries
@@ -2363,7 +2391,10 @@ where
             effective_system_prompt.push(memory_override);
         }
         let memory = LongTermMemory::load_for_workspace(self.session.workspace_root());
-        let active_language = active_language_preference(&user_memory_facts, &memory);
+        // Explicit user/stored preference wins; otherwise default the output
+        // language to match the language the user wrote their prompt in.
+        let active_language = active_language_preference(&user_memory_facts, &memory)
+            .or_else(|| detect_input_language(&user_input));
         task_state.set_output_language(active_language.clone());
         if let Some(language) = &active_language {
             effective_system_prompt.push(format!(
@@ -5010,6 +5041,24 @@ mod tests {
         assert!(saved.contains("Chinese"));
         fs::remove_dir_all(root).expect("cleanup workspace");
     }
+    #[test]
+    fn detect_input_language_defaults_to_input_script() {
+        // Chinese input → Chinese.
+        assert_eq!(
+            super::detect_input_language("请分析这个项目的源代码结构"),
+            Some("Chinese".to_string())
+        );
+        // English input → None (model default).
+        assert_eq!(super::detect_input_language("analyze this project"), None);
+        // Mostly-English with a single quoted Chinese identifier → stays None.
+        assert_eq!(
+            super::detect_input_language("rename the 文件 variable to file in main.rs"),
+            None
+        );
+        // Empty / whitespace → None.
+        assert_eq!(super::detect_input_language("   "), None);
+    }
+
     #[test]
     fn language_preference_persists_as_output_contract_across_turns() {
         struct InspectingLanguageApi {

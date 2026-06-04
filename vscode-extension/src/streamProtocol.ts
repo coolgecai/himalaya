@@ -466,15 +466,15 @@ function hasObject(record: Record<string, unknown>, key: string): boolean {
 }
 
 function hasOptionalString(record: Record<string, unknown>, key: string): boolean {
-  return !(key in record) || typeof record[key] === 'string';
+  return !(key in record) || record[key] === null || typeof record[key] === 'string';
 }
 
 function hasOptionalNumber(record: Record<string, unknown>, key: string): boolean {
-  return !(key in record) || (typeof record[key] === 'number' && Number.isFinite(record[key]));
+  return !(key in record) || record[key] === null || (typeof record[key] === 'number' && Number.isFinite(record[key]));
 }
 
 function hasOptionalStringArray(record: Record<string, unknown>, key: string): boolean {
-  return !(key in record) || (Array.isArray(record[key]) && record[key].every((value) => typeof value === 'string'));
+  return !(key in record) || record[key] === null || (Array.isArray(record[key]) && record[key].every((value) => typeof value === 'string'));
 }
 
 function validateReasoningStep(event: Record<string, unknown>): boolean {
