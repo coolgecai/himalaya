@@ -6011,6 +6011,10 @@ impl LiveCli {
     }
 
     fn run_prompt_stream_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Host-driven mode: AskUserQuestion exchanges a structured user_question
+        // NDJSON event + a single-line answer (so a VS Code webview can render
+        // options) instead of printing a human stdin prompt.
+        std::env::set_var("HIMALAYAD_INTERACTIVE_PROTOCOL", "stream-json");
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, true)?;
         let mut permission_prompter =
             CliPermissionPrompter::new_with_stream_json(self.permission_mode, true);

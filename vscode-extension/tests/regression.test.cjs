@@ -537,6 +537,7 @@ test('stream protocol helpers behave as expected', async () => {
     ['worker_restart', '{"type":"worker_restart","worker":{"worker_id":"worker-1","status":"spawning"},"protocol_version":1}'],
     ['worker_terminate', '{"type":"worker_terminate","worker":{"worker_id":"worker-1","status":"failed"},"protocol_version":1}'],
     ['worker_supervisor_tick', '{"type":"worker_supervisor_tick","tick":{"status":"running","active_workers":1},"protocol_version":1}'],
+    ['user_question', '{"type":"user_question","question":"Pick one","options":["a","b"],"protocol_version":1}'],
   ];
 
   for (const [type, line] of fixtures) {

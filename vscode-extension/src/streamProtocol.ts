@@ -58,7 +58,8 @@ export type KnownStreamEventType =
   | 'worker_terminate'
   | 'worker_supervisor_tick'
   | 'error'
-  | 'context_event';
+  | 'context_event'
+  | 'user_question';
 
 
 export type StreamEvent = {
@@ -95,6 +96,8 @@ export type StreamEvent = {
   session_id?: string;
   session_path?: string;
   model?: string;
+  question?: string;
+  options?: string[];
   protocol_version?: number;
   schema_version?: number;
   [key: string]: unknown;
@@ -433,6 +436,7 @@ export const KNOWN_STREAM_EVENT_TYPES: readonly KnownStreamEventType[] = [
   'worker_supervisor_tick',
   'error',
   'context_event',
+  'user_question',
 ];
 
 const KNOWN_EVENT_TYPES: ReadonlySet<KnownStreamEventType> = new Set(KNOWN_STREAM_EVENT_TYPES);
@@ -634,6 +638,8 @@ function validateStreamEventShape(event: Record<string, unknown>): boolean {
       return hasString(event, 'error');
     case 'context_event':
       return hasString(event, 'kind');
+    case 'user_question':
+      return hasString(event, 'question');
     default:
       return true;
   }

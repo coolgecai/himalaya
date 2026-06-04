@@ -1314,15 +1314,77 @@ fn maybe_enforce_permission_check(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
-    use std::io::{self, BufRead, Write};
+    use std::io;
 
-    // Display the question to the user via stdout
+    // In stream-json / host-driven mode (set by the CLI when emitting NDJSON),
+    // exchange a structured `user_question` event + a single-line answer so a
+    // VS Code webview (or any host) can render options and reply. Otherwise
+    // fall back to the interactive human stdin/stdout prompt.
+    let structured = std::env::var("HIMALAYAD_INTERACTIVE_PROTOCOL")
+        .map(|value| value == "stream-json")
+        .unwrap_or(false);
     let stdout = io::stdout();
     let stdin = io::stdin();
     let mut out = stdout.lock();
+    let mut reader = stdin.lock();
+    ask_user_question_io(&input, &mut out, &mut reader, structured)
+}
+
+/// Resolve a raw response into the chosen answer: when options were provided
+/// and the response is a valid 1-based index, return that option; otherwise
+/// return the trimmed response verbatim. Pure so it is unit-testable.
+fn resolve_ask_answer(options: Option<&[String]>, response: &str) -> String {
+    let response = response.trim();
+    if let Some(options) = options {
+        if let Ok(idx) = response.parse::<usize>() {
+            if idx >= 1 && idx <= options.len() {
+                return options[idx - 1].clone();
+            }
+        }
+    }
+    response.to_string()
+}
+
+/// I/O core for AskUserQuestion, generic over reader/writer so both the
+/// structured (NDJSON) and human-prompt paths are unit-testable without real
+/// stdio. In structured mode it emits one `user_question` NDJSON line and reads
+/// one answer line (plain text or `{"answer":"..."}`); otherwise it prints the
+/// human prompt and reads a line.
+fn ask_user_question_io<W: std::io::Write, R: std::io::BufRead>(
+    input: &AskUserQuestionInput,
+    out: &mut W,
+    reader: &mut R,
+    structured: bool,
+) -> Result<String, String> {
+    if structured {
+        let event = json!({
+            "type": "user_question",
+            "protocol_version": 1,
+            "question": input.question,
+            "options": input.options,
+        });
+        writeln!(out, "{event}").map_err(|e| e.to_string())?;
+        out.flush().map_err(|e| e.to_string())?;
+        let mut response = String::new();
+        reader.read_line(&mut response).map_err(|e| e.to_string())?;
+        // Accept either a plain answer line or a JSON `{"answer": "..."}` reply.
+        let answer = serde_json::from_str::<Value>(response.trim())
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("answer")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| resolve_ask_answer(input.options.as_deref(), &response));
+        return to_pretty_json(json!({
+            "question": input.question,
+            "answer": answer,
+            "status": "answered"
+        }));
+    }
 
     writeln!(out, "\n[Question] {}", input.question).map_err(|e| e.to_string())?;
-
     if let Some(ref options) = input.options {
         for (i, option) in options.iter().enumerate() {
             writeln!(out, "  {}. {}", i + 1, option).map_err(|e| e.to_string())?;
@@ -1333,28 +1395,9 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
     }
     out.flush().map_err(|e| e.to_string())?;
 
-    // Read user response from stdin
     let mut response = String::new();
-    stdin
-        .lock()
-        .read_line(&mut response)
-        .map_err(|e| e.to_string())?;
-    let response = response.trim().to_string();
-
-    // If options were provided, resolve the numeric choice
-    let answer = if let Some(ref options) = input.options {
-        if let Ok(idx) = response.parse::<usize>() {
-            if idx >= 1 && idx <= options.len() {
-                options[idx - 1].clone()
-            } else {
-                response.clone()
-            }
-        } else {
-            response.clone()
-        }
-    } else {
-        response.clone()
-    };
+    reader.read_line(&mut response).map_err(|e| e.to_string())?;
+    let answer = resolve_ask_answer(input.options.as_deref(), &response);
 
     to_pretty_json(json!({
         "question": input.question,
@@ -5640,12 +5683,12 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        agent_permission_policy, allowed_tools_for_subagent, ask_user_question_io,
+        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
+        final_assistant_text, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, resolve_ask_answer, run_task_packet,
+        AgentInput, AgentJob, AskUserQuestionInput, GlobalToolRegistry, LaneEventName,
+        LaneFailureClass, ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use plugins::{PluginTool, PluginToolDefinition, PluginToolPermission};
@@ -5659,6 +5702,72 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn ask_input(question: &str, options: Option<Vec<&str>>) -> AskUserQuestionInput {
+        let value = match options {
+            Some(opts) => json!({"question": question, "options": opts}),
+            None => json!({"question": question}),
+        };
+        serde_json::from_value(value).expect("ask input should deserialize")
+    }
+
+    #[test]
+    fn resolve_ask_answer_maps_numeric_choice_to_option() {
+        let options = vec!["red".to_string(), "green".to_string(), "blue".to_string()];
+        assert_eq!(resolve_ask_answer(Some(&options), "2"), "green");
+        // Out-of-range / non-numeric falls back to the verbatim response.
+        assert_eq!(resolve_ask_answer(Some(&options), "9"), "9");
+        assert_eq!(resolve_ask_answer(Some(&options), "teal"), "teal");
+        // No options: verbatim trimmed response.
+        assert_eq!(resolve_ask_answer(None, "  free text \n"), "free text");
+    }
+
+    #[test]
+    fn ask_user_question_structured_mode_emits_event_and_reads_json_answer() {
+        let input = ask_input("Pick one", Some(vec!["a", "b"]));
+        let mut out = Vec::new();
+        let mut reader = std::io::Cursor::new(b"{\"answer\":\"b\"}\n".to_vec());
+        let result = ask_user_question_io(&input, &mut out, &mut reader, true)
+            .expect("structured ask should succeed");
+
+        // Emitted a single user_question NDJSON line with options + version.
+        let emitted = String::from_utf8(out).expect("utf8");
+        let event: serde_json::Value =
+            serde_json::from_str(emitted.trim()).expect("emitted line should be JSON");
+        assert_eq!(event["type"], "user_question");
+        assert_eq!(event["protocol_version"], 1);
+        assert_eq!(event["question"], "Pick one");
+        assert_eq!(event["options"][1], "b");
+        // The JSON answer was parsed.
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("result JSON");
+        assert_eq!(parsed["answer"], "b");
+        assert_eq!(parsed["status"], "answered");
+    }
+
+    #[test]
+    fn ask_user_question_structured_mode_accepts_plain_numeric_answer() {
+        let input = ask_input("Pick one", Some(vec!["a", "b", "c"]));
+        let mut out = Vec::new();
+        let mut reader = std::io::Cursor::new(b"3\n".to_vec());
+        let result = ask_user_question_io(&input, &mut out, &mut reader, true)
+            .expect("structured ask should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("result JSON");
+        assert_eq!(parsed["answer"], "c");
+    }
+
+    #[test]
+    fn ask_user_question_human_mode_prompts_and_resolves_choice() {
+        let input = ask_input("Pick one", Some(vec!["a", "b"]));
+        let mut out = Vec::new();
+        let mut reader = std::io::Cursor::new(b"1\n".to_vec());
+        let result = ask_user_question_io(&input, &mut out, &mut reader, false)
+            .expect("human ask should succeed");
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(printed.contains("[Question] Pick one"));
+        assert!(printed.contains("1. a"));
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("result JSON");
+        assert_eq!(parsed["answer"], "a");
     }
 
     #[test]

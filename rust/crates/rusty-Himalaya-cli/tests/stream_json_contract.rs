@@ -70,6 +70,7 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "worker_supervisor_tick",
         "error",
         "context_event",
+        "user_question",
     ]
     .into_iter()
     .map(String::from)

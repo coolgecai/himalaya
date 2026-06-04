@@ -171,6 +171,9 @@
         },
         {
           "$ref": "#/$defs/contextEvent"
+        },
+        {
+          "$ref": "#/$defs/userQuestion"
         }
       ]
     }
@@ -235,7 +238,8 @@
         "worker_terminate",
         "worker_supervisor_tick",
         "error",
-        "context_event"
+        "context_event",
+        "user_question"
       ]
     },
     "baseEvent": {
@@ -1441,6 +1445,32 @@
             "deduped_entries": {
               "type": "integer",
               "minimum": 0
+            }
+          }
+        }
+      ]
+    },
+    "userQuestion": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "question"
+          ],
+          "properties": {
+            "type": {
+              "const": "user_question"
+            },
+            "question": {
+              "type": "string"
+            },
+            "options": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
           }
         }
