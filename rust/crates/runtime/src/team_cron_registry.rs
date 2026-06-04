@@ -142,6 +142,20 @@ struct CronRegistrySnapshot {
     counter: u64,
 }
 
+/// Outcome of one `run_cron_tick`: which cron ids fired and which failed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CronTickReport {
+    pub fired: Vec<String>,
+    pub failed: Vec<(String, String)>,
+}
+
+impl CronTickReport {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fired.is_empty() && self.failed.is_empty()
+    }
+}
+
 const CRON_SNAPSHOT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default)]
@@ -256,6 +270,40 @@ impl CronRegistry {
             })
             .cloned()
             .collect()
+    }
+
+    /// Fire all cron entries due at `now_secs`, in deterministic cron_id order,
+    /// calling `fire_fn(entry)` for each. On a successful fire the entry's run
+    /// is recorded (so it won't re-fire this minute). `max_fires` bounds the
+    /// number of fires per tick as a runaway guard. Returns a report of what
+    /// fired and what failed. This is the deterministic core a CLI `cron run`
+    /// command (single tick or sleep-loop) drives.
+    pub fn run_cron_tick<F>(
+        &self,
+        now_secs: u64,
+        max_fires: usize,
+        mut fire_fn: F,
+    ) -> CronTickReport
+    where
+        F: FnMut(&CronEntry) -> Result<(), String>,
+    {
+        let mut due = self.due_entries(now_secs);
+        due.sort_by(|a, b| a.cron_id.cmp(&b.cron_id));
+        let mut fired = Vec::new();
+        let mut failed = Vec::new();
+        for entry in due {
+            if fired.len() >= max_fires {
+                break;
+            }
+            match fire_fn(&entry) {
+                Ok(()) => {
+                    let _ = self.record_run(&entry.cron_id);
+                    fired.push(entry.cron_id);
+                }
+                Err(reason) => failed.push((entry.cron_id, reason)),
+            }
+        }
+        CronTickReport { fired, failed }
     }
 
     pub fn save_to_dir(&self, dir: &Path) -> io::Result<()> {
@@ -450,6 +498,50 @@ mod tests {
             inner.entries.get_mut(&entry2.cron_id).unwrap().last_run_at = Some(now - 120);
         }
         assert_eq!(registry.due_entries(now).len(), 1);
+    }
+
+    #[test]
+    fn run_cron_tick_fires_due_entries_and_records_runs() {
+        let now = 1_780_497_000_u64; // 14:30:00 UTC
+        let registry = CronRegistry::new();
+        let due = registry.create("30 14 * * *", "Due now", None);
+        let _not_due = registry.create("0 9 * * *", "Morning only", None);
+
+        let mut fired_prompts = Vec::new();
+        let report = registry.run_cron_tick(now, 10, |entry| {
+            fired_prompts.push(entry.prompt.clone());
+            Ok(())
+        });
+
+        assert_eq!(report.fired, vec![due.cron_id.clone()]);
+        assert!(report.failed.is_empty());
+        assert_eq!(fired_prompts, vec!["Due now".to_string()]);
+        // The fired entry's run was recorded, so it won't re-fire this minute.
+        let after = registry.get(&due.cron_id).unwrap();
+        assert_eq!(after.run_count, 1);
+        assert!(registry.due_entries(now).is_empty());
+    }
+
+    #[test]
+    fn run_cron_tick_honors_max_fires_and_reports_failures() {
+        let now = 1_780_497_000_u64;
+        let registry = CronRegistry::new();
+        // Two due entries this minute.
+        registry.create("30 14 * * *", "A", None);
+        registry.create("* * * * *", "B", None);
+
+        // max_fires = 1 caps the tick.
+        let capped = registry.run_cron_tick(now, 1, |_entry| Ok(()));
+        assert_eq!(capped.fired.len(), 1);
+
+        // A failing fire is reported and NOT recorded as run.
+        let registry2 = CronRegistry::new();
+        let failing = registry2.create("* * * * *", "fails", None);
+        let report = registry2.run_cron_tick(now, 10, |_entry| Err("boom".to_string()));
+        assert!(report.fired.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, failing.cron_id);
+        assert_eq!(registry2.get(&failing.cron_id).unwrap().run_count, 0);
     }
 
     #[test]

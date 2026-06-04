@@ -749,6 +749,11 @@ enum CronCliCommand {
     Remove {
         cron_id: String,
     },
+    /// Fire all cron entries due now (single tick). `max_fires` bounds how many
+    /// prompts run this invocation as a runaway guard.
+    Run {
+        max_fires: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1785,8 +1790,27 @@ fn parse_cron_cli_command(args: &[String]) -> Result<CronCliCommand, String> {
         Some(("remove" | "delete" | "rm", [cron_id])) => Ok(CronCliCommand::Remove {
             cron_id: cron_id.clone(),
         }),
+        Some(("run", rest)) => {
+            // Optional `--max-fires N` (default 16).
+            let mut max_fires = 16usize;
+            let mut iter = rest.iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--max-fires" => {
+                        let value = iter
+                            .next()
+                            .ok_or_else(|| "--max-fires requires a value".to_string())?;
+                        max_fires = value
+                            .parse::<usize>()
+                            .map_err(|_| format!("invalid --max-fires value: {value}"))?;
+                    }
+                    other => return Err(format!("unknown cron run argument: {other}")),
+                }
+            }
+            Ok(CronCliCommand::Run { max_fires })
+        }
         Some((other, _)) => Err(format!(
-            "unknown cron command: {other}\nUsage: Himalaya cron [list|add <5-field-cron> <prompt>|remove <cron-id>]"
+            "unknown cron command: {other}\nUsage: Himalaya cron [list|add <5-field-cron> <prompt>|remove <cron-id>|run [--max-fires N]]"
         )),
     }
 }
@@ -7099,6 +7123,70 @@ fn run_cron_command(
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_cron_output(json!({"type":"cron_delete","cron":entry}), output_format)?;
                 }
+            }
+        }
+        CronCliCommand::Run { max_fires } => {
+            run_cron_tick_command(max_fires, output_format)?;
+        }
+    }
+    Ok(())
+}
+
+/// Fire all cron entries due now. Each fire re-invokes this CLI binary with the
+/// cron's prompt as an independent agent run (genuine cron-daemon behavior),
+/// inheriting the environment so it reaches the configured API. Successful
+/// fires are recorded so they will not re-fire within the same minute.
+fn run_cron_tick_command(
+    max_fires: usize,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = load_cron_registry()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let exe = std::env::current_exe()?;
+    let report = registry.run_cron_tick(now, max_fires, |entry| {
+        let output = std::process::Command::new(&exe)
+            .arg(&entry.prompt)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "cron fire exited with status {:?}",
+                output.status.code()
+            ))
+        }
+    });
+    save_cron_registry(&registry)?;
+
+    match output_format {
+        CliOutputFormat::Text => {
+            if report.is_empty() {
+                println!("no cron entries were due");
+            } else {
+                for cron_id in &report.fired {
+                    println!("fired cron {cron_id}");
+                }
+                for (cron_id, reason) in &report.failed {
+                    println!("cron {cron_id} failed: {reason}");
+                }
+            }
+        }
+        CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+            for cron_id in &report.fired {
+                print_cron_output(
+                    json!({"type":"cron_fired","cron_id":cron_id}),
+                    output_format,
+                )?;
+            }
+            for (cron_id, reason) in &report.failed {
+                print_cron_output(
+                    json!({"type":"cron_fire_failed","cron_id":cron_id,"reason":reason}),
+                    output_format,
+                )?;
             }
         }
     }

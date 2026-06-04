@@ -908,6 +908,65 @@ fn team_convergence_drives_roles_end_to_end() {
     assert!(events.iter().any(|event| event["type"] == "done"));
 }
 
+#[test]
+fn cron_run_fires_due_entry_end_to_end() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-cron-run"));
+    workspace.create();
+
+    // Helper: run an arbitrary CLI invocation in the workspace against the mock.
+    let run_cli = |args: &[&str]| -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_Himalaya"));
+        command
+            .current_dir(&workspace.root)
+            .env_clear()
+            .env("ANTHROPIC_API_KEY", "test-stream-json-key")
+            .env("ANTHROPIC_BASE_URL", server.base_url().as_str())
+            .env("Himalaya_CONFIG_HOME", &workspace.config_home)
+            .env("HOME", &workspace.home)
+            .env("NO_COLOR", "1")
+            .env("PATH", "/usr/bin:/bin")
+            .args(args);
+        command.output().expect("Himalaya should launch")
+    };
+
+    // Seed a cron due every minute whose prompt selects the mock scenario.
+    let add = run_cli(&[
+        "cron",
+        "add",
+        "* * * * *",
+        &format!("{SCENARIO_PREFIX}streaming_text"),
+    ]);
+    assert_success(&add);
+
+    // Fire due crons; each fire re-invokes the binary against the mock.
+    let run = run_cli(&["cron", "run", "--output-format", "stream-json"]);
+    assert_success(&run);
+    let events = parse_stream_json_stdout(&run.stdout);
+    assert!(
+        events.iter().any(|event| event["type"] == "cron_fired"),
+        "expected a cron_fired event: {events:?}"
+    );
+
+    // The fired entry's run was recorded in the persisted registry.
+    let crons_path = workspace
+        .root
+        .join(".Himalaya")
+        .join("cron")
+        .join("crons.json");
+    let crons: Value =
+        serde_json::from_str(&fs::read_to_string(&crons_path).expect("crons.json should exist"))
+            .expect("crons.json should parse");
+    let run_count = crons["entries"][0]["run_count"].as_u64().unwrap_or(0);
+    assert!(
+        run_count >= 1,
+        "fired cron should have run_count >= 1: {crons}"
+    );
+}
+
 fn run_stream_json_case(
     workspace: &HarnessWorkspace,
     base_url: &str,
