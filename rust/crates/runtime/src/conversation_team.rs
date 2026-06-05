@@ -25,7 +25,6 @@ where
     C: ApiClient,
     T: ToolExecutor,
 {
-    // PLACEHOLDER_TEAM_METHODS
     /// Run a node through the multi-role convergence loop: Architect drafts an
     /// approach, Executor implements it, Reviewer approves or requests changes
     /// (re-driving the Executor with the reasons), bounded by `max_rounds`
