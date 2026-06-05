@@ -1473,28 +1473,53 @@ fn language_output_contract(language: &str) -> String {
 
 /// Detect the dominant natural language of free-text user input by script, so
 /// the agent can default its output language to match the user's input when no
-/// explicit preference is configured. Conservative: only returns a language for
-/// a clear script signal (CJK → Chinese), else `None` (caller defaults to no
-/// contract, i.e. model default / English).
+/// explicit preference is configured. Conservative for Latin (English stays the
+/// model default), but recognizes major non-Latin scripts so a user writing in
+/// Chinese/Japanese/Korean/Cyrillic/Arabic gets a reply in that language.
 fn detect_input_language(text: &str) -> Option<String> {
-    let mut cjk = 0usize;
+    let mut han = 0usize;
+    let mut hiragana_katakana = 0usize;
+    let mut hangul = 0usize;
+    let mut cyrillic = 0usize;
+    let mut arabic = 0usize;
     let mut latin = 0usize;
     for ch in text.chars() {
-        // CJK Unified Ideographs (covers the common Han range) — treat as Chinese.
         if ('\u{4E00}'..='\u{9FFF}').contains(&ch)
             || ('\u{3400}'..='\u{4DBF}').contains(&ch)
             || ('\u{F900}'..='\u{FAFF}').contains(&ch)
         {
-            cjk += 1;
+            han += 1;
+        } else if ('\u{3040}'..='\u{30FF}').contains(&ch) {
+            hiragana_katakana += 1;
+        } else if ('\u{AC00}'..='\u{D7A3}').contains(&ch) || ('\u{1100}'..='\u{11FF}').contains(&ch)
+        {
+            hangul += 1;
+        } else if ('\u{0400}'..='\u{04FF}').contains(&ch) {
+            cyrillic += 1;
+        } else if ('\u{0600}'..='\u{06FF}').contains(&ch) {
+            arabic += 1;
         } else if ch.is_ascii_alphabetic() {
             latin += 1;
         }
     }
-    // Require a meaningful number of CJK characters and that they are a
-    // non-trivial share of the alphabetic content, so an English prompt that
-    // quotes one Chinese identifier does not flip the whole response.
-    if cjk >= 2 && cjk * 2 >= latin {
+
+    // Japanese kana is the strongest signal for Japanese (even mixed with Han).
+    if hiragana_katakana >= 2 {
+        return Some("Japanese".to_string());
+    }
+    if hangul >= 2 {
+        return Some("Korean".to_string());
+    }
+    // Require a meaningful share so a Latin prompt quoting one foreign word does
+    // not flip the whole response.
+    if han >= 2 && han * 2 >= latin {
         return Some("Chinese".to_string());
+    }
+    if cyrillic >= 2 && cyrillic * 2 >= latin {
+        return Some("Russian".to_string());
+    }
+    if arabic >= 2 && arabic * 2 >= latin {
+        return Some("Arabic".to_string());
     }
     None
 }
@@ -2406,6 +2431,17 @@ where
                     language_output_contract(language)
                 ),
             );
+            // Also append a terse reminder to the END of the just-pushed user
+            // message. Weak local models follow an instruction placed closest
+            // to generation far more reliably than one buried in the system
+            // prompt; this is the single most effective lever for them.
+            if let Some(last) = self.session.messages.last_mut() {
+                if last.role == MessageRole::User {
+                    last.blocks.push(ContentBlock::Text {
+                        text: format!("(Reply in {language}.)"),
+                    });
+                }
+            }
         }
         if let Some(relevant_memory) =
             format_relevant_memory_context(&memory.relevant_entries(&user_input, 12))
@@ -5062,6 +5098,30 @@ mod tests {
         );
         // Empty / whitespace → None.
         assert_eq!(super::detect_input_language("   "), None);
+    }
+
+    #[test]
+    fn detect_input_language_recognizes_other_scripts() {
+        // Japanese kana → Japanese (even mixed with Han).
+        assert_eq!(
+            super::detect_input_language("このプロジェクトを分析してください"),
+            Some("Japanese".to_string())
+        );
+        // Korean Hangul → Korean.
+        assert_eq!(
+            super::detect_input_language("이 프로젝트를 분석해 주세요"),
+            Some("Korean".to_string())
+        );
+        // Cyrillic → Russian.
+        assert_eq!(
+            super::detect_input_language("проанализируйте этот проект"),
+            Some("Russian".to_string())
+        );
+        // Arabic → Arabic.
+        assert_eq!(
+            super::detect_input_language("حلل هذا المشروع"),
+            Some("Arabic".to_string())
+        );
     }
 
     #[test]
