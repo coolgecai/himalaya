@@ -716,7 +716,11 @@ export class HimalayaChatPanel {
         if (parsed.reason === 'invalid-shape') {
           malformedEventCount += 1;
           if (malformedEventCount <= 3) {
-            this.host.webview.postMessage({ type: 'stderrChunk', text: `Malformed stream event ignored: ${line.slice(0, 160)}\n` });
+            // Log to the output channel at full length (the 160-char slice in
+            // the webview made complete events look truncated). The webview
+            // gets a short, accurate note instead of a misleading fragment.
+            this.output.appendLine(`[stream] unknown event type ignored: ${line}`);
+            this.host.webview.postMessage({ type: 'stderrChunk', text: `Unknown stream event type ignored (see output channel)\n` });
           }
         }
         return;
