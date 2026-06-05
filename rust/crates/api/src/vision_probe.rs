@@ -19,8 +19,19 @@ pub fn model_supports_vision_with_probe(model: &str, base_url: &str) -> bool {
         return cached;
     }
 
-    // Try OpenAI-compat endpoint first, then Anthropic-compat endpoint
-    let result = probe_vision_openai(model, base_url) || probe_vision_anthropic(model, base_url);
+    // Probe both compat endpoints in parallel (they were previously serial,
+    // so an unreachable first endpoint cost the full timeout before the second
+    // even started). Whichever returns true wins; if both fail we cache false.
+    let model_owned = model.to_string();
+    let url_owned = base_url.to_string();
+    let openai_handle = std::thread::spawn({
+        let m = model_owned.clone();
+        let u = url_owned.clone();
+        move || probe_vision_openai(&m, &u)
+    });
+    let anthropic = probe_vision_anthropic(&model_owned, &url_owned);
+    let openai = openai_handle.join().unwrap_or(false);
+    let result = openai || anthropic;
     write_cache(&cache_key, result);
     result
 }
@@ -48,7 +59,8 @@ fn probe_vision_openai(model: &str, base_url: &str) -> bool {
     });
 
     let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(4))
+        .connect_timeout(Duration::from_secs(2))
         .build()
     {
         Ok(c) => c,
@@ -85,7 +97,8 @@ fn probe_vision_anthropic(model: &str, base_url: &str) -> bool {
     });
 
     let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(4))
+        .connect_timeout(Duration::from_secs(2))
         .build()
     {
         Ok(c) => c,

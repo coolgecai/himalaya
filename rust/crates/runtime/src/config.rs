@@ -162,6 +162,11 @@ pub struct DecisioningConfig {
     enabled: bool,
     emit_events: bool,
     max_parallelism: usize,
+    /// Whether the user explicitly configured a `decisioning` block in
+    /// settings.json. When false, a host (e.g. the CLI) may apply its own
+    /// sensible defaults (such as enabling plan events for the task board)
+    /// without overriding an explicit user choice.
+    user_specified: bool,
     safety_policy: DecisioningSafetyPolicyConfig,
     /// Task complexity (1..=5) at or above which the initial plan is enriched
     /// with a real model-driven planning pass (via the Planning route) instead
@@ -188,6 +193,7 @@ impl Default for DecisioningConfig {
             enabled: false,
             emit_events: true,
             max_parallelism: 2,
+            user_specified: false,
             safety_policy: DecisioningSafetyPolicyConfig::default(),
             // Off by default: model-driven planning is opt-in so enabling the
             // decisioning skeleton alone does not add a model call per turn.
@@ -740,6 +746,13 @@ impl DecisioningConfig {
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Whether the user explicitly configured a `decisioning` block. Hosts can
+    /// use this to apply their own defaults only when the user has not opted in.
+    #[must_use]
+    pub fn user_specified(&self) -> bool {
+        self.user_specified
     }
 
     #[must_use]
@@ -1343,7 +1356,10 @@ fn parse_optional_decisioning_config(root: &JsonValue) -> Result<DecisioningConf
         return Ok(DecisioningConfig::default());
     };
     let decisioning = expect_object(value, "merged settings.decisioning")?;
-    let mut config = DecisioningConfig::default();
+    let mut config = DecisioningConfig {
+        user_specified: true,
+        ..DecisioningConfig::default()
+    };
 
     if let Some(enabled) = optional_bool(decisioning, "enabled", "merged settings.decisioning")? {
         config = config.with_enabled(enabled);
@@ -2140,8 +2156,20 @@ mod tests {
         assert!(!decisioning.uses_structured_execution(3));
         assert!(decisioning.uses_team_convergence(5));
         assert!(!decisioning.uses_team_convergence(4));
+        // An explicit decisioning block marks the config user-specified so
+        // hosts do not override it with their own defaults.
+        assert!(decisioning.user_specified());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn decisioning_defaults_are_not_user_specified() {
+        // Default (no settings.json decisioning block) is not user-specified,
+        // so a host (the CLI) may enable plan events by default.
+        let config = super::DecisioningConfig::default();
+        assert!(!config.user_specified());
+        assert!(!config.enabled());
     }
 
     #[test]

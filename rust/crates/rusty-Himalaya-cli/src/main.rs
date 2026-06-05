@@ -10227,6 +10227,21 @@ fn build_runtime_plugin_state_with_loader(
         .feature_config()
         .clone()
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
+    // When the user has not explicitly configured a decisioning block, enable
+    // the lightweight plan/decisioning event stream by default so the task
+    // board, current-node, and related panels populate. This is heuristic-only
+    // (no extra model calls); structured execution and team convergence stay
+    // opt-in via their thresholds, so plain turns keep their latency profile.
+    let feature_config = if feature_config.decisioning().user_specified() {
+        feature_config
+    } else {
+        let decisioning = feature_config
+            .decisioning()
+            .clone()
+            .with_enabled(true)
+            .with_emit_events(true);
+        feature_config.with_decisioning(decisioning)
+    };
     let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config)?;
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
@@ -12437,10 +12452,19 @@ fn expand_file_prefix_lines(input: &str) -> String {
 fn expand_at_file_syntax(input: &str, model: &str) -> Result<(String, Vec<ContentBlock>), String> {
     use file_extract::{extract_file, FileContent};
 
-    let base_url = std::env::var("OPENAI_BASE_URL")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let want_image = api::model_supports_vision_probed(model, base_url.as_deref());
+    // Only probe the model for vision support when the prompt actually contains
+    // an attachment token. The probe makes a blocking network request on a
+    // cache miss, so running it on every plain-text turn added seconds of
+    // latency for nothing.
+    let has_attachment = input.contains('@');
+    let want_image = if has_attachment {
+        let base_url = std::env::var("OPENAI_BASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        api::model_supports_vision_probed(model, base_url.as_deref())
+    } else {
+        false
+    };
     let mut image_blocks = Vec::new();
     let mut result = String::with_capacity(input.len());
     let mut chars = input.char_indices().peekable();

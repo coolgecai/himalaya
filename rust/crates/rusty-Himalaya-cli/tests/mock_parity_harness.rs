@@ -289,6 +289,13 @@ impl HarnessWorkspace {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(&self.config_home)?;
         fs::create_dir_all(&self.home)?;
+        // Pin decisioning off so the parity assertions (which encode the
+        // single-shot agentic flow) are not affected by the CLI's default of
+        // enabling decisioning events when the user has not configured it.
+        fs::write(
+            self.config_home.join("settings.json"),
+            r#"{"decisioning":{"enabled":false}}"#,
+        )?;
         Ok(())
     }
 }
