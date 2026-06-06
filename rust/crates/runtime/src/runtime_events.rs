@@ -9,7 +9,8 @@ use serde_json::Value;
 
 use crate::{
     DecisioningEvent, ModelRouteDecision, PlanExecutionEvent, ProgressLedgerEntry,
-    RecoveryActionExecution, RecoveryEvent, TaskExecutionOutcome, TeamExecutionEvent,
+    RecoveryActionExecution, RecoveryEvent, TaskExecutionOutcome, TaskExecutionReport,
+    TeamExecutionEvent,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,6 +24,7 @@ pub enum RuntimeEvent {
     Recovery(RecoveryEvent),
     RecoveryAction(RecoveryActionExecution),
     TaskExecution(TaskExecutionOutcome),
+    TaskExecutionReport(Box<TaskExecutionReport>),
 }
 
 impl RuntimeEvent {
@@ -37,6 +39,7 @@ impl RuntimeEvent {
             Self::Recovery(_) => "recovery_event",
             Self::RecoveryAction(_) => "recovery_action_event",
             Self::TaskExecution(_) => "task_execution_event",
+            Self::TaskExecutionReport(_) => "task_execution_report_event",
         }
     }
 }
@@ -210,6 +213,7 @@ fn task_id_for_runtime_event(event: &RuntimeEvent) -> Option<String> {
         RuntimeEvent::Recovery(_) => None,
         RuntimeEvent::RecoveryAction(value) => Some(value.task_id.clone()),
         RuntimeEvent::TaskExecution(value) => Some(value.task_id.clone()),
+        RuntimeEvent::TaskExecutionReport(value) => Some(value.task_id.clone()),
     }
 }
 

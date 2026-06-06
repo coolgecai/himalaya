@@ -29,14 +29,15 @@ use crate::permissions::{
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::{
-    build_verification_request, evaluate_verification_result, infer_tool_capabilities,
-    infer_verification_policy, tool_from_profile, DecisioningEngine, DecisioningEvent,
-    DecisioningEventKind, DecisioningSnapshot, ExecutionScheduler, FailureClassifier,
-    MoERoutingPolicy, ModelRouteDecision, ModelRouteFeedback, ModelRouter, PlanExecution,
-    PlanExecutionEvent, ReasoningContext, RecoveryActionEngine, RecoveryOrchestrator,
-    RiskAssessment, RuntimeEvent, RuntimeEventReporter, SafetyOutcome, SafetyPolicy, StepOutcome,
-    Subtask, Task, TaskPacket, TaskRegistry, TeamExecutionEvent, TeamExecutionLedger, Tool,
-    ToolHistoryEntry, ToolSelector, VerificationDecision, VerificationResult, VerificationRunner,
+    infer_tool_capabilities, tool_from_profile, DecisioningEngine, DecisioningEvent,
+    DecisioningEventKind, DecisioningSnapshot, ExecutionScheduler, FailureClassification,
+    FailureClassifier, MoERoutingPolicy, ModelRouteDecision, ModelRouteFeedback, ModelRouter,
+    PlanExecution, PlanExecutionEvent, ReasoningContext, RecoveryActionEngine,
+    RecoveryActionExecution, RecoveryOrchestrator, RecoveryOrchestratorOutcome, RiskAssessment,
+    RuntimeEvent, RuntimeEventReporter, SafetyOutcome, SafetyPolicy, StepOutcome, Subtask, Task,
+    TaskExecutionEngine, TaskExecutionOutcome, TaskExecutionStep, TaskExecutionStepKind,
+    TaskPacket, TaskRegistry, TeamExecutionEvent, TeamExecutionLedger, Tool, ToolHistoryEntry,
+    ToolSelector, VerificationDecision, VerificationResult, VerificationRunner,
 };
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
@@ -2952,7 +2953,7 @@ where
             team_ledger
                 .record_verification(&verification_decision, Some(verification_route.clone())),
         );
-        match verification_decision {
+        match verification_decision.clone() {
             VerificationDecision::Failed { reason } => {
                 let _ = self
                     .task_registry
@@ -2988,7 +2989,7 @@ where
                     self.permission_policy.active_mode(),
                     &self.task_registry,
                 );
-                self.emit_runtime_event(RuntimeEvent::RecoveryAction(action_execution));
+                self.emit_runtime_event(RuntimeEvent::RecoveryAction(action_execution.clone()));
                 self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
                 *task_ledger_offset = self.task_registry.ledger_for_task(runtime_task_id).len();
 
@@ -3001,19 +3002,17 @@ where
                         .set_status(runtime_task_id, crate::TaskStatus::Running);
                     self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
                     *task_ledger_offset = self.task_registry.ledger_for_task(runtime_task_id).len();
-                    let _ = self.task_registry.update_latest_route_feedback(
+                    self.emit_conversation_task_report(
                         runtime_task_id,
-                        crate::ModelRouteFeedback::pending(
-                            runtime_task_id.to_string(),
-                            verification_route.clone(),
-                            current_time_millis() / 1_000,
-                        )
-                        .with_outcome(
-                            false,
-                            Some(false),
-                            true,
-                            Some(reason.clone()),
-                        ),
+                        verification_route.clone(),
+                        "conversation recovery redrive scheduled".to_string(),
+                        false,
+                        true,
+                        Some(false),
+                        verification_decision.clone(),
+                        Some(classification.clone()),
+                        Some(outcome.clone()),
+                        Some(action_execution.clone()),
                     );
                     // Clear the stale failing result so the next pass re-verifies
                     // against the model's new attempt.
@@ -3036,19 +3035,19 @@ where
                     .task_registry
                     .set_status(runtime_task_id, terminal_status);
                 self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
-                let _ = self.task_registry.update_latest_route_feedback(
+                self.emit_conversation_task_report(
                     runtime_task_id,
-                    crate::ModelRouteFeedback::pending(
-                        runtime_task_id.to_string(),
-                        verification_route.clone(),
-                        current_time_millis() / 1_000,
-                    )
-                    .with_outcome(
-                        false,
-                        Some(false),
-                        true,
-                        Some(reason.clone()),
-                    ),
+                    verification_route.clone(),
+                    reason.clone(),
+                    false,
+                    true,
+                    Some(false),
+                    VerificationDecision::Failed {
+                        reason: reason.clone(),
+                    },
+                    Some(classification),
+                    Some(outcome),
+                    Some(action_execution),
                 );
                 self.record_turn_failed(iterations, &RuntimeError::new(reason.clone()));
                 TurnFlow::Fail(RuntimeError::new(reason))
@@ -3074,40 +3073,104 @@ where
                     .set_status(runtime_task_id, crate::TaskStatus::Failed);
                 self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
                 let error = RuntimeError::new("verification is required before task completion");
-                let _ = self.task_registry.update_latest_route_feedback(
+                self.emit_conversation_task_report(
                     runtime_task_id,
-                    crate::ModelRouteFeedback::pending(
-                        runtime_task_id.to_string(),
-                        verification_route.clone(),
-                        current_time_millis() / 1_000,
-                    )
-                    .with_outcome(
-                        false,
-                        Some(false),
-                        false,
-                        Some("verification remained required".to_string()),
-                    ),
+                    verification_route.clone(),
+                    "verification remained required".to_string(),
+                    false,
+                    true,
+                    Some(false),
+                    VerificationDecision::Failed {
+                        reason: "verification is required before task completion".to_string(),
+                    },
+                    None,
+                    None,
+                    None,
                 );
                 self.record_turn_failed(iterations, &error);
                 TurnFlow::Fail(error)
             }
             VerificationDecision::NotRequired | VerificationDecision::Passed => {
-                let _ = self.task_registry.update_latest_route_feedback(
-                    runtime_task_id,
-                    crate::ModelRouteFeedback::pending(
-                        runtime_task_id.to_string(),
-                        verification_route.clone(),
-                        current_time_millis() / 1_000,
-                    )
-                    .with_outcome(true, Some(true), false, None),
-                );
                 let _ = self
                     .task_registry
                     .set_status(runtime_task_id, crate::TaskStatus::Completed);
                 self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
+                self.emit_conversation_task_report(
+                    runtime_task_id,
+                    verification_route,
+                    "conversation turn completed".to_string(),
+                    true,
+                    false,
+                    Some(true),
+                    verification_decision,
+                    None,
+                    None,
+                    None,
+                );
                 TurnFlow::Complete
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_conversation_task_report(
+        &self,
+        runtime_task_id: &str,
+        verification_route: ModelRouteDecision,
+        message: String,
+        completed: bool,
+        blocked: bool,
+        verification_passed: Option<bool>,
+        verification_decision: VerificationDecision,
+        failure: Option<FailureClassification>,
+        recovery: Option<RecoveryOrchestratorOutcome>,
+        recovery_action: Option<RecoveryActionExecution>,
+    ) {
+        let Some(task) = self.task_registry.get(runtime_task_id) else {
+            return;
+        };
+        let verification_result = task.verification_result.clone();
+        let outcome = TaskExecutionOutcome {
+            task_id: runtime_task_id.to_string(),
+            steps: vec![TaskExecutionStep {
+                task_id: runtime_task_id.to_string(),
+                node_id: None,
+                kind: if completed {
+                    TaskExecutionStepKind::CompleteTask
+                } else {
+                    TaskExecutionStepKind::Blocked
+                },
+                message: message.clone(),
+            }],
+            completed,
+            blocked,
+            message,
+        };
+        let report = crate::task_execution_report_from_parts(
+            runtime_task_id,
+            outcome.clone(),
+            verification_result,
+            verification_decision,
+            failure,
+            recovery,
+            recovery_action,
+            &task,
+        );
+        self.emit_runtime_event(RuntimeEvent::TaskExecution(outcome));
+        self.emit_runtime_event(RuntimeEvent::TaskExecutionReport(Box::new(report.clone())));
+
+        let mut route = verification_route;
+        let verification_passed = verification_passed.unwrap_or(matches!(
+            report.verification_decision,
+            VerificationDecision::NotRequired | VerificationDecision::Passed
+        ));
+        route.reason = format!(
+            "{}; verification_passed={verification_passed}",
+            route.reason
+        );
+        let engine =
+            TaskExecutionEngine::new(self.task_registry.clone(), self.verification_runner.clone());
+        let _ = engine.record_execution_route_feedback_for_route(&report, Some(route));
     }
 
     #[must_use]
@@ -4171,20 +4234,9 @@ where
     }
 
     fn evaluate_runtime_task_completion(&self, task_id: &str) -> VerificationDecision {
-        let Some(task) = self.task_registry.get(task_id) else {
-            return VerificationDecision::Failed {
-                reason: format!("task not found: {task_id}"),
-            };
-        };
-        let policy = infer_verification_policy(task.task_packet.as_ref());
-        if task.verification_result.is_none() {
-            if let Some(packet) = task.task_packet.as_ref() {
-                return VerificationDecision::Required(build_verification_request(
-                    task_id, packet, policy,
-                ));
-            }
-        }
-        evaluate_verification_result(policy, task.verification_result.as_ref())
+        TaskExecutionEngine::new(self.task_registry.clone(), self.verification_runner.clone())
+            .recorded_completion_decision(task_id)
+            .unwrap_or_else(|reason| VerificationDecision::Failed { reason })
     }
 
     fn emit_decisioning_adjustment_event(

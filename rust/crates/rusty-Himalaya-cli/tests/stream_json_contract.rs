@@ -33,6 +33,7 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "recovery_event",
         "recovery_action_event",
         "task_execution_event",
+        "task_execution_report_event",
         "local_command",
         "recovery_suggestion",
         "task_list",
@@ -1235,6 +1236,26 @@ fn assert_stream_event_schema(event: &Value) {
                 "task_execution_event requires object payload: {event:?}"
             );
             assert_task_execution_outcome_schema(outcome);
+        }
+        "task_execution_report_event" => {
+            let report = &event["task_execution_report_event"];
+            assert!(
+                report.is_object(),
+                "task_execution_report_event requires object payload: {event:?}"
+            );
+            assert_non_empty_string(&report["task_id"]);
+            assert!(
+                report["outcome"].is_object(),
+                "task_execution_report_event requires outcome object: {event:?}"
+            );
+            assert!(
+                report.get("verification_decision").is_some(),
+                "task_execution_report_event requires verification_decision: {event:?}"
+            );
+            assert!(
+                report["message"].is_string(),
+                "task_execution_report_event requires message: {event:?}"
+            );
         }
         "task_execution" => assert_task_execution_outcome_schema(&event["outcome"]),
         "task_recovery" => {

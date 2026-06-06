@@ -86,6 +86,9 @@
           "$ref": "#/$defs/taskExecutionEvent"
         },
         {
+          "$ref": "#/$defs/taskExecutionReportEvent"
+        },
+        {
           "$ref": "#/$defs/localCommandEvent"
         },
         {
@@ -205,6 +208,7 @@
         "recovery_event",
         "recovery_action_event",
         "task_execution_event",
+        "task_execution_report_event",
         "local_command",
         "recovery_suggestion",
         "task_list",
@@ -737,6 +741,42 @@
         }
       ]
     },
+    "taskExecutionReportEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task_execution_report_event"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_execution_report_event"
+            },
+            "task_execution_report_event": {
+              "type": "object",
+              "required": [
+                "task_id",
+                "outcome",
+                "verification_decision",
+                "final_status",
+                "completed",
+                "blocked",
+                "message"
+              ],
+              "additionalProperties": true
+            },
+            "outcome": {
+              "type": "object"
+            },
+            "report": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    },
     "recoverySuggestionEvent": {
       "allOf": [
         {
@@ -874,6 +914,9 @@
               "const": "task_execution"
             },
             "outcome": {
+              "type": "object"
+            },
+            "report": {
               "type": "object"
             }
           }
@@ -1114,6 +1157,9 @@
               "const": "task_scheduler_tick"
             },
             "tick": {
+              "type": "object"
+            },
+            "report": {
               "type": "object"
             }
           }

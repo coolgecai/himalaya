@@ -224,8 +224,9 @@ pub use stale_branch::{
     StaleBranchPolicy,
 };
 pub use task_execution_engine::{
-    task_plan_progress, TaskExecutionEngine, TaskExecutionOutcome, TaskExecutionReport,
-    TaskExecutionStep, TaskExecutionStepKind, TaskPlanProgress,
+    task_execution_report_from_parts, task_plan_progress, TaskExecutionEngine,
+    TaskExecutionOutcome, TaskExecutionReport, TaskExecutionStep, TaskExecutionStepKind,
+    TaskPlanProgress,
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
 pub use task_registry::{

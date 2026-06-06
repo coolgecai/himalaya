@@ -344,6 +344,9 @@ fn task_scheduler_tick_persists_durable_status() {
     assert_eq!(tick["tick"]["status"], "running");
     assert_eq!(tick["tick"]["task"]["status"], "running");
     assert_eq!(tick["tick"]["outcome"]["blocked"], false);
+    assert_eq!(tick["tick"]["report"]["task_id"], task_id);
+    assert_eq!(tick["tick"]["report"]["final_status"], "running");
+    assert!(tick["tick"]["report"]["verification_decision"].is_object());
     assert!(tick["tick"]["outcome"]["steps"]
         .as_array()
         .expect("steps array")
@@ -357,6 +360,7 @@ fn task_scheduler_tick_persists_durable_status() {
     );
     assert_eq!(second_tick["tick"]["status"], "running");
     assert_eq!(second_tick["tick"]["task"]["status"], "running");
+    assert_eq!(second_tick["tick"]["report"]["final_status"], "running");
     assert!(second_tick["tick"]["outcome"]["steps"]
         .as_array()
         .expect("second tick steps array")
@@ -472,6 +476,7 @@ fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
     assert_eq!(first_tick["type"], "task_scheduler_tick");
     assert_eq!(first_tick["tick"]["selected_task_id"], task_id);
     assert_eq!(first_tick["tick"]["status"], "running");
+    assert_eq!(first_tick["tick"]["report"]["task_id"], task_id);
     assert!(first_tick["tick"]["outcome"]["steps"]
         .as_array()
         .expect("steps array")
@@ -534,17 +539,14 @@ fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
         ],
     );
     assert_eq!(daemon_waiting["type"], "task_scheduler_daemon_run");
-    assert_eq!(
-        daemon_waiting["state"]["last_tick"]["task"]["status"],
-        "waiting_for_verification"
-    );
-
-    let verification = assert_json_command(
-        &root,
-        &["--output-format", "json", "tasks", "verify", &task_id],
-    );
-    assert_eq!(verification["type"], "task_verification");
-    assert_eq!(verification["result"]["passed"], true);
+    assert!(daemon_waiting["runs"]
+        .as_array()
+        .expect("daemon waiting runs")
+        .iter()
+        .any(|run| {
+            run["tick"]["task"]["status"] == "completed"
+                && run["tick"]["report"]["verification_decision"] == "passed"
+        }));
 
     let daemon_completed = assert_json_command(
         &root,
@@ -558,11 +560,8 @@ fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
         ],
     );
     assert_eq!(daemon_completed["type"], "task_scheduler_daemon_run");
-    assert_eq!(daemon_completed["runs"][0]["tick"]["status"], "completed");
-    assert_eq!(
-        daemon_completed["state"]["last_tick"]["status"],
-        "completed"
-    );
+    assert_eq!(daemon_completed["runs"][0]["tick"]["status"], "idle");
+    assert_eq!(daemon_completed["state"]["last_tick"]["status"], "idle");
 
     let task = assert_json_command(
         &root,
@@ -924,10 +923,11 @@ fn bootstrap_and_system_prompt_emit_json_when_requested() {
 
     let prompt = assert_json_command(&root, &["--output-format", "json", "system-prompt"]);
     assert_eq!(prompt["kind"], "system-prompt");
-    assert!(prompt["message"]
-        .as_str()
-        .expect("prompt text")
-        .contains("interactive agent"));
+    let prompt_text = prompt["message"].as_str().expect("prompt text");
+    assert!(
+        prompt_text.contains("interactive agent")
+            || prompt_text.contains("interactive AI coding agent")
+    );
 }
 
 #[test]

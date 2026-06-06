@@ -7392,10 +7392,10 @@ fn run_task_command(
             run_task_packet_command(command, output_format)?;
         }
         TaskCliCommand::Scheduler { command } => {
-            run_task_scheduler_command(command, output_format)?;
+            run_task_scheduler_command(command, output_format, permission_mode)?;
         }
         TaskCliCommand::Daemon { command } => {
-            run_task_daemon_command(command, output_format)?;
+            run_task_daemon_command(command, output_format, permission_mode)?;
         }
         TaskCliCommand::Execute { task_id, from_node } => {
             let registry = load_task_registry()?;
@@ -8592,6 +8592,7 @@ fn run_task_packet_command(
 fn run_task_scheduler_command(
     command: TaskSchedulerCliCommand,
     output_format: CliOutputFormat,
+    permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let registry = load_task_registry()?;
     let worker_registry = load_worker_registry()?;
@@ -8600,7 +8601,8 @@ fn run_task_scheduler_command(
         registry.clone(),
         runner,
         worker_registry.clone(),
-    );
+    )
+    .with_permission_mode(permission_mode);
     match command {
         TaskSchedulerCliCommand::Tick => {
             let tick = scheduler.tick()?;
@@ -8707,6 +8709,7 @@ fn run_task_scheduler_command(
 fn run_task_daemon_command(
     command: TaskDaemonCliCommand,
     output_format: CliOutputFormat,
+    permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let registry = load_task_registry()?;
     let worker_registry = load_worker_registry()?;
@@ -8715,7 +8718,8 @@ fn run_task_daemon_command(
         registry.clone(),
         runner,
         worker_registry.clone(),
-    );
+    )
+    .with_permission_mode(permission_mode);
     let daemon = runtime::SchedulerDaemon::new(scheduler, scheduler_state_dir()?);
     match command {
         TaskDaemonCliCommand::Start { max_ticks } => {
@@ -10994,6 +10998,16 @@ impl runtime::RuntimeEventReporter for CliRuntimeEventReporter {
                 let mut payload = json!({
                     "type": "task_execution_event",
                     "task_execution_event": value,
+                });
+                attach_runtime_event_envelope(&mut payload, envelope.as_ref());
+                print_stream_json_event(payload);
+            }
+            runtime::RuntimeEvent::TaskExecutionReport(value) => {
+                let mut payload = json!({
+                    "type": "task_execution_report_event",
+                    "task_execution_report_event": value,
+                    "outcome": value.outcome,
+                    "report": value,
                 });
                 attach_runtime_event_envelope(&mut payload, envelope.as_ref());
                 print_stream_json_event(payload);

@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::task_registry::Task as RegistryTask;
 use crate::{
     PlanDag, PlanExecution, PlanExecutionEvent, PlanNodeStatus, TaskExecutionEngine,
-    TaskExecutionOutcome, TaskRegistry, TaskStatus, VerificationRunner, WorkerRegistry,
+    TaskExecutionOutcome, TaskExecutionReport, TaskRegistry, TaskStatus, VerificationRunner,
+    WorkerRegistry,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +66,7 @@ pub struct DurableSchedulerTick {
     pub selected_task_id: Option<String>,
     pub task: Option<RegistryTask>,
     pub outcome: Option<TaskExecutionOutcome>,
+    pub report: Option<TaskExecutionReport>,
     pub queue: Vec<DurableSchedulerTaskSnapshot>,
     pub message: String,
 }
@@ -336,6 +338,7 @@ pub struct DurableTaskScheduler {
     registry: TaskRegistry,
     verification_runner: VerificationRunner,
     worker_registry: Option<WorkerRegistry>,
+    permission_mode: crate::PermissionMode,
 }
 
 impl DurableTaskScheduler {
@@ -345,6 +348,7 @@ impl DurableTaskScheduler {
             registry,
             verification_runner,
             worker_registry: None,
+            permission_mode: crate::PermissionMode::DangerFullAccess,
         }
     }
 
@@ -358,7 +362,14 @@ impl DurableTaskScheduler {
             registry,
             verification_runner,
             worker_registry: Some(worker_registry),
+            permission_mode: crate::PermissionMode::DangerFullAccess,
         }
+    }
+
+    #[must_use]
+    pub fn with_permission_mode(mut self, permission_mode: crate::PermissionMode) -> Self {
+        self.permission_mode = permission_mode;
+        self
     }
 
     pub fn tick(&self) -> Result<DurableSchedulerTick, String> {
@@ -378,6 +389,7 @@ impl DurableTaskScheduler {
                 selected_task_id: None,
                 task: None,
                 outcome: None,
+                report: None,
                 queue: queue_before,
                 message: "no runnable tasks".to_string(),
             });
@@ -393,7 +405,12 @@ impl DurableTaskScheduler {
             TaskExecutionEngine::new(self.registry.clone(), self.verification_runner.clone())
         };
         let _ = engine.assign_team(&snapshot.task_id)?;
-        let outcome = engine.execute(&snapshot.task_id, snapshot.current_node.as_deref())?;
+        let report = engine.execute_with_recovery(
+            &snapshot.task_id,
+            snapshot.current_node.as_deref(),
+            self.permission_mode,
+        )?;
+        let outcome = report.outcome.clone();
         let task = self
             .registry
             .get(&snapshot.task_id)
@@ -411,6 +428,7 @@ impl DurableTaskScheduler {
             selected_task_id: Some(snapshot.task_id),
             task: Some(task),
             outcome: Some(outcome),
+            report: Some(report),
             queue: self.queue(),
             message,
         })
@@ -594,6 +612,40 @@ mod tests {
         (registry, task.task_id)
     }
 
+    fn registry_with_packet_task(acceptance_tests: Vec<String>) -> (TaskRegistry, String) {
+        let registry = TaskRegistry::new();
+        let task = registry
+            .create_from_packet(crate::TaskPacket {
+                objective: "scheduled packet task".to_string(),
+                scope: "runtime".to_string(),
+                repo: ".".to_string(),
+                branch_policy: "current branch".to_string(),
+                acceptance_tests,
+                commit_policy: "no commit".to_string(),
+                reporting_contract: "return scheduler status".to_string(),
+                escalation_policy: "block on failure".to_string(),
+            })
+            .expect("packet task should create");
+        let dag = PlanDag {
+            task_id: task.task_id.clone(),
+            root_id: task.task_id.clone(),
+            nodes: vec![PlanDagNode {
+                kind: PlanNodeKind::Step,
+                id: "node-1".to_string(),
+                title: "Node".to_string(),
+                parallelizable: false,
+                estimated_effort: 1,
+                candidate_tools: Vec::new(),
+                notes: Vec::new(),
+            }],
+            edges: Vec::new(),
+        };
+        registry
+            .record_plan(&task.task_id, dag.clone(), PlanExecution::new(&dag))
+            .expect("plan should record");
+        (registry, task.task_id)
+    }
+
     #[test]
     fn starts_ready_node_for_matching_tool() {
         let dag = sample_dag();
@@ -620,10 +672,35 @@ mod tests {
         assert_eq!(tick.status, DurableSchedulerStatus::Completed);
         assert_eq!(tick.selected_task_id.as_deref(), Some(task_id.as_str()));
         assert!(tick.outcome.expect("outcome").completed);
+        let report = tick.report.expect("report");
+        assert!(report.completed);
+        assert_eq!(report.final_status, TaskStatus::Completed);
         assert_eq!(
             registry.get(&task_id).expect("task").status,
             TaskStatus::Completed
         );
+    }
+
+    #[test]
+    fn durable_scheduler_tick_uses_recovery_execution_report() {
+        let (registry, task_id) =
+            registry_with_packet_task(vec!["python3 -c 'import sys; sys.exit(1)'".to_string()]);
+        let scheduler = DurableTaskScheduler::new(registry.clone(), VerificationRunner::new(None));
+
+        let tick = scheduler.tick().expect("tick should run");
+
+        assert_eq!(tick.status, DurableSchedulerStatus::Blocked);
+        let report = tick.report.expect("report");
+        assert_eq!(report.task_id, task_id);
+        assert!(report.blocked);
+        assert!(report.failure.is_some());
+        assert!(report.recovery.is_some());
+        assert!(registry
+            .get(&report.task_id)
+            .expect("task")
+            .route_feedback
+            .iter()
+            .any(|feedback| feedback.recovery_triggered));
     }
 
     #[test]
@@ -756,6 +833,7 @@ mod tests {
             Some(task.task_id.as_str())
         );
         assert!(tick.outcome.expect("outcome").blocked);
+        assert!(tick.report.expect("report").blocked);
         assert_eq!(
             registry.get(&task.task_id).expect("task").status,
             TaskStatus::Blocked
