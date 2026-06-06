@@ -629,6 +629,9 @@ enum TaskCliCommand {
     Status {
         task_id: String,
     },
+    Report {
+        task_id: String,
+    },
     Packet {
         command: TaskPacketCliCommand,
     },
@@ -1373,6 +1376,9 @@ fn parse_task_cli_command(args: &[String]) -> Result<TaskCliCommand, String> {
         Some(("status", [task_id])) => Ok(TaskCliCommand::Status {
             task_id: task_id.clone(),
         }),
+        Some(("report", [task_id])) => Ok(TaskCliCommand::Report {
+            task_id: task_id.clone(),
+        }),
         Some(("packet", rest)) => Ok(TaskCliCommand::Packet {
             command: parse_task_packet_cli_command(rest)?,
         }),
@@ -1448,7 +1454,7 @@ fn parse_task_cli_command(args: &[String]) -> Result<TaskCliCommand, String> {
             task_id: task_id.clone(),
         }),
         Some((other, _)) => Err(format!(
-            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|status <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
+            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
         )),
     }
 }
@@ -4802,6 +4808,18 @@ fn run_resume_command(
                         json: Some(value),
                     })
                 }
+                TaskCliCommand::Report { task_id } => {
+                    let registry = load_task_registry()?;
+                    let task = registry
+                        .get(&task_id)
+                        .ok_or_else(|| format!("task not found: {task_id}"))?;
+                    let value = task_report_value(&registry, task)?;
+                    Ok(ResumeCommandOutcome {
+                        session: session.clone(),
+                        message: Some(render_task_report_text(&value)),
+                        json: Some(value),
+                    })
+                }
                 TaskCliCommand::Packet {
                     command: TaskPacketCliCommand::Status { task_id },
                 } => {
@@ -4846,7 +4864,7 @@ fn run_resume_command(
                         .into(),
                 ),
                 _ => Err(
-                    "resumed /tasks supports list, show, packet status, and scheduler queue; use `Himalaya tasks ...` for execution, recovery, verification, retry, compact, cancel, packet create/run, scheduler tick, or resume actions"
+                    "resumed /tasks supports list, show, status, report, packet status, and scheduler queue; use `Himalaya tasks ...` for execution, recovery, verification, retry, compact, cancel, packet create/run, scheduler tick, or resume actions"
                         .into(),
                 ),
             }
@@ -7388,6 +7406,19 @@ fn run_task_command(
                 }
             }
         }
+        TaskCliCommand::Report { task_id } => {
+            let registry = load_task_registry()?;
+            let task = registry
+                .get(&task_id)
+                .ok_or_else(|| format!("task not found: {task_id}"))?;
+            let value = task_report_value(&registry, task)?;
+            match output_format {
+                CliOutputFormat::Text => println!("{}", render_task_report_text(&value)),
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(value, output_format)?;
+                }
+            }
+        }
         TaskCliCommand::Packet { command } => {
             run_task_packet_command(command, output_format)?;
         }
@@ -8439,6 +8470,60 @@ fn task_status_value(
     })
 }
 
+fn task_report_value(
+    registry: &runtime::TaskRegistry,
+    task: runtime::task_registry::Task,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let task_id = task.task_id.clone();
+    let status_snapshot = task_status_value(registry, task.clone(), "task_status");
+    let latest_execution_report = task.execution_reports.last().cloned();
+    let latest_recovery = task.recovery_events.last().cloned();
+    let latest_recovery_action = task.recovery_action_executions.last().cloned();
+    let local_feedback_count = task.route_feedback.len();
+    let mut route_feedback = runtime::RouteFeedbackStore::new();
+    for feedback in task.route_feedback.iter().cloned() {
+        route_feedback.record(feedback);
+    }
+    let workspace_store = load_route_feedback_store()?;
+    let mut workspace_feedback_count = 0_usize;
+    for feedback in workspace_store
+        .feedback()
+        .iter()
+        .filter(|feedback| feedback.task_id == task_id)
+        .cloned()
+    {
+        workspace_feedback_count += 1;
+        route_feedback.record(feedback);
+    }
+    let route_feedback_summary = route_feedback.summaries();
+    let latest_failure = latest_execution_report
+        .as_ref()
+        .and_then(|report| report.failure.clone())
+        .or_else(|| {
+            serde_json::from_value(status_snapshot["failure"].clone())
+                .ok()
+                .flatten()
+        });
+    Ok(json!({
+        "type": "task_report",
+        "task": task,
+        "status_snapshot": status_snapshot,
+        "latest_execution_report": latest_execution_report,
+        "latest_failure": latest_failure,
+        "latest_recovery": latest_recovery,
+        "latest_recovery_action": latest_recovery_action,
+        "route_feedback": {
+            "local_count": local_feedback_count,
+            "workspace_count": workspace_feedback_count,
+            "combined_count": route_feedback.feedback().len(),
+            "summaries": route_feedback_summary,
+            "feedback_path": route_feedback_dir()?.join("feedback.json"),
+        },
+        "ledger": registry.ledger_for_task(&task_id),
+        "event_log": registry.event_log_for_task(&task_id),
+    }))
+}
+
 fn task_failure_classification(
     task: &runtime::task_registry::Task,
     verification_decision: &runtime::VerificationDecision,
@@ -8538,6 +8623,70 @@ fn render_task_status_text(value: &Value) -> String {
     if let Some(policy) = value["verification"]["policy"].as_str() {
         lines.push(format!("  Verification      {policy}"));
     }
+    lines.join("\n")
+}
+
+fn render_task_report_text(value: &Value) -> String {
+    let task = &value["task"];
+    let task_id = task["task_id"].as_str().unwrap_or("unknown");
+    let status = task["status"].as_str().unwrap_or("unknown");
+    let reports = task["execution_reports"]
+        .as_array()
+        .map_or(0, std::vec::Vec::len);
+    let mut lines = vec![format!(
+        "Task report\n  Task              {task_id}\n  Status            {status}\n  Execution reports {reports}"
+    )];
+    if let Some(report) = value
+        .get("latest_execution_report")
+        .filter(|value| value.is_object())
+    {
+        lines.push(format!(
+            "  Last report       {} - {}",
+            report["final_status"].as_str().unwrap_or("unknown"),
+            report["message"].as_str().unwrap_or("")
+        ));
+        if let Some(progress) = report
+            .get("plan_progress")
+            .filter(|value| value.is_object())
+        {
+            lines.push(format!(
+                "  Plan              {}/{} succeeded, {} failed, {} running",
+                progress["succeeded"].as_u64().unwrap_or(0),
+                progress["total"].as_u64().unwrap_or(0),
+                progress["failed"].as_u64().unwrap_or(0),
+                progress["running"].as_u64().unwrap_or(0)
+            ));
+        }
+    }
+    if let Some(failure) = value
+        .get("latest_failure")
+        .filter(|value| value.is_object())
+    {
+        lines.push(format!(
+            "  Failure           {} - {}",
+            failure["failure_class"].as_str().unwrap_or("unknown"),
+            failure["reason"].as_str().unwrap_or("")
+        ));
+    }
+    if let Some(action) = value
+        .get("latest_recovery_action")
+        .filter(|value| value.is_object())
+    {
+        let results = action["results"].as_array().map_or(0, std::vec::Vec::len);
+        let executed = action["results"].as_array().map_or(0, |items| {
+            items
+                .iter()
+                .filter(|item| item["executed"].as_bool() == Some(true))
+                .count()
+        });
+        lines.push(format!("  Recovery action   {executed}/{results} executed"));
+    }
+    let route_feedback = &value["route_feedback"];
+    lines.push(format!(
+        "  Route feedback    {} combined ({} workspace)",
+        route_feedback["combined_count"].as_u64().unwrap_or(0),
+        route_feedback["workspace_count"].as_u64().unwrap_or(0)
+    ));
     lines.join("\n")
 }
 
@@ -12977,7 +13126,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Himalaya tasks [list|show <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [prompt]|execute <task-id>|verify <task-id>|recover <task-id>|cancel <task-id>]"
+        "  Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [prompt]|execute <task-id>|verify <task-id>|recover <task-id>|cancel <task-id>]"
     )?;
     writeln!(
         out,
@@ -14189,6 +14338,13 @@ mod tests {
             parse_task_cli_command(&["status".to_string(), "task-1".to_string()])
                 .expect("tasks status should parse"),
             TaskCliCommand::Status {
+                task_id: "task-1".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_task_cli_command(&["report".to_string(), "task-1".to_string()])
+                .expect("tasks report should parse"),
+            TaskCliCommand::Report {
                 task_id: "task-1".to_string(),
             }
         );

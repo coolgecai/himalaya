@@ -182,9 +182,37 @@ impl RecoveryActionEngine {
                         }
                     }
                 }
-                RecoveryActionKind::SwitchModel
-                | RecoveryActionKind::RestartPlugin
-                | RecoveryActionKind::RetryMcpHandshake => {}
+                RecoveryActionKind::SwitchModel => {
+                    let _ = registry.clear_verification(&task_id);
+                    match registry.set_status(&task_id, TaskStatus::Running) {
+                        Ok(()) => {
+                            result.executed = true;
+                            result.reason =
+                                "scheduled model route retry for next execution pass".to_string();
+                        }
+                        Err(error) => {
+                            result.blocked = true;
+                            result.executed = false;
+                            result.reason = error;
+                        }
+                    }
+                }
+                RecoveryActionKind::RestartPlugin | RecoveryActionKind::RetryMcpHandshake => {
+                    let _ = registry.clear_verification(&task_id);
+                    match registry.set_status(&task_id, TaskStatus::Running) {
+                        Ok(()) => {
+                            result.executed = true;
+                            result.reason =
+                                "scheduled runtime capability retry for next execution pass"
+                                    .to_string();
+                        }
+                        Err(error) => {
+                            result.blocked = true;
+                            result.executed = false;
+                            result.reason = error;
+                        }
+                    }
+                }
             }
         }
         let _ = registry.record_recovery_action_execution(&task_id, execution.clone());
@@ -392,6 +420,37 @@ mod tests {
             registry.get(&task.task_id).expect("task").status,
             TaskStatus::WaitingForPermission
         );
+    }
+
+    #[test]
+    fn registry_executor_switch_model_schedules_runtime_retry() {
+        let registry = TaskRegistry::new();
+        let task = registry.create("recover", Some("test"));
+        registry
+            .set_status(&task.task_id, TaskStatus::Blocked)
+            .expect("task should block");
+        let action = RecoveryAction {
+            kind: RecoveryActionKind::SwitchModel,
+            scenario: FailureScenario::ProviderFailure,
+            risk: RecoveryActionRisk::Safe,
+            node_id: None,
+            message: "switch route".to_string(),
+        };
+        let engine = RecoveryActionEngine::new();
+        let execution = engine.execute_against_registry(
+            RecoveryActionPlan {
+                task_id: task.task_id.clone(),
+                actions: vec![action],
+            },
+            PermissionMode::ReadOnly,
+            &registry,
+        );
+        let task = registry.get(&task.task_id).expect("task");
+
+        assert!(execution.results[0].executed);
+        assert!(!execution.results[0].blocked);
+        assert_eq!(task.status, TaskStatus::Running);
+        assert!(task.recovery_action_executions.len() == 1);
     }
 
     #[test]

@@ -569,6 +569,33 @@ fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
     );
     assert_eq!(task["type"], "task_show");
     assert_eq!(task["task"]["status"], "completed");
+    assert!(!task["task"]["execution_reports"]
+        .as_array()
+        .expect("execution reports")
+        .is_empty());
+
+    let report = assert_json_command(
+        &root,
+        &["--output-format", "json", "tasks", "report", &task_id],
+    );
+    assert_eq!(report["type"], "task_report");
+    assert_eq!(report["task"]["task_id"], task_id);
+    assert_eq!(
+        report["latest_execution_report"]["final_status"],
+        "completed"
+    );
+    assert_eq!(report["status_snapshot"]["task"]["status"], "completed");
+    assert!(
+        report["route_feedback"]["combined_count"]
+            .as_u64()
+            .expect("combined route feedback count")
+            > 0
+    );
+    let text_report = run_Himalaya(&root, &["tasks", "report", &task_id], &[]);
+    assert!(text_report.status.success());
+    let text_stdout = String::from_utf8(text_report.stdout).expect("text report stdout");
+    assert!(text_stdout.contains("Task report"));
+    assert!(text_stdout.contains("Route feedback"));
 
     let logs = assert_json_command(
         &root,

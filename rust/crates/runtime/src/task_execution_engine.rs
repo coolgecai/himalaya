@@ -393,6 +393,8 @@ impl TaskExecutionEngine {
             recovery_action,
             &final_task,
         );
+        self.registry
+            .record_task_execution_report(task_id, report.clone())?;
         self.record_execution_route_feedback(&report)?;
         Ok(report)
     }
@@ -450,10 +452,21 @@ impl TaskExecutionEngine {
             VerificationDecision::NotRequired | VerificationDecision::Passed
         );
         let recovery_triggered = report.recovery.is_some() || report.recovery_action.is_some();
-        let note = report.failure.as_ref().map_or_else(
-            || Some(report.message.clone()),
-            |failure| Some(format!("{}: {}", failure.failure_class, failure.reason)),
-        );
+        let verification_decision = verification_decision_label(&report.verification_decision);
+        let recovery_decision = report
+            .recovery
+            .as_ref()
+            .map(|recovery| recovery_decision_label(&recovery.decision));
+        let plan_progress = report.plan_progress.as_ref().map(plan_progress_label);
+        let failure_class = report
+            .failure
+            .as_ref()
+            .map(|failure| failure.failure_class.clone());
+        let note = Some(route_feedback_note(
+            report,
+            verification_decision.as_str(),
+            plan_progress.as_deref(),
+        ));
         let feedback =
             ModelRouteFeedback::pending(report.task_id.clone(), route, execution_now_secs())
                 .with_outcome(
@@ -461,6 +474,13 @@ impl TaskExecutionEngine {
                     Some(verification_passed),
                     recovery_triggered,
                     note,
+                )
+                .with_diagnostics(
+                    failure_class,
+                    Some(report.final_status.to_string()),
+                    Some(verification_decision),
+                    recovery_decision,
+                    plan_progress,
                 );
         self.registry
             .update_latest_route_feedback(&report.task_id, feedback)?;
@@ -885,6 +905,65 @@ fn execution_now_secs() -> u64 {
         .as_secs()
 }
 
+fn verification_decision_label(decision: &VerificationDecision) -> String {
+    match decision {
+        VerificationDecision::NotRequired => "not_required".to_string(),
+        VerificationDecision::Required(request) => format!("required:{:?}", request.policy),
+        VerificationDecision::Passed => "passed".to_string(),
+        VerificationDecision::Failed { .. } => "failed".to_string(),
+    }
+}
+
+fn recovery_decision_label(decision: &crate::RecoveryOrchestratorDecision) -> String {
+    match decision {
+        crate::RecoveryOrchestratorDecision::Recovered => "recovered".to_string(),
+        crate::RecoveryOrchestratorDecision::Escalate { reason } => {
+            format!("escalate:{reason}")
+        }
+        crate::RecoveryOrchestratorDecision::Blocked { reason } => {
+            format!("blocked:{reason}")
+        }
+    }
+}
+
+fn plan_progress_label(progress: &TaskPlanProgress) -> String {
+    format!(
+        "{}/{} succeeded; pending={}; ready={}; running={}; failed={}; skipped={}",
+        progress.succeeded,
+        progress.total,
+        progress.pending,
+        progress.ready,
+        progress.running,
+        progress.failed,
+        progress.skipped
+    )
+}
+
+fn route_feedback_note(
+    report: &TaskExecutionReport,
+    verification_decision: &str,
+    plan_progress: Option<&str>,
+) -> String {
+    let mut parts = vec![
+        report.message.clone(),
+        format!("final_status={}", report.final_status),
+        format!("verification_decision={verification_decision}"),
+    ];
+    if let Some(progress) = plan_progress {
+        parts.push(format!("plan_progress={progress}"));
+    }
+    if let Some(failure) = report.failure.as_ref() {
+        parts.push(format!(
+            "failure_class={}; reason={}",
+            failure.failure_class, failure.reason
+        ));
+    }
+    if report.recovery_action.is_some() {
+        parts.push("recovery_action_recorded=true".to_string());
+    }
+    parts.join("; ")
+}
+
 fn task_plan_succeeded(task: &crate::task_registry::Task) -> bool {
     task.plan.as_ref().is_some_and(|plan| {
         !plan.execution.nodes.is_empty()
@@ -919,6 +998,8 @@ mod tests {
     use crate::{
         PlanDag, PlanDagEdge, PlanDagEdgeKind, PlanDagNode, PlanExecution, PlanNodeKind, TaskPacket,
     };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample_registry() -> (TaskRegistry, String) {
         let registry = TaskRegistry::new();
@@ -1018,6 +1099,14 @@ mod tests {
         (registry, task.task_id)
     }
 
+    fn unique_script_path(label: &str) -> std::path::PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("Himalaya-{label}-{}-{now}.sh", std::process::id()))
+    }
+
     #[test]
     fn executes_single_ready_node_to_completion() {
         let (registry, task_id) = sample_registry();
@@ -1028,6 +1117,28 @@ mod tests {
         assert_eq!(
             registry.get(&task_id).expect("task").status,
             TaskStatus::Completed
+        );
+    }
+
+    #[test]
+    fn no_plan_conversation_completion_is_not_plan_gated() {
+        let registry = TaskRegistry::new();
+        let task = registry.create("conversation answer", Some("conversation_turn"));
+        let engine = TaskExecutionEngine::new(registry.clone(), VerificationRunner::new(None));
+
+        let decision = engine
+            .recorded_completion_decision(&task.task_id)
+            .expect("completion decision");
+        let outcome = engine
+            .execute(&task.task_id, None)
+            .expect("scheduler execution should still require a persisted plan");
+
+        assert_eq!(decision, VerificationDecision::NotRequired);
+        assert!(outcome.blocked);
+        assert_eq!(outcome.message, "task has no persisted plan");
+        assert_eq!(
+            registry.get(&task.task_id).expect("task").status,
+            TaskStatus::Blocked
         );
     }
 
@@ -1141,11 +1252,109 @@ mod tests {
             feedback.route.phase == ModelRoutePhase::Verification
                 && feedback.succeeded == Some(true)
                 && feedback.verification_passed == Some(true)
+                && feedback.final_status.as_deref() == Some("completed")
+                && feedback.verification_decision.as_deref() == Some("passed")
+                && feedback.plan_progress.is_some()
         }));
+        assert_eq!(task.execution_reports.len(), 1);
+        assert_eq!(
+            task.execution_reports[0].final_status,
+            TaskStatus::Completed
+        );
         assert_eq!(
             report.plan_progress.as_ref().expect("progress").succeeded,
             report.plan_progress.as_ref().expect("progress").total
         );
+    }
+
+    #[test]
+    fn execute_with_recovery_waits_for_verification_then_completes_after_result() {
+        let (registry, task_id) = packet_registry(vec!["python3 --version".to_string()]);
+        let engine = TaskExecutionEngine::new(registry.clone(), VerificationRunner::new(None));
+
+        let first = engine.execute(&task_id, None).expect("execute");
+
+        assert!(!first.completed, "{first:?}");
+        assert_eq!(
+            registry.get(&task_id).expect("task").status,
+            TaskStatus::WaitingForVerification
+        );
+
+        registry
+            .record_verification(
+                &task_id,
+                VerificationResult {
+                    task_id: task_id.clone(),
+                    passed: true,
+                    observed_green_level: Some(crate::green_contract::GreenLevel::TargetedTests),
+                    summary: "external verification passed".to_string(),
+                    evidence: vec!["manual".to_string()],
+                },
+            )
+            .expect("verification should record");
+
+        let second = engine
+            .execute_with_recovery(&task_id, None, PermissionMode::ReadOnly)
+            .expect("execution loop should complete after verification");
+        let task = registry.get(&task_id).expect("task");
+
+        assert!(second.completed, "{second:?}");
+        assert_eq!(second.final_status, TaskStatus::Completed);
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.execution_reports.len(), 1);
+    }
+
+    #[test]
+    fn execute_with_recovery_switch_model_action_redrives_verification() {
+        let script = unique_script_path("provider-retry");
+        let marker = script.with_extension("marker");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ -f \"{}\" ]; then exit 0; fi\ntouch \"{}\"\necho provider timeout >&2\nexit 1\n",
+                marker.display(),
+                marker.display()
+            ),
+        )
+        .expect("script should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script)
+                .expect("script metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).expect("script permissions");
+        }
+        let command = format!("sh {}", script.display());
+        let (registry, task_id) = packet_registry(vec![command]);
+        let engine = TaskExecutionEngine::new(registry.clone(), VerificationRunner::new(None));
+
+        let report = engine
+            .execute_with_recovery(&task_id, None, PermissionMode::ReadOnly)
+            .expect("execution loop should recover and retry");
+        let task = registry.get(&task_id).expect("task");
+
+        assert!(report.completed, "{report:?}");
+        assert_eq!(report.final_status, TaskStatus::Completed);
+        assert!(report.failure.is_none(), "{report:?}");
+        assert!(report.recovery.is_some());
+        assert!(report
+            .recovery_action
+            .as_ref()
+            .expect("recovery action")
+            .results
+            .iter()
+            .any(|result| {
+                result.executed && result.action.kind == crate::RecoveryActionKind::SwitchModel
+            }));
+        assert!(task.route_feedback.iter().any(|feedback| {
+            feedback.succeeded == Some(true)
+                && feedback.recovery_triggered
+                && feedback.recovery_decision.is_some()
+        }));
+        let _ = fs::remove_file(script);
+        let _ = fs::remove_file(marker);
     }
 
     #[test]
@@ -1171,7 +1380,10 @@ mod tests {
                 && feedback.succeeded == Some(false)
                 && feedback.verification_passed == Some(false)
                 && feedback.recovery_triggered
+                && feedback.final_status.is_some()
+                && feedback.failure_class.is_some()
         }));
+        assert_eq!(task.execution_reports.len(), 1);
     }
 
     #[test]

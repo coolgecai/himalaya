@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     evaluate_verification_result, infer_verification_policy, validate_packet, ModelRouteFeedback,
-    PlanDag, PlanExecution, RecoveryActionExecution, RecoveryEvent, TaskPacket,
-    TaskPacketValidationError, TeamExecutionEvent, VerificationDecision, VerificationResult,
+    PlanDag, PlanExecution, RecoveryActionExecution, RecoveryEvent, TaskExecutionReport,
+    TaskPacket, TaskPacketValidationError, TeamExecutionEvent, VerificationDecision,
+    VerificationResult,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +106,8 @@ pub struct Task {
     pub recovery_action_executions: Vec<RecoveryActionExecution>,
     #[serde(default)]
     pub route_feedback: Vec<ModelRouteFeedback>,
+    #[serde(default)]
+    pub execution_reports: Vec<TaskExecutionReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,7 +137,8 @@ pub struct TaskEventLogEntry {
     pub timestamp: u64,
 }
 
-const SNAPSHOT_VERSION: u32 = 2;
+const SNAPSHOT_VERSION: u32 = 3;
+const TASK_EXECUTION_REPORT_KEEP_LAST: usize = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TaskRegistrySnapshot {
@@ -367,6 +371,7 @@ impl TaskRegistry {
             team_events: Vec::new(),
             recovery_action_executions: Vec::new(),
             route_feedback: Vec::new(),
+            execution_reports: Vec::new(),
         };
         task.checkpoints.push(TaskCheckpoint {
             seq: 1,
@@ -643,6 +648,7 @@ impl TaskRegistry {
             .ok_or_else(|| format!("task not found: {task_id}"))?;
         let ts = now_secs();
         task.recovery_action_executions.push(execution);
+        enrich_latest_route_feedback(task, None, None, None, None, None, None, Some(true), None);
         task.updated_at = ts;
         let updated = task.clone();
         push_ledger_entry(
@@ -734,6 +740,35 @@ impl TaskRegistry {
             &mut inner,
             task_id,
             "route_feedback_recorded",
+            updated.status,
+            None,
+            ts,
+        );
+        Ok(updated)
+    }
+
+    pub fn record_task_execution_report(
+        &self,
+        task_id: &str,
+        report: TaskExecutionReport,
+    ) -> Result<Task, String> {
+        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let task = inner
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        let ts = now_secs();
+        task.execution_reports.push(report);
+        if task.execution_reports.len() > TASK_EXECUTION_REPORT_KEEP_LAST {
+            let removed = task.execution_reports.len() - TASK_EXECUTION_REPORT_KEEP_LAST;
+            task.execution_reports.drain(0..removed);
+        }
+        task.updated_at = ts;
+        let updated = task.clone();
+        push_ledger_entry(
+            &mut inner,
+            task_id,
+            "task_execution_report_recorded",
             updated.status,
             None,
             ts,
@@ -836,6 +871,10 @@ impl TaskRegistry {
         if task.route_feedback.len() > keep_last {
             let removed = task.route_feedback.len() - keep_last;
             task.route_feedback.drain(0..removed);
+        }
+        if task.execution_reports.len() > keep_last {
+            let removed = task.execution_reports.len() - keep_last;
+            task.execution_reports.drain(0..removed);
         }
         let ts = now_secs();
         task.updated_at = ts;

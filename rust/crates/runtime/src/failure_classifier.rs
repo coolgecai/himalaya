@@ -59,6 +59,17 @@ impl FailureClassifier {
         } else if contains_any(
             &normalized,
             &[
+                "provider",
+                "rate limit",
+                "model route",
+                "model failed",
+                "model error",
+            ],
+        ) {
+            (FailureScenario::ProviderFailure, "provider_failure")
+        } else if contains_any(
+            &normalized,
+            &[
                 "cargo",
                 "rustc",
                 "compile",

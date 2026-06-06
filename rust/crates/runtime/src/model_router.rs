@@ -180,6 +180,16 @@ pub struct ModelRouteFeedback {
     pub recovery_triggered: bool,
     pub timestamp: u64,
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_progress: Option<String>,
 }
 
 impl ModelRouteFeedback {
@@ -197,6 +207,11 @@ impl ModelRouteFeedback {
             recovery_triggered: false,
             timestamp,
             note: None,
+            failure_class: None,
+            final_status: None,
+            verification_decision: None,
+            recovery_decision: None,
+            plan_progress: None,
         }
     }
 
@@ -230,6 +245,23 @@ impl ModelRouteFeedback {
         self
     }
 
+    #[must_use]
+    pub fn with_diagnostics(
+        mut self,
+        failure_class: Option<String>,
+        final_status: Option<String>,
+        verification_decision: Option<String>,
+        recovery_decision: Option<String>,
+        plan_progress: Option<String>,
+    ) -> Self {
+        self.failure_class = failure_class;
+        self.final_status = final_status;
+        self.verification_decision = verification_decision;
+        self.recovery_decision = recovery_decision;
+        self.plan_progress = plan_progress;
+        self
+    }
+
     pub fn merge_observations(&mut self, observation: &Self) {
         if observation.succeeded.is_some() {
             self.succeeded = observation.succeeded;
@@ -252,6 +284,21 @@ impl ModelRouteFeedback {
         self.recovery_triggered |= observation.recovery_triggered;
         if observation.note.is_some() {
             self.note = observation.note.clone();
+        }
+        if observation.failure_class.is_some() {
+            self.failure_class = observation.failure_class.clone();
+        }
+        if observation.final_status.is_some() {
+            self.final_status = observation.final_status.clone();
+        }
+        if observation.verification_decision.is_some() {
+            self.verification_decision = observation.verification_decision.clone();
+        }
+        if observation.recovery_decision.is_some() {
+            self.recovery_decision = observation.recovery_decision.clone();
+        }
+        if observation.plan_progress.is_some() {
+            self.plan_progress = observation.plan_progress.clone();
         }
     }
 

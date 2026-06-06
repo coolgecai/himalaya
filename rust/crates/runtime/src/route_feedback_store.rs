@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -23,6 +24,9 @@ pub struct RouteFeedbackSummary {
     pub avg_latency_ms: Option<f32>,
     pub avg_tokens: Option<f32>,
     pub avg_cost_usd: Option<f64>,
+    pub failure_classes: BTreeMap<String, usize>,
+    pub final_statuses: BTreeMap<String, usize>,
+    pub verification_decisions: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -124,6 +128,21 @@ impl RouteFeedbackStore {
             );
             let avg_cost_usd =
                 average_f64(related.iter().filter_map(|candidate| candidate.cost_usd));
+            let failure_classes = count_strings(
+                related
+                    .iter()
+                    .filter_map(|candidate| candidate.failure_class.as_deref()),
+            );
+            let final_statuses = count_strings(
+                related
+                    .iter()
+                    .filter_map(|candidate| candidate.final_status.as_deref()),
+            );
+            let verification_decisions = count_strings(
+                related
+                    .iter()
+                    .filter_map(|candidate| candidate.verification_decision.as_deref()),
+            );
             summaries.push(RouteFeedbackSummary {
                 phase: entry.route.phase,
                 provider: entry.route.provider.clone(),
@@ -139,6 +158,9 @@ impl RouteFeedbackStore {
                 avg_latency_ms,
                 avg_tokens,
                 avg_cost_usd,
+                failure_classes,
+                final_statuses,
+                verification_decisions,
             });
         }
         summaries.sort_by(|left, right| {
@@ -159,6 +181,14 @@ impl RouteFeedbackStore {
         });
         summaries
     }
+}
+
+fn count_strings<'a>(values: impl Iterator<Item = &'a str>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for value in values {
+        *counts.entry(value.to_string()).or_insert(0) += 1;
+    }
+    counts
 }
 
 fn average_f32(values: impl Iterator<Item = f32>) -> Option<f32> {
@@ -283,7 +313,14 @@ mod tests {
                 .with_outcome(true, None, false, None),
             ModelRouteFeedback::pending("task-2", anthropic_route, 2)
                 .with_metrics(Some(3_000), Some(2_500), Some(1_500), Some(0.03))
-                .with_outcome(false, None, true, None),
+                .with_outcome(false, None, true, None)
+                .with_diagnostics(
+                    Some("verification_command".to_string()),
+                    Some("blocked".to_string()),
+                    Some("failed".to_string()),
+                    Some("blocked:partial recovery".to_string()),
+                    Some("1/2 succeeded".to_string()),
+                ),
             ModelRouteFeedback::pending("task-3", openai_route, 3)
                 .with_metrics(Some(500), Some(700), Some(300), Some(0.005))
                 .with_outcome(true, None, false, None),
@@ -301,6 +338,12 @@ mod tests {
         assert_eq!(anthropic.avg_latency_ms, Some(2_000.0));
         assert_eq!(anthropic.avg_tokens, Some(3_000.0));
         assert_eq!(anthropic.avg_cost_usd, Some(0.02));
+        assert_eq!(
+            anthropic.failure_classes.get("verification_command"),
+            Some(&1)
+        );
+        assert_eq!(anthropic.final_statuses.get("blocked"), Some(&1));
+        assert_eq!(anthropic.verification_decisions.get("failed"), Some(&1));
         let openai = summaries
             .iter()
             .find(|summary| summary.provider.as_deref() == Some("openai"))

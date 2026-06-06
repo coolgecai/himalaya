@@ -3156,6 +3156,9 @@ where
             recovery_action,
             &task,
         );
+        let _ = self
+            .task_registry
+            .record_task_execution_report(runtime_task_id, report.clone());
         self.emit_runtime_event(RuntimeEvent::TaskExecution(outcome));
         self.emit_runtime_event(RuntimeEvent::TaskExecutionReport(Box::new(report.clone())));
 

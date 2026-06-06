@@ -104,6 +104,9 @@
           "$ref": "#/$defs/taskStatusEvent"
         },
         {
+          "$ref": "#/$defs/taskReportEvent"
+        },
+        {
           "$ref": "#/$defs/taskExecutionCommandEvent"
         },
         {
@@ -214,6 +217,7 @@
         "task_list",
         "task_show",
         "task_status",
+        "task_report",
         "task_execution",
         "task_recovery",
         "task_verification",
@@ -895,6 +899,52 @@
             },
             "ledger": {
               "type": "array"
+            }
+          }
+        }
+      ]
+    },
+    "taskReportEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task",
+            "status_snapshot",
+            "route_feedback"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_report"
+            },
+            "task": {
+              "type": "object"
+            },
+            "status_snapshot": {
+              "type": "object"
+            },
+            "latest_execution_report": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "latest_failure": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "latest_recovery_action": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "route_feedback": {
+              "type": "object"
             }
           }
         }
