@@ -54,6 +54,7 @@ pub mod stale_branch;
 pub mod structured_execution;
 pub mod summary_compression;
 pub mod task_execution_engine;
+pub mod task_memory_store;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_convergence;
@@ -227,6 +228,10 @@ pub use task_execution_engine::{
     task_execution_report_from_parts, task_plan_progress, TaskExecutionEngine,
     TaskExecutionOutcome, TaskExecutionReport, TaskExecutionStep, TaskExecutionStepKind,
     TaskPlanProgress,
+};
+pub use task_memory_store::{
+    RecoveryActionMemorySummary, TaskMemoryEntry, TaskMemorySnapshot, TaskMemoryStore,
+    TaskMemorySummary, TaskRecoveryActionSignal,
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
 pub use task_registry::{

@@ -358,14 +358,21 @@ fn task_scheduler_tick_persists_durable_status() {
         &root,
         &["--output-format", "json", "tasks", "scheduler", "tick"],
     );
-    assert_eq!(second_tick["tick"]["status"], "running");
-    assert_eq!(second_tick["tick"]["task"]["status"], "running");
-    assert_eq!(second_tick["tick"]["report"]["final_status"], "running");
-    assert!(second_tick["tick"]["outcome"]["steps"]
+    assert_eq!(second_tick["tick"]["status"], "idle");
+    assert!(second_tick["tick"]["selected_task_id"].is_null());
+    assert!(second_tick["tick"]["task"].is_null());
+    assert!(second_tick["tick"]["outcome"].is_null());
+    assert!(second_tick["tick"]["report"].is_null());
+    assert!(second_tick["tick"]["decision_trace"]
         .as_array()
-        .expect("second tick steps array")
+        .expect("second tick decision trace")
         .iter()
-        .any(|step| step["kind"] == "await_worker"));
+        .any(|trace| trace["task_id"] == task_id
+            && trace["selected"] == false
+            && trace["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("waiting for worker")));
 
     let daemon = assert_json_command(
         &root,
@@ -591,11 +598,30 @@ fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
             .expect("combined route feedback count")
             > 0
     );
+    assert!(report["task_memory"]["entry"].is_object());
+    assert!(root.join(".Himalaya/memory/tasks.json").exists());
     let text_report = run_Himalaya(&root, &["tasks", "report", &task_id], &[]);
     assert!(text_report.status.success());
     let text_stdout = String::from_utf8(text_report.stdout).expect("text report stdout");
     assert!(text_stdout.contains("Task report"));
     assert!(text_stdout.contains("Route feedback"));
+
+    let review = assert_json_command(
+        &root,
+        &["--output-format", "json", "tasks", "review", &task_id],
+    );
+    assert_eq!(review["type"], "task_review");
+    assert_eq!(review["task"]["task_id"], task_id);
+    assert!(review["recommendations"]
+        .as_array()
+        .expect("recommendations array")
+        .iter()
+        .any(|item| item.as_str().unwrap_or("").contains("Reuse")));
+    let text_review = run_Himalaya(&root, &["tasks", "review", &task_id], &[]);
+    assert!(text_review.status.success());
+    let review_stdout = String::from_utf8(text_review.stdout).expect("text review stdout");
+    assert!(review_stdout.contains("Task review"));
+    assert!(review_stdout.contains("Recommendations"));
 
     let logs = assert_json_command(
         &root,

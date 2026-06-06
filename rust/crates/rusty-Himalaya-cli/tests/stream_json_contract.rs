@@ -40,6 +40,7 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "task_show",
         "task_status",
         "task_report",
+        "task_review",
         "task_execution",
         "task_recovery",
         "task_verification",
@@ -1297,6 +1298,20 @@ fn assert_stream_event_schema(event: &Value) {
             assert!(
                 event["route_feedback"].is_object(),
                 "task_report requires route_feedback object: {event:?}"
+            );
+        }
+        "task_review" => {
+            assert!(
+                event["task"].is_object(),
+                "task_review requires task object: {event:?}"
+            );
+            assert!(
+                event["report"].is_object(),
+                "task_review requires report object: {event:?}"
+            );
+            assert!(
+                event["recommendations"].is_array(),
+                "task_review requires recommendations array: {event:?}"
             );
         }
         "task_status" => {

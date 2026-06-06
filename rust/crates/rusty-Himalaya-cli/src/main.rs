@@ -632,6 +632,9 @@ enum TaskCliCommand {
     Report {
         task_id: String,
     },
+    Review {
+        task_id: String,
+    },
     Packet {
         command: TaskPacketCliCommand,
     },
@@ -1379,6 +1382,9 @@ fn parse_task_cli_command(args: &[String]) -> Result<TaskCliCommand, String> {
         Some(("report", [task_id])) => Ok(TaskCliCommand::Report {
             task_id: task_id.clone(),
         }),
+        Some(("review", [task_id])) => Ok(TaskCliCommand::Review {
+            task_id: task_id.clone(),
+        }),
         Some(("packet", rest)) => Ok(TaskCliCommand::Packet {
             command: parse_task_packet_cli_command(rest)?,
         }),
@@ -1454,7 +1460,7 @@ fn parse_task_cli_command(args: &[String]) -> Result<TaskCliCommand, String> {
             task_id: task_id.clone(),
         }),
         Some((other, _)) => Err(format!(
-            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
+            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|review <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
         )),
     }
 }
@@ -4820,6 +4826,18 @@ fn run_resume_command(
                         json: Some(value),
                     })
                 }
+                TaskCliCommand::Review { task_id } => {
+                    let registry = load_task_registry()?;
+                    let task = registry
+                        .get(&task_id)
+                        .ok_or_else(|| format!("task not found: {task_id}"))?;
+                    let value = task_review_value(&registry, task)?;
+                    Ok(ResumeCommandOutcome {
+                        session: session.clone(),
+                        message: Some(render_task_review_text(&value)),
+                        json: Some(value),
+                    })
+                }
                 TaskCliCommand::Packet {
                     command: TaskPacketCliCommand::Status { task_id },
                 } => {
@@ -4864,7 +4882,7 @@ fn run_resume_command(
                         .into(),
                 ),
                 _ => Err(
-                    "resumed /tasks supports list, show, status, report, packet status, and scheduler queue; use `Himalaya tasks ...` for execution, recovery, verification, retry, compact, cancel, packet create/run, scheduler tick, or resume actions"
+                    "resumed /tasks supports list, show, status, report, review, packet status, and scheduler queue; use `Himalaya tasks ...` for execution, recovery, verification, retry, compact, cancel, packet create/run, scheduler tick, or resume actions"
                         .into(),
                 ),
             }
@@ -7419,6 +7437,19 @@ fn run_task_command(
                 }
             }
         }
+        TaskCliCommand::Review { task_id } => {
+            let registry = load_task_registry()?;
+            let task = registry
+                .get(&task_id)
+                .ok_or_else(|| format!("task not found: {task_id}"))?;
+            let value = task_review_value(&registry, task)?;
+            match output_format {
+                CliOutputFormat::Text => println!("{}", render_task_review_text(&value)),
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(value, output_format)?;
+                }
+            }
+        }
         TaskCliCommand::Packet { command } => {
             run_task_packet_command(command, output_format)?;
         }
@@ -8262,6 +8293,11 @@ fn route_feedback_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(cwd.join(".Himalaya").join("routes"))
 }
 
+fn task_memory_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    Ok(cwd.join(".Himalaya").join("memory"))
+}
+
 fn load_route_feedback_store() -> Result<runtime::RouteFeedbackStore, Box<dyn std::error::Error>> {
     Ok(runtime::RouteFeedbackStore::load_from_dir(
         &route_feedback_dir()?,
@@ -8275,6 +8311,17 @@ fn save_route_feedback_store(
     Ok(())
 }
 
+fn load_task_memory_store() -> Result<runtime::TaskMemoryStore, Box<dyn std::error::Error>> {
+    Ok(runtime::TaskMemoryStore::load_from_dir(&task_memory_dir()?)?)
+}
+
+fn save_task_memory_store(
+    store: &runtime::TaskMemoryStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    store.save_to_dir(&task_memory_dir()?)?;
+    Ok(())
+}
+
 fn load_task_registry() -> Result<runtime::TaskRegistry, Box<dyn std::error::Error>> {
     let dir = task_registry_dir()?;
     if dir.join("tasks.json").exists() {
@@ -8285,13 +8332,15 @@ fn load_task_registry() -> Result<runtime::TaskRegistry, Box<dyn std::error::Err
 
 fn save_task_registry(registry: &runtime::TaskRegistry) -> Result<(), Box<dyn std::error::Error>> {
     registry.save_to_dir(&task_registry_dir()?)?;
+    let tasks = registry.list(None);
     let mut store = load_route_feedback_store()?;
-    for task in registry.list(None) {
-        for feedback in task.route_feedback {
+    for task in &tasks {
+        for feedback in task.route_feedback.iter().cloned() {
             store.record(feedback);
         }
     }
     save_route_feedback_store(&store)?;
+    save_task_memory_store(&runtime::TaskMemoryStore::from_tasks(&tasks))?;
     Ok(())
 }
 
@@ -8479,6 +8528,20 @@ fn task_report_value(
     let latest_execution_report = task.execution_reports.last().cloned();
     let latest_recovery = task.recovery_events.last().cloned();
     let latest_recovery_action = task.recovery_action_executions.last().cloned();
+    let registry_tasks = registry.list(None);
+    let memory_store = load_task_memory_store()
+        .ok()
+        .filter(|store| !store.entries().is_empty())
+        .unwrap_or_else(|| runtime::TaskMemoryStore::from_tasks(&registry_tasks));
+    let memory_entry = memory_store
+        .entry_for_task(&task_id)
+        .cloned()
+        .unwrap_or_else(|| runtime::TaskMemoryEntry::from_task(&task));
+    let similar_memory_count = memory_store
+        .similar_entries(&memory_entry.task_type)
+        .into_iter()
+        .filter(|entry| entry.task_id != task_id)
+        .count();
     let local_feedback_count = task.route_feedback.len();
     let mut route_feedback = runtime::RouteFeedbackStore::new();
     for feedback in task.route_feedback.iter().cloned() {
@@ -8512,6 +8575,13 @@ fn task_report_value(
         "latest_failure": latest_failure,
         "latest_recovery": latest_recovery,
         "latest_recovery_action": latest_recovery_action,
+        "task_memory": {
+            "entry": memory_entry,
+            "similar_count": similar_memory_count,
+            "summaries": memory_store.summaries(),
+            "recovery_actions": memory_store.recovery_action_summaries(),
+            "memory_path": task_memory_dir()?.join("tasks.json"),
+        },
         "route_feedback": {
             "local_count": local_feedback_count,
             "workspace_count": workspace_feedback_count,
@@ -8522,6 +8592,111 @@ fn task_report_value(
         "ledger": registry.ledger_for_task(&task_id),
         "event_log": registry.event_log_for_task(&task_id),
     }))
+}
+
+fn task_review_value(
+    registry: &runtime::TaskRegistry,
+    task: runtime::task_registry::Task,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let report = task_report_value(registry, task)?;
+    let recommendations = task_review_recommendations(&report);
+    let latest_report = &report["latest_execution_report"];
+    let latest_failure = &report["latest_failure"];
+    let route_feedback = &report["route_feedback"];
+    let recovery_action = &report["latest_recovery_action"];
+    let route_summary_count = route_feedback["summaries"].as_array().map_or(0, Vec::len);
+    let recovery_results = recovery_action["results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let recovery_executed = recovery_results
+        .iter()
+        .filter(|result| result["executed"].as_bool() == Some(true))
+        .count();
+    let recovery_blocked = recovery_results
+        .iter()
+        .filter(|result| result["blocked"].as_bool() == Some(true))
+        .count();
+    Ok(json!({
+        "type": "task_review",
+        "task": report["task"].clone(),
+        "report": report,
+        "failure_summary": {
+            "class": latest_failure["failure_class"].as_str(),
+            "reason": latest_failure["reason"].as_str(),
+            "latest_report_message": latest_report["message"].as_str(),
+        },
+        "recovery_summary": {
+            "actions": recovery_results.len(),
+            "executed": recovery_executed,
+            "blocked": recovery_blocked,
+            "effective": latest_report["completed"].as_bool() == Some(true) && recovery_executed > 0,
+        },
+        "route_summary": {
+            "feedback_count": route_feedback["combined_count"].as_u64().unwrap_or(0),
+            "summary_count": route_summary_count,
+            "routes": route_feedback["summaries"].clone(),
+        },
+        "memory_summary": report["task_memory"].clone(),
+        "recommendations": recommendations,
+    }))
+}
+
+fn task_review_recommendations(report: &Value) -> Vec<String> {
+    let mut recommendations = Vec::new();
+    let latest_report = &report["latest_execution_report"];
+    let completed = latest_report["completed"].as_bool().unwrap_or(false);
+    let blocked = latest_report["blocked"].as_bool().unwrap_or(false);
+    if latest_report.is_null() {
+        recommendations
+            .push("Run the task execution loop before reviewing adaptive outcomes.".to_string());
+    }
+    if let Some(failure_class) = report["latest_failure"]["failure_class"].as_str() {
+        recommendations.push(format!(
+            "Treat future similar failures as `{failure_class}` and compare recovery outcomes before retrying."
+        ));
+    }
+    if report["latest_recovery_action"]["results"]
+        .as_array()
+        .is_some_and(|results| {
+            results
+                .iter()
+                .any(|result| result["blocked"].as_bool() == Some(true))
+        })
+    {
+        recommendations.push(
+            "A recovery action was blocked; keep the task blocked or raise permission before retrying.".to_string(),
+        );
+    }
+    if report["route_feedback"]["summaries"]
+        .as_array()
+        .is_some_and(|summaries| {
+            summaries.iter().any(|summary| {
+                summary["failures"].as_u64().unwrap_or(0) > 0
+                    || summary["recovery_triggered"].as_u64().unwrap_or(0) > 0
+            })
+        })
+    {
+        recommendations.push(
+            "Use route feedback to prefer models with higher verification success and lower recovery rate.".to_string(),
+        );
+    }
+    let similar_count = report["task_memory"]["similar_count"].as_u64().unwrap_or(0);
+    if similar_count > 0 {
+        recommendations.push(format!(
+            "Consult {similar_count} similar task memory entry/entries before planning the next task."
+        ));
+    }
+    if completed && !blocked {
+        recommendations.push(
+            "Reuse the recorded acceptance tests and route pattern for similar future tasks."
+                .to_string(),
+        );
+    }
+    if recommendations.is_empty() {
+        recommendations.push("No adaptive recommendation is available yet.".to_string());
+    }
+    recommendations
 }
 
 fn task_failure_classification(
@@ -8687,6 +8862,54 @@ fn render_task_report_text(value: &Value) -> String {
         route_feedback["combined_count"].as_u64().unwrap_or(0),
         route_feedback["workspace_count"].as_u64().unwrap_or(0)
     ));
+    let task_memory = &value["task_memory"];
+    if let Some(task_type) = task_memory["entry"]["task_type"].as_str() {
+        lines.push(format!(
+            "  Task memory       type={} similar={}",
+            task_type,
+            task_memory["similar_count"].as_u64().unwrap_or(0)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_task_review_text(value: &Value) -> String {
+    let task = &value["task"];
+    let task_id = task["task_id"].as_str().unwrap_or("unknown");
+    let status = task["status"].as_str().unwrap_or("unknown");
+    let mut lines = vec![format!(
+        "Task review\n  Task              {task_id}\n  Status            {status}"
+    )];
+    let failure = &value["failure_summary"];
+    if let Some(class) = failure["class"].as_str() {
+        lines.push(format!(
+            "  Failure           {} - {}",
+            class,
+            failure["reason"].as_str().unwrap_or("")
+        ));
+    }
+    let recovery = &value["recovery_summary"];
+    lines.push(format!(
+        "  Recovery          {}/{} executed, {} blocked",
+        recovery["executed"].as_u64().unwrap_or(0),
+        recovery["actions"].as_u64().unwrap_or(0),
+        recovery["blocked"].as_u64().unwrap_or(0)
+    ));
+    let route = &value["route_summary"];
+    lines.push(format!(
+        "  Routes            {} feedback entries across {} route(s)",
+        route["feedback_count"].as_u64().unwrap_or(0),
+        route["summary_count"].as_u64().unwrap_or(0)
+    ));
+    if let Some(recommendations) = value["recommendations"].as_array() {
+        lines.push("  Recommendations".to_string());
+        lines.extend(
+            recommendations
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|item| format!("    - {item}")),
+        );
+    }
     lines.join("\n")
 }
 
@@ -13126,7 +13349,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [prompt]|execute <task-id>|verify <task-id>|recover <task-id>|cancel <task-id>]"
+        "  Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|review <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [prompt]|execute <task-id>|verify <task-id>|recover <task-id>|cancel <task-id>]"
     )?;
     writeln!(
         out,
@@ -14345,6 +14568,13 @@ mod tests {
             parse_task_cli_command(&["report".to_string(), "task-1".to_string()])
                 .expect("tasks report should parse"),
             TaskCliCommand::Report {
+                task_id: "task-1".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_task_cli_command(&["review".to_string(), "task-1".to_string()])
+                .expect("tasks review should parse"),
+            TaskCliCommand::Review {
                 task_id: "task-1".to_string(),
             }
         );

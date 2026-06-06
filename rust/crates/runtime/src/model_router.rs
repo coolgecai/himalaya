@@ -497,6 +497,9 @@ impl ModelRouter {
 struct RouteFeedbackStats {
     total: usize,
     failures: usize,
+    verification_failures: usize,
+    terminal_blocks: usize,
+    recovery_triggered: usize,
     avg_latency_ms: Option<f32>,
     avg_tokens: Option<f32>,
     avg_cost_usd: Option<f32>,
@@ -522,6 +525,26 @@ impl RouteFeedbackStats {
             .iter()
             .filter(|entry| entry.succeeded == Some(false) || entry.recovery_triggered)
             .count();
+        let verification_failures = related
+            .iter()
+            .filter(|entry| {
+                entry.verification_passed == Some(false)
+                    || entry.verification_decision.as_deref() == Some("failed")
+            })
+            .count();
+        let terminal_blocks = related
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.final_status.as_deref(),
+                    Some("blocked" | "failed" | "waiting_for_permission")
+                )
+            })
+            .count();
+        let recovery_triggered = related
+            .iter()
+            .filter(|entry| entry.recovery_triggered)
+            .count();
         let avg_latency_ms = average_metric(
             related
                 .iter()
@@ -540,6 +563,9 @@ impl RouteFeedbackStats {
         Self {
             total: related.len(),
             failures,
+            verification_failures,
+            terminal_blocks,
+            recovery_triggered,
             avg_latency_ms,
             avg_tokens,
             avg_cost_usd,
@@ -550,8 +576,23 @@ impl RouteFeedbackStats {
         if self.total == 0 {
             0.0
         } else {
-            self.failures as f32 / self.total as f32
+            self.failures
+                .max(self.verification_failures)
+                .max(self.terminal_blocks) as f32
+                / self.total as f32
         }
+    }
+
+    fn quality_factor(self) -> f32 {
+        if self.total == 0 {
+            return 1.0;
+        }
+        let total = self.total as f32;
+        let verification_failure_rate = self.verification_failures as f32 / total;
+        let recovery_rate = self.recovery_triggered as f32 / total;
+        let terminal_block_rate = self.terminal_blocks as f32 / total;
+        (1.0 - verification_failure_rate * 0.35 - recovery_rate * 0.2 - terminal_block_rate * 0.3)
+            .clamp(0.25, 1.1)
     }
 
     fn efficiency_factor(self, route: &ModelRoute) -> f32 {
@@ -623,7 +664,9 @@ fn adaptive_route_score_with_complexity(
         None => route_weight_score(route),
         Some(_) => complexity_weighted_score(route, complexity),
     };
-    base * (1.0 - stats.failure_rate()).clamp(0.1, 1.0) * stats.efficiency_factor(route)
+    base * (1.0 - stats.failure_rate()).clamp(0.1, 1.0)
+        * stats.quality_factor()
+        * stats.efficiency_factor(route)
 }
 
 #[cfg(test)]
@@ -673,6 +716,52 @@ mod tests {
         assert_eq!(decision.fallback_model, Some("sonnet".to_string()));
         assert!(decision.reason.contains("adaptive route selected"));
         assert!(decision.reason.contains("route feedback"));
+    }
+
+    #[test]
+    fn adaptive_feedback_treats_verification_failures_as_route_quality_failures() {
+        let policy = MoERoutingPolicy::new(
+            "sonnet",
+            vec![
+                ModelRoute::new(ModelRoutePhase::Verification, "primary").with_weights(1, 1, 5),
+                ModelRoute::new(ModelRoutePhase::Verification, "fallback").with_weights(1, 1, 4),
+            ],
+        )
+        .with_adaptive(true, 2, 50);
+        let router = ModelRouter::new(policy);
+        let primary = ModelRouteDecision {
+            phase: ModelRoutePhase::Verification,
+            model: "primary".to_string(),
+            provider: None,
+            reason: "test".to_string(),
+            confidence: Some(0.8),
+            fallback_model: None,
+        };
+        let feedback = vec![
+            ModelRouteFeedback::pending("task-1", primary.clone(), 1)
+                .with_outcome(true, Some(false), false, Some("verify failed".to_string()))
+                .with_diagnostics(
+                    Some("verification_command".to_string()),
+                    Some("blocked".to_string()),
+                    Some("failed".to_string()),
+                    None,
+                    None,
+                ),
+            ModelRouteFeedback::pending("task-2", primary, 2)
+                .with_outcome(true, Some(false), false, Some("verify failed".to_string()))
+                .with_diagnostics(
+                    Some("verification_command".to_string()),
+                    Some("blocked".to_string()),
+                    Some("failed".to_string()),
+                    None,
+                    None,
+                ),
+        ];
+
+        let decision = router.select_with_feedback(ModelRoutePhase::Verification, &feedback);
+
+        assert_eq!(decision.model, "fallback");
+        assert_eq!(decision.fallback_model, Some("primary".to_string()));
     }
 
     #[test]

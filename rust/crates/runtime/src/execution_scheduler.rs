@@ -9,7 +9,7 @@ use crate::task_registry::Task as RegistryTask;
 use crate::{
     PlanDag, PlanExecution, PlanExecutionEvent, PlanNodeStatus, TaskExecutionEngine,
     TaskExecutionOutcome, TaskExecutionReport, TaskRegistry, TaskStatus, VerificationRunner,
-    WorkerRegistry,
+    WorkerRegistry, WorkerStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +58,18 @@ pub struct DurableSchedulerTaskSnapshot {
     pub status: DurableSchedulerStatus,
     pub task_status: TaskStatus,
     pub current_node: Option<String>,
+    pub priority: i32,
+    pub runnable: bool,
+    pub skip_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableSchedulerDecisionTrace {
+    pub task_id: String,
+    pub status: DurableSchedulerStatus,
+    pub priority: i32,
+    pub selected: bool,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +80,7 @@ pub struct DurableSchedulerTick {
     pub outcome: Option<TaskExecutionOutcome>,
     pub report: Option<TaskExecutionReport>,
     pub queue: Vec<DurableSchedulerTaskSnapshot>,
+    pub decision_trace: Vec<DurableSchedulerDecisionTrace>,
     pub message: String,
 }
 
@@ -374,16 +387,17 @@ impl DurableTaskScheduler {
 
     pub fn tick(&self) -> Result<DurableSchedulerTick, String> {
         let queue_before = self.queue();
-        let Some(snapshot) = queue_before
+        let selected = queue_before
             .iter()
-            .find(|task| {
-                matches!(
-                    task.status,
-                    DurableSchedulerStatus::Pending | DurableSchedulerStatus::Running
-                )
+            .filter(|task| task.runnable)
+            .max_by(|left, right| {
+                left.priority
+                    .cmp(&right.priority)
+                    .then_with(|| right.task_id.cmp(&left.task_id))
             })
-            .cloned()
-        else {
+            .cloned();
+        let decision_trace = scheduler_decision_trace(&queue_before, selected.as_ref());
+        let Some(snapshot) = selected else {
             return Ok(DurableSchedulerTick {
                 status: DurableSchedulerStatus::Idle,
                 selected_task_id: None,
@@ -391,6 +405,7 @@ impl DurableTaskScheduler {
                 outcome: None,
                 report: None,
                 queue: queue_before,
+                decision_trace,
                 message: "no runnable tasks".to_string(),
             });
         };
@@ -430,6 +445,7 @@ impl DurableTaskScheduler {
             outcome: Some(outcome),
             report: Some(report),
             queue: self.queue(),
+            decision_trace,
             message,
         })
     }
@@ -440,18 +456,113 @@ impl DurableTaskScheduler {
         tasks.sort_by_key(|task| (task.created_at, task.task_id.clone()));
         tasks
             .into_iter()
-            .map(|task| DurableSchedulerTaskSnapshot {
-                task_id: task.task_id.clone(),
-                status: durable_status_for_task(&task),
-                task_status: task.status,
-                current_node: task
-                    .plan
-                    .as_ref()
-                    .and_then(|plan| plan.resume_cursor.as_ref())
-                    .and_then(|cursor| cursor.node_id.clone()),
-            })
+            .map(|task| task_snapshot(task, self.worker_registry.as_ref()))
             .collect()
     }
+}
+
+fn task_snapshot(
+    task: RegistryTask,
+    worker_registry: Option<&WorkerRegistry>,
+) -> DurableSchedulerTaskSnapshot {
+    let status = durable_status_for_task(&task);
+    let current_node = task
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.resume_cursor.as_ref())
+        .and_then(|cursor| cursor.node_id.clone());
+    let waiting_for_worker = task.plan.as_ref().is_some_and(|plan| {
+        plan.execution.nodes.values().any(|node| {
+            node.status == PlanNodeStatus::Running
+                && node.worker_id.as_deref().is_some_and(|worker_id| {
+                    worker_registry
+                        .and_then(|registry| registry.get(worker_id))
+                        .map_or(true, |worker| {
+                            matches!(
+                                worker.status,
+                                WorkerStatus::Spawning
+                                    | WorkerStatus::ReadyForPrompt
+                                    | WorkerStatus::PromptAccepted
+                                    | WorkerStatus::Running
+                            )
+                        })
+                })
+        })
+    });
+    let has_executable_recovery = task.plan.is_some()
+        && task
+            .recovery_action_executions
+            .last()
+            .is_some_and(|execution| {
+                execution.results.iter().any(|result| {
+                    result.executed
+                        && matches!(
+                            result.action.kind,
+                            crate::RecoveryActionKind::RetryNode
+                                | crate::RecoveryActionKind::RerunVerification
+                                | crate::RecoveryActionKind::SwitchModel
+                                | crate::RecoveryActionKind::RetryMcpHandshake
+                                | crate::RecoveryActionKind::RestartPlugin
+                        )
+                })
+            });
+    let (priority, runnable, skip_reason) = match task.status {
+        TaskStatus::Running | TaskStatus::Recovering => {
+            if waiting_for_worker {
+                (40, false, Some("waiting for worker completion".to_string()))
+            } else {
+                (90, true, None)
+            }
+        }
+        TaskStatus::WaitingForVerification => (80, true, None),
+        TaskStatus::Created | TaskStatus::Planning => (70, true, None),
+        TaskStatus::Blocked | TaskStatus::Failed if has_executable_recovery => (60, true, None),
+        TaskStatus::Blocked | TaskStatus::Failed => (
+            10,
+            false,
+            Some("blocked without executable recovery action".to_string()),
+        ),
+        TaskStatus::WaitingForPermission => {
+            (5, false, Some("waiting for user permission".to_string()))
+        }
+        TaskStatus::Completed | TaskStatus::Stopped | TaskStatus::Cancelled => {
+            (0, false, Some("terminal task".to_string()))
+        }
+    };
+    DurableSchedulerTaskSnapshot {
+        task_id: task.task_id,
+        status,
+        task_status: task.status,
+        current_node,
+        priority,
+        runnable,
+        skip_reason,
+    }
+}
+
+fn scheduler_decision_trace(
+    queue: &[DurableSchedulerTaskSnapshot],
+    selected: Option<&DurableSchedulerTaskSnapshot>,
+) -> Vec<DurableSchedulerDecisionTrace> {
+    queue
+        .iter()
+        .map(|task| {
+            let selected_task = selected.is_some_and(|selected| selected.task_id == task.task_id);
+            DurableSchedulerDecisionTrace {
+                task_id: task.task_id.clone(),
+                status: task.status,
+                priority: task.priority,
+                selected: selected_task,
+                reason: if selected_task {
+                    "selected highest-priority runnable task".to_string()
+                } else {
+                    task.skip_reason
+                        .clone()
+                        .unwrap_or_else(|| "lower priority than selected task".to_string())
+                },
+            }
+        })
+        .collect()
 }
 
 #[must_use]
@@ -841,5 +952,70 @@ mod tests {
 
         let second_tick = scheduler.tick().expect("second tick should run");
         assert_eq!(second_tick.status, DurableSchedulerStatus::Idle);
+        assert_eq!(second_tick.selected_task_id, None);
+        assert!(second_tick.decision_trace.iter().any(|trace| {
+            trace.task_id == task.task_id
+                && !trace.selected
+                && trace.reason.contains("blocked without executable recovery")
+        }));
+    }
+
+    #[test]
+    fn scheduler_trace_skips_worker_waiting_task_and_selects_runnable_task() {
+        let (registry, waiting_task_id) =
+            registry_with_packet_task(vec!["python3 --version".to_string()]);
+        registry
+            .set_status(&waiting_task_id, TaskStatus::Running)
+            .expect("waiting task should run first");
+        let (_, runnable_task_id) = {
+            let task = registry.create("second", Some("runnable"));
+            let dag = PlanDag {
+                task_id: task.task_id.clone(),
+                root_id: task.task_id.clone(),
+                nodes: vec![crate::PlanDagNode {
+                    kind: crate::PlanNodeKind::Step,
+                    id: "node-1".to_string(),
+                    title: "Node".to_string(),
+                    parallelizable: false,
+                    estimated_effort: 1,
+                    candidate_tools: Vec::new(),
+                    notes: Vec::new(),
+                }],
+                edges: Vec::new(),
+            };
+            registry
+                .record_plan(&task.task_id, dag.clone(), PlanExecution::new(&dag))
+                .expect("plan");
+            (registry.clone(), task.task_id)
+        };
+        let workers = WorkerRegistry::new();
+        let scheduler = DurableTaskScheduler::with_workers(
+            registry.clone(),
+            VerificationRunner::new(None),
+            workers,
+        );
+
+        let first = scheduler.tick().expect("first tick should dispatch worker");
+        assert_eq!(
+            first.selected_task_id.as_deref(),
+            Some(waiting_task_id.as_str())
+        );
+        let second = scheduler
+            .tick()
+            .expect("second tick should skip worker wait");
+
+        assert_eq!(
+            second.selected_task_id.as_deref(),
+            Some(runnable_task_id.as_str())
+        );
+        assert!(second.decision_trace.iter().any(|trace| {
+            trace.task_id == waiting_task_id
+                && !trace.selected
+                && trace.reason.contains("waiting for worker")
+        }));
+        assert!(second
+            .decision_trace
+            .iter()
+            .any(|trace| { trace.task_id == runnable_task_id && trace.selected }));
     }
 }

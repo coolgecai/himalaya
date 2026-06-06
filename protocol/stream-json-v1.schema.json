@@ -107,6 +107,9 @@
           "$ref": "#/$defs/taskReportEvent"
         },
         {
+          "$ref": "#/$defs/taskReviewEvent"
+        },
+        {
           "$ref": "#/$defs/taskExecutionCommandEvent"
         },
         {
@@ -218,6 +221,7 @@
         "task_show",
         "task_status",
         "task_report",
+        "task_review",
         "task_execution",
         "task_recovery",
         "task_verification",
@@ -945,6 +949,46 @@
             },
             "route_feedback": {
               "type": "object"
+            }
+          }
+        }
+      ]
+    },
+    "taskReviewEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task",
+            "report",
+            "recommendations"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_review"
+            },
+            "task": {
+              "type": "object"
+            },
+            "report": {
+              "type": "object"
+            },
+            "failure_summary": {
+              "type": "object"
+            },
+            "recovery_summary": {
+              "type": "object"
+            },
+            "route_summary": {
+              "type": "object"
+            },
+            "memory_summary": {
+              "type": "object"
+            },
+            "recommendations": {
+              "type": "array"
             }
           }
         }
