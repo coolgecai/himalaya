@@ -200,7 +200,10 @@ pub use remote::{
     DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
 };
 pub use route_feedback_store::{RouteFeedbackSnapshot, RouteFeedbackStore, RouteFeedbackSummary};
-pub use runtime_events::{RuntimeEvent, RuntimeEventReporter};
+pub use runtime_events::{
+    append_runtime_event_log, read_runtime_event_log, RuntimeEvent, RuntimeEventEnvelope,
+    RuntimeEventLog, RuntimeEventReporter, RuntimeEventSeverity,
+};
 pub use sandbox::{
     build_linux_sandbox_command, detect_container_environment, detect_container_environment_from,
     resolve_sandbox_status, resolve_sandbox_status_for_request, ContainerEnvironment,

@@ -10733,56 +10733,105 @@ struct CliRuntimeEventReporter;
 
 impl runtime::RuntimeEventReporter for CliRuntimeEventReporter {
     fn emit_runtime_event(&self, event: &runtime::RuntimeEvent) {
+        let envelope = runtime::RuntimeEventEnvelope::from_runtime_event(event).ok();
+        if let Some(envelope) = envelope.as_ref() {
+            persist_cli_runtime_event(envelope);
+        }
         match event {
             runtime::RuntimeEvent::Decisioning(value) => {
-                print_stream_json_event(json!({
+                let mut payload = json!({
                     "type": "decisioning_event",
                     "decisioning_event": value,
-                }));
+                });
+                attach_runtime_event_envelope(&mut payload, envelope.as_ref());
+                print_stream_json_event(payload);
             }
             runtime::RuntimeEvent::PlanExecution(value) => {
-                print_stream_json_event(json!({
+                let mut payload = json!({
                     "type": "plan_execution_event",
                     "plan_execution_event": value,
-                }));
+                });
+                attach_runtime_event_envelope(&mut payload, envelope.as_ref());
+                print_stream_json_event(payload);
             }
             runtime::RuntimeEvent::TaskLedger(value) => {
-                print_stream_json_event(json!({
+                let mut payload = json!({
                     "type": "task_ledger_event",
                     "task_ledger_event": value,
-                }));
+                });
+                attach_runtime_event_envelope(&mut payload, envelope.as_ref());
+                print_stream_json_event(payload);
             }
             runtime::RuntimeEvent::ModelRoute(value) => {
-                print_stream_json_event(json!({
+                let mut payload = json!({
                     "type": "model_route_event",
                     "model_route_event": value,
-                }));
+                });
+                attach_runtime_event_envelope(&mut payload, envelope.as_ref());
+                print_stream_json_event(payload);
             }
             runtime::RuntimeEvent::TeamExecution(value) => {
-                print_stream_json_event(json!({
+                let mut payload = json!({
                     "type": "team_execution_event",
                     "team_execution_event": value,
-                }));
+                });
+                attach_runtime_event_envelope(&mut payload, envelope.as_ref());
+                print_stream_json_event(payload);
             }
             runtime::RuntimeEvent::Recovery(value) => {
-                print_stream_json_event(json!({
+                let mut payload = json!({
                     "type": "recovery_event",
                     "recovery_event": value,
-                }));
+                });
+                attach_runtime_event_envelope(&mut payload, envelope.as_ref());
+                print_stream_json_event(payload);
             }
             runtime::RuntimeEvent::RecoveryAction(value) => {
-                print_stream_json_event(json!({
+                let mut payload = json!({
                     "type": "recovery_action_event",
                     "recovery_action_event": value,
-                }));
+                });
+                attach_runtime_event_envelope(&mut payload, envelope.as_ref());
+                print_stream_json_event(payload);
             }
             runtime::RuntimeEvent::TaskExecution(value) => {
-                print_stream_json_event(json!({
+                let mut payload = json!({
                     "type": "task_execution_event",
                     "task_execution_event": value,
-                }));
+                });
+                attach_runtime_event_envelope(&mut payload, envelope.as_ref());
+                print_stream_json_event(payload);
             }
         }
+    }
+}
+
+fn runtime_event_log_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    Ok(cwd.join(".Himalaya").join("events").join("runtime.jsonl"))
+}
+
+fn attach_runtime_event_envelope(
+    payload: &mut Value,
+    envelope: Option<&runtime::RuntimeEventEnvelope>,
+) {
+    let Some(envelope) = envelope else {
+        return;
+    };
+    if let Value::Object(object) = payload {
+        object.insert("event".to_string(), json!(envelope));
+    }
+}
+
+fn persist_cli_runtime_event(envelope: &runtime::RuntimeEventEnvelope) {
+    let Ok(path) = runtime_event_log_path() else {
+        return;
+    };
+    if let Err(error) = runtime::append_runtime_event_log(&path, envelope) {
+        eprintln!(
+            "warning: failed to persist runtime event log at {}: {error}",
+            path.display()
+        );
     }
 }
 

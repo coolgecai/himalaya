@@ -21,6 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::{read_runtime_event_log, RuntimeEventEnvelope, RuntimeEventLog, RuntimeEventSeverity};
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -620,7 +622,9 @@ impl WorkerRegistry {
         };
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        fs::write(dir.join("workers.json"), format!("{json}\n"))
+        fs::write(dir.join("workers.json"), format!("{json}\n"))?;
+        append_worker_event_log_to_dir(dir, &snapshot.workers)?;
+        Ok(())
     }
 
     pub fn load_from_dir(dir: &Path) -> io::Result<Self> {
@@ -1116,6 +1120,50 @@ fn cleanup_worker_isolation(isolation: Option<&WorkerIsolation>) {
     }
 }
 
+fn worker_event_log_path(dir: &Path) -> PathBuf {
+    dir.join("events.jsonl")
+}
+
+fn append_worker_event_log_to_dir(dir: &Path, workers: &[Worker]) -> io::Result<()> {
+    let path = worker_event_log_path(dir);
+    let persisted_keys = read_runtime_event_log(&path)?
+        .into_iter()
+        .filter_map(|envelope| {
+            let worker_id = envelope.worker_id?;
+            let seq = envelope.payload.get("seq")?.as_u64()?;
+            Some((worker_id, seq))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let log = RuntimeEventLog::new(&path);
+    for worker in workers {
+        for event in &worker.events {
+            let key = (worker.worker_id.clone(), event.seq);
+            if persisted_keys.contains(&key) {
+                continue;
+            }
+            let payload = serde_json::to_value(event)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let severity = match event.kind {
+                WorkerEventKind::Failed
+                | WorkerEventKind::LeaseExpired
+                | WorkerEventKind::PromptMisdelivery => RuntimeEventSeverity::Warn,
+                _ => RuntimeEventSeverity::Info,
+            };
+            let envelope = RuntimeEventEnvelope::from_payload_at(
+                "worker_event",
+                payload,
+                None,
+                None,
+                Some(worker.worker_id.clone()),
+                event.timestamp,
+            )
+            .with_severity(severity);
+            log.append(&envelope)?;
+        }
+    }
+    Ok(())
+}
+
 fn normalize_loaded_worker(mut worker: Worker) -> Worker {
     if worker.heartbeat_at == 0 {
         worker.heartbeat_at = worker.updated_at.max(worker.created_at);
@@ -1579,6 +1627,47 @@ mod tests {
             .expect("ready observe should succeed");
         assert_eq!(ready.status, WorkerStatus::ReadyForPrompt);
         assert!(ready.last_error.is_none());
+    }
+
+    #[test]
+    fn persists_append_only_worker_event_log() {
+        let dir = unique_temp_dir("worker-events");
+        let cwd = dir.join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace should exist");
+        let registry = WorkerRegistry::new();
+        let worker = registry.create(cwd.to_string_lossy().as_ref(), &[], false);
+        registry
+            .observe(&worker.worker_id, "ready for input\n>")
+            .expect("worker should observe ready state");
+        let state_dir = dir.join("registry");
+
+        registry
+            .save_to_dir(&state_dir)
+            .expect("first save should persist");
+        registry
+            .save_to_dir(&state_dir)
+            .expect("second save should not duplicate");
+
+        let events_path = state_dir.join("events.jsonl");
+        let event_lines = std::fs::read_to_string(&events_path)
+            .expect("worker events jsonl should exist")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        assert_eq!(event_lines, 2);
+
+        let envelopes =
+            read_runtime_event_log(&events_path).expect("worker events should load as envelopes");
+        assert_eq!(envelopes.len(), 2);
+        assert!(envelopes.iter().all(|event| {
+            event.event_type == "worker_event"
+                && event.worker_id.as_deref() == Some(worker.worker_id.as_str())
+        }));
+        assert!(envelopes
+            .iter()
+            .any(|event| event.payload["kind"] == "ready_for_prompt"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -519,6 +519,8 @@ fn stream_json_decisioning_events_match_contract() {
         decisioning_events.len() >= 4,
         "expected decisioning event set: {events:?}"
     );
+    let first_envelope = &decisioning_events[0]["event"];
+    assert_runtime_event_envelope(first_envelope, "decisioning_event");
 
     let tool_selection = decisioning_events
         .iter()
@@ -616,6 +618,25 @@ fn stream_json_decisioning_events_match_contract() {
                 && event["team_execution_event"]["kind"] == "verification_passed"
         }),
         "expected verifier team execution event: {events:?}"
+    );
+
+    let runtime_events_path = workspace
+        .root
+        .join(".Himalaya")
+        .join("events")
+        .join("runtime.jsonl");
+    let runtime_events =
+        fs::read_to_string(&runtime_events_path).expect("runtime event log should be persisted");
+    let persisted = runtime_events
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("runtime event should be JSON"))
+        .collect::<Vec<_>>();
+    assert!(
+        persisted
+            .iter()
+            .any(|event| event["event_id"] == first_envelope["event_id"]),
+        "runtime event log should contain stdout envelope: {persisted:?}"
     );
 }
 
@@ -1401,6 +1422,21 @@ fn assert_non_empty_string(value: &Value) {
     assert!(
         value.as_str().is_some_and(|value| !value.is_empty()),
         "value should be a non-empty string: {value:?}"
+    );
+}
+
+fn assert_runtime_event_envelope(value: &Value, event_type: &str) {
+    assert_eq!(value["schema_version"], 1);
+    assert_non_empty_string(&value["event_id"]);
+    assert_eq!(value["event_type"], event_type);
+    assert!(
+        value["timestamp"].as_u64().is_some(),
+        "runtime envelope requires timestamp: {value:?}"
+    );
+    assert_eq!(value["severity"], "info");
+    assert!(
+        value["payload"].is_object(),
+        "runtime envelope requires object payload: {value:?}"
     );
 }
 
