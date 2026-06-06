@@ -626,6 +626,9 @@ enum TaskCliCommand {
     Show {
         task_id: String,
     },
+    Status {
+        task_id: String,
+    },
     Packet {
         command: TaskPacketCliCommand,
     },
@@ -1367,6 +1370,9 @@ fn parse_task_cli_command(args: &[String]) -> Result<TaskCliCommand, String> {
         Some(("show", [task_id])) => Ok(TaskCliCommand::Show {
             task_id: task_id.clone(),
         }),
+        Some(("status", [task_id])) => Ok(TaskCliCommand::Status {
+            task_id: task_id.clone(),
+        }),
         Some(("packet", rest)) => Ok(TaskCliCommand::Packet {
             command: parse_task_packet_cli_command(rest)?,
         }),
@@ -1442,7 +1448,7 @@ fn parse_task_cli_command(args: &[String]) -> Result<TaskCliCommand, String> {
             task_id: task_id.clone(),
         }),
         Some((other, _)) => Err(format!(
-            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
+            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|status <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
         )),
     }
 }
@@ -4784,6 +4790,18 @@ fn run_resume_command(
                         })),
                     })
                 }
+                TaskCliCommand::Status { task_id } => {
+                    let registry = load_task_registry()?;
+                    let task = registry
+                        .get(&task_id)
+                        .ok_or_else(|| format!("task not found: {task_id}"))?;
+                    let value = task_status_value(&registry, task, "task_status");
+                    Ok(ResumeCommandOutcome {
+                        session: session.clone(),
+                        message: Some(render_task_status_text(&value)),
+                        json: Some(value),
+                    })
+                }
                 TaskCliCommand::Packet {
                     command: TaskPacketCliCommand::Status { task_id },
                 } => {
@@ -7357,6 +7375,19 @@ fn run_task_command(
                 )?;
             }
         },
+        TaskCliCommand::Status { task_id } => {
+            let registry = load_task_registry()?;
+            let task = registry
+                .get(&task_id)
+                .ok_or_else(|| format!("task not found: {task_id}"))?;
+            let value = task_status_value(&registry, task, "task_status");
+            match output_format {
+                CliOutputFormat::Text => println!("{}", render_task_status_text(&value)),
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(value, output_format)?;
+                }
+            }
+        }
         TaskCliCommand::Packet { command } => {
             run_task_packet_command(command, output_format)?;
         }
@@ -7376,14 +7407,15 @@ fn run_task_command(
                 worker_registry.clone(),
             );
             let _ = engine.assign_team(&task_id)?;
-            let outcome = engine.execute(&task_id, from_node.as_deref())?;
+            let report =
+                engine.execute_with_recovery(&task_id, from_node.as_deref(), permission_mode)?;
             save_task_registry(&registry)?;
             save_worker_registry(&worker_registry)?;
             match output_format {
-                CliOutputFormat::Text => println!("{}", outcome.message),
+                CliOutputFormat::Text => println!("{}", report.message),
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_task_output(
-                        json!({"type":"task_execution","outcome":outcome}),
+                        json!({"type":"task_execution","outcome":report.outcome,"report":report}),
                         output_format,
                     )?;
                 }
@@ -8343,6 +8375,170 @@ fn task_packet_status_value(
         "event_log": event_log,
         "verification_handoff": verification_handoff,
     })
+}
+
+fn task_status_value(
+    registry: &runtime::TaskRegistry,
+    task: runtime::task_registry::Task,
+    event_type: &str,
+) -> Value {
+    let task_id = task.task_id.clone();
+    let policy = runtime::infer_verification_policy(task.task_packet.as_ref());
+    let verification_decision = if task_plan_all_succeeded(&task) {
+        runtime::evaluate_verification_result(policy, task.verification_result.as_ref())
+    } else {
+        task.task_packet
+            .as_ref()
+            .map_or(runtime::VerificationDecision::NotRequired, |packet| {
+                runtime::VerificationDecision::Required(runtime::build_verification_request(
+                    &task.task_id,
+                    packet,
+                    policy,
+                ))
+            })
+    };
+    let plan_progress = runtime::task_plan_progress(&task);
+    let failed_node = task
+        .plan
+        .as_ref()
+        .and_then(|plan| {
+            plan.execution
+                .nodes
+                .values()
+                .find(|node| node.status == runtime::PlanNodeStatus::Failed)
+        })
+        .map(|node| {
+            json!({
+                "node_id": node.node_id.clone(),
+                "failure_class": node.failure_class.clone(),
+                "output_summary": node.output_summary.clone(),
+                "retry_count": node.retry_count,
+            })
+        });
+    let failure = task_failure_classification(&task, &verification_decision);
+    let current_blocker = task_current_blocker(&task, &verification_decision, failed_node.as_ref());
+    let latest_recovery = task.recovery_events.last().cloned();
+    let latest_recovery_action = task.recovery_action_executions.last().cloned();
+    let ledger = registry.ledger_for_task(&task_id);
+    let event_log = registry.event_log_for_task(&task_id);
+    json!({
+        "type": event_type,
+        "task": task,
+        "plan_progress": plan_progress,
+        "verification": {
+            "policy": policy,
+            "decision": verification_decision,
+        },
+        "failure": failure,
+        "current_blocker": current_blocker,
+        "failed_node": failed_node,
+        "latest_recovery": latest_recovery,
+        "latest_recovery_action": latest_recovery_action,
+        "ledger": ledger,
+        "event_log": event_log,
+    })
+}
+
+fn task_failure_classification(
+    task: &runtime::task_registry::Task,
+    verification_decision: &runtime::VerificationDecision,
+) -> Option<runtime::FailureClassification> {
+    let classifier = runtime::FailureClassifier::new();
+    if let runtime::VerificationDecision::Failed { .. } = verification_decision {
+        if task.plan.as_ref().is_some_and(|plan| {
+            plan.execution
+                .nodes
+                .values()
+                .all(|node| node.status == runtime::PlanNodeStatus::Succeeded)
+        }) {
+            return classifier.classify_verification_decision(verification_decision);
+        }
+    }
+    task.plan.as_ref().and_then(|plan| {
+        plan.execution
+            .nodes
+            .values()
+            .find(|node| node.status == runtime::PlanNodeStatus::Failed)
+            .and_then(|node| node.failure_class.as_deref())
+            .map(|reason| classifier.classify_reason(reason))
+    })
+}
+
+fn task_plan_all_succeeded(task: &runtime::task_registry::Task) -> bool {
+    task.plan.as_ref().is_some_and(|plan| {
+        !plan.execution.nodes.is_empty()
+            && plan
+                .execution
+                .nodes
+                .values()
+                .all(|node| node.status == runtime::PlanNodeStatus::Succeeded)
+    })
+}
+
+fn task_current_blocker(
+    task: &runtime::task_registry::Task,
+    verification_decision: &runtime::VerificationDecision,
+    failed_node: Option<&Value>,
+) -> Value {
+    let blocker = match task.status {
+        runtime::TaskStatus::WaitingForPermission => Some("permission"),
+        runtime::TaskStatus::WaitingForVerification => Some("verification"),
+        runtime::TaskStatus::Blocked | runtime::TaskStatus::Failed => Some("blocked"),
+        _ => None,
+    };
+    let reason = match blocker {
+        Some("verification") => match verification_decision {
+            runtime::VerificationDecision::Failed { reason } => Some(reason.clone()),
+            runtime::VerificationDecision::Required(_) => Some("verification required".to_string()),
+            runtime::VerificationDecision::NotRequired | runtime::VerificationDecision::Passed => {
+                None
+            }
+        },
+        Some("blocked") => failed_node
+            .and_then(|node| node["failure_class"].as_str())
+            .map(ToOwned::to_owned)
+            .or_else(|| match verification_decision {
+                runtime::VerificationDecision::Failed { reason } => Some(reason.clone()),
+                runtime::VerificationDecision::Required(_) => {
+                    Some("verification required".to_string())
+                }
+                runtime::VerificationDecision::NotRequired
+                | runtime::VerificationDecision::Passed => None,
+            }),
+        Some("permission") => Some("permission required".to_string()),
+        _ => None,
+    };
+    json!({
+        "task_id": task.task_id.clone(),
+        "status": task.status,
+        "kind": blocker,
+        "reason": reason,
+    })
+}
+
+fn render_task_status_text(value: &Value) -> String {
+    let task = &value["task"];
+    let task_id = task["task_id"].as_str().unwrap_or("unknown");
+    let status = task["status"].as_str().unwrap_or("unknown");
+    let message = value["current_blocker"]["reason"]
+        .as_str()
+        .unwrap_or("no current blocker");
+    let mut lines = vec![format!(
+        "Task status\n  Task              {task_id}\n  Status            {status}\n  Blocker           {message}"
+    )];
+    if let Some(progress) = value.get("plan_progress").filter(|value| value.is_object()) {
+        lines.push(format!(
+            "  Plan              {}/{} succeeded, {} failed, {} running",
+            progress["succeeded"].as_u64().unwrap_or(0),
+            progress["total"].as_u64().unwrap_or(0),
+            progress["failed"].as_u64().unwrap_or(0),
+            progress["running"].as_u64().unwrap_or(0)
+        ));
+    }
+    if let Some(policy) = value["verification"]["policy"].as_str() {
+        lines.push(format!("  Verification      {policy}"));
+    }
+    lines.join("\n")
 }
 
 fn run_task_packet_command(
@@ -13973,6 +14169,13 @@ mod tests {
                 permission_mode: crate::default_permission_mode(),
                 compact: false,
                 reasoning_effort: None,
+            }
+        );
+        assert_eq!(
+            parse_task_cli_command(&["status".to_string(), "task-1".to_string()])
+                .expect("tasks status should parse"),
+            TaskCliCommand::Status {
+                task_id: "task-1".to_string(),
             }
         );
         assert_eq!(

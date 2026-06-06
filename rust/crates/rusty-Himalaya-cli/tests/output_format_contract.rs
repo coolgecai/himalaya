@@ -235,6 +235,19 @@ fn task_packet_commands_persist_structured_tasks() {
     assert_eq!(status["type"], "task_packet_status");
     assert_eq!(status["task"]["task_id"], task_id);
     assert!(status["task"]["task_packet"].is_object());
+    let loop_status = assert_json_command(
+        &root,
+        &["--output-format", "json", "tasks", "status", &task_id],
+    );
+    assert_eq!(loop_status["type"], "task_status");
+    assert_eq!(loop_status["task"]["task_id"], task_id);
+    assert_eq!(loop_status["verification"]["policy"], "full");
+    assert!(loop_status["plan_progress"].is_object());
+    assert!(loop_status["ledger"]
+        .as_array()
+        .expect("task status ledger")
+        .iter()
+        .any(|entry| entry["event"] == "plan_recorded"));
     assert!(root.join(".Himalaya/tasks/tasks.json").exists());
     assert!(root.join(".Himalaya/tasks/ledger.jsonl").exists());
     let event_log_path = root.join(".Himalaya/tasks/events.jsonl");

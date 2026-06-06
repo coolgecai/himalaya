@@ -168,7 +168,19 @@ impl RecoveryActionEngine {
                     result.blocked = true;
                 }
                 RecoveryActionKind::RerunVerification => {
-                    let _ = registry.set_status(&task_id, TaskStatus::WaitingForVerification);
+                    match registry.clear_verification(&task_id) {
+                        Ok(_) => {
+                            let _ =
+                                registry.set_status(&task_id, TaskStatus::WaitingForVerification);
+                            result.executed = true;
+                            result.reason = "cleared verification result for rerun".to_string();
+                        }
+                        Err(error) => {
+                            result.blocked = true;
+                            result.executed = false;
+                            result.reason = error;
+                        }
+                    }
                 }
                 RecoveryActionKind::SwitchModel
                 | RecoveryActionKind::RestartPlugin

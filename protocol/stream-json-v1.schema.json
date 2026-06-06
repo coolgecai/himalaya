@@ -98,6 +98,9 @@
           "$ref": "#/$defs/taskShowEvent"
         },
         {
+          "$ref": "#/$defs/taskStatusEvent"
+        },
+        {
           "$ref": "#/$defs/taskExecutionCommandEvent"
         },
         {
@@ -206,6 +209,7 @@
         "recovery_suggestion",
         "task_list",
         "task_show",
+        "task_status",
         "task_execution",
         "task_recovery",
         "task_verification",
@@ -808,6 +812,45 @@
               "const": "task_show"
             },
             "task": {
+              "type": "object"
+            },
+            "ledger": {
+              "type": "array"
+            }
+          }
+        }
+      ]
+    },
+    "taskStatusEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "task",
+            "plan_progress",
+            "verification",
+            "current_blocker",
+            "ledger"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_status"
+            },
+            "task": {
+              "type": "object"
+            },
+            "plan_progress": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "verification": {
+              "type": "object"
+            },
+            "current_blocker": {
               "type": "object"
             },
             "ledger": {

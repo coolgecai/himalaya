@@ -37,6 +37,7 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "recovery_suggestion",
         "task_list",
         "task_show",
+        "task_status",
         "task_execution",
         "task_recovery",
         "task_verification",
@@ -1260,6 +1261,28 @@ fn assert_stream_event_schema(event: &Value) {
             assert!(
                 event["ledger"].is_array(),
                 "task_show requires ledger array: {event:?}"
+            );
+        }
+        "task_status" => {
+            assert!(
+                event["task"].is_object(),
+                "task_status requires task object: {event:?}"
+            );
+            assert!(
+                event.get("plan_progress").is_some(),
+                "task_status requires plan_progress: {event:?}"
+            );
+            assert!(
+                event["verification"].is_object(),
+                "task_status requires verification object: {event:?}"
+            );
+            assert!(
+                event["current_blocker"].is_object(),
+                "task_status requires current_blocker object: {event:?}"
+            );
+            assert!(
+                event["ledger"].is_array(),
+                "task_status requires ledger array: {event:?}"
             );
         }
         "task_node_retry" => {
