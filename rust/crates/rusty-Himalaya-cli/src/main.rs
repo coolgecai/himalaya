@@ -56,7 +56,7 @@ use runtime::{
     PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ReasoningStep,
     RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tools::{
     execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
@@ -326,7 +326,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Cron {
             command,
             output_format,
-        } => run_cron_command(command, output_format)?,
+            permission_mode,
+        } => run_cron_command(command, output_format, permission_mode)?,
         CliAction::Routes {
             command,
             output_format,
@@ -500,6 +501,7 @@ enum CliAction {
     Cron {
         command: CronCliCommand,
         output_format: CliOutputFormat,
+        permission_mode: PermissionMode,
     },
     Routes {
         command: RouteCliCommand,
@@ -764,6 +766,7 @@ enum CronCliCommand {
     /// prompts run this invocation as a runaway guard.
     Run {
         max_fires: usize,
+        max_ticks: usize,
     },
 }
 
@@ -1175,6 +1178,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "cron" => Ok(CliAction::Cron {
             command: parse_cron_cli_command(&rest[1..])?,
             output_format,
+            permission_mode: permission_mode_override.unwrap_or(PermissionMode::ReadOnly),
         }),
         "routes" | "route" => Ok(CliAction::Routes {
             command: parse_route_cli_command(&rest[1..])?,
@@ -1814,26 +1818,49 @@ fn parse_cron_cli_command(args: &[String]) -> Result<CronCliCommand, String> {
             cron_id: cron_id.clone(),
         }),
         Some(("run", rest)) => {
-            // Optional `--max-fires N` (default 16).
+            // Optional runaway guards: `--max-fires N` bounds due cron entries
+            // and `--max-ticks N` bounds durable scheduler ticks after enqueue.
             let mut max_fires = 16usize;
-            let mut iter = rest.iter();
-            while let Some(arg) = iter.next() {
-                match arg.as_str() {
+            let mut max_ticks = 1usize;
+            let mut index = 0;
+            while index < rest.len() {
+                match rest[index].as_str() {
                     "--max-fires" => {
-                        let value = iter
-                            .next()
+                        let value = rest
+                            .get(index + 1)
                             .ok_or_else(|| "--max-fires requires a value".to_string())?;
-                        max_fires = value
-                            .parse::<usize>()
-                            .map_err(|_| format!("invalid --max-fires value: {value}"))?;
+                        max_fires = parse_positive_usize("--max-fires", value)?;
+                        index += 2;
+                    }
+                    value if value.starts_with("--max-fires=") => {
+                        max_fires = parse_positive_usize("--max-fires", &value[12..])?;
+                        index += 1;
+                    }
+                    "--max-ticks" => {
+                        let value = rest
+                            .get(index + 1)
+                            .ok_or_else(|| "--max-ticks requires a value".to_string())?;
+                        max_ticks = parse_positive_usize("--max-ticks", value)?;
+                        index += 2;
+                    }
+                    value if value.starts_with("--max-ticks=") => {
+                        max_ticks = parse_positive_usize("--max-ticks", &value[12..])?;
+                        index += 1;
+                    }
+                    "--once" => {
+                        max_ticks = 1;
+                        index += 1;
                     }
                     other => return Err(format!("unknown cron run argument: {other}")),
                 }
             }
-            Ok(CronCliCommand::Run { max_fires })
+            Ok(CronCliCommand::Run {
+                max_fires,
+                max_ticks,
+            })
         }
         Some((other, _)) => Err(format!(
-            "unknown cron command: {other}\nUsage: Himalaya cron [list|add <5-field-cron> <prompt>|remove <cron-id>|run [--max-fires N]]"
+            "unknown cron command: {other}\nUsage: Himalaya cron [list|add <5-field-cron> <prompt>|remove <cron-id>|run [--max-fires N] [--max-ticks N]]"
         )),
     }
 }
@@ -2031,6 +2058,7 @@ fn parse_direct_slash_cli_action(
         Ok(Some(SlashCommand::Cron { args })) => Ok(CliAction::Cron {
             command: parse_cron_cli_command(&split_slash_remainder(args.as_deref()))?,
             output_format,
+            permission_mode: PermissionMode::ReadOnly,
         }),
         Ok(Some(SlashCommand::Benchmark { args })) => Ok(CliAction::Benchmark {
             command: parse_benchmark_cli_command(&split_slash_remainder(args.as_deref()))?,
@@ -6362,6 +6390,7 @@ impl LiveCli {
                 run_cron_command(
                     parse_cron_cli_command(&split_slash_remainder(args.as_deref()))?,
                     CliOutputFormat::Text,
+                    PermissionMode::ReadOnly,
                 )?;
                 false
             }
@@ -7255,6 +7284,7 @@ fn print_cron_output(
 fn run_cron_command(
     command: CronCliCommand,
     output_format: CliOutputFormat,
+    permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         CronCliCommand::List => match output_format {
@@ -7293,72 +7323,264 @@ fn run_cron_command(
                 }
             }
         }
-        CronCliCommand::Run { max_fires } => {
-            run_cron_tick_command(max_fires, output_format)?;
+        CronCliCommand::Run {
+            max_fires,
+            max_ticks,
+        } => {
+            run_cron_tick_command(max_fires, max_ticks, output_format, permission_mode)?;
         }
     }
     Ok(())
 }
 
-/// Fire all cron entries due now. Each fire re-invokes this CLI binary with the
-/// cron's prompt as an independent agent run (genuine cron-daemon behavior),
-/// inheriting the environment so it reaches the configured API. Successful
-/// fires are recorded so they will not re-fire within the same minute.
+#[derive(Debug, Clone, Serialize)]
+struct CronScheduledTaskReport {
+    cron_id: String,
+    task_id: String,
+    task_type: String,
+    prompt: String,
+    memory_context: runtime::TaskMemoryContext,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CronRunFailure {
+    cron_id: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CronRunSummary {
+    due: usize,
+    fired: usize,
+    failed: usize,
+    scheduler_runs: usize,
+    scheduler_errors: usize,
+    max_fires: usize,
+    max_ticks: usize,
+    permission_mode: String,
+}
+
+/// Fire all cron entries due now by creating durable task packets and handing
+/// them to the persistent scheduler daemon. A cron run is recorded only after
+/// its task has been created and planned successfully, so crash recovery can
+/// resume from `.Himalaya/tasks` and `.Himalaya/scheduler`.
 fn run_cron_tick_command(
     max_fires: usize,
+    max_ticks: usize,
     output_format: CliOutputFormat,
+    permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let registry = load_cron_registry()?;
+    let task_registry = load_task_registry()?;
+    let worker_registry = load_worker_registry()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let exe = std::env::current_exe()?;
-    let report = registry.run_cron_tick(now, max_fires, |entry| {
-        let output = std::process::Command::new(&exe)
-            .arg(&entry.prompt)
-            .output()
-            .map_err(|error| error.to_string())?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "cron fire exited with status {:?}",
-                output.status.code()
-            ))
+    let due_count = registry.due_entries(now).len();
+    let mut warnings = Vec::new();
+    let memory_store = load_task_memory_store()
+        .ok()
+        .filter(|store| !store.entries().is_empty())
+        .unwrap_or_else(|| runtime::TaskMemoryStore::from_tasks(&task_registry.list(None)));
+    if memory_store.entries().is_empty() {
+        warnings
+            .push("task memory store is empty; cron task starts without prior memory".to_string());
+    }
+    let mut created_tasks = Vec::new();
+    let mut report = runtime::team_cron_registry::CronTickReport::default();
+    let mut due_entries = registry.due_entries(now);
+    due_entries.sort_by(|left, right| left.cron_id.cmp(&right.cron_id));
+    for entry in due_entries.into_iter().take(max_fires) {
+        match create_durable_cron_task(&task_registry, &entry, &memory_store).and_then(
+            |scheduled| {
+                save_task_registry(&task_registry).map_err(|error| error.to_string())?;
+                registry.record_run(&entry.cron_id)?;
+                save_cron_registry(&registry).map_err(|error| error.to_string())?;
+                Ok(scheduled)
+            },
+        ) {
+            Ok(scheduled) => {
+                report.fired.push(entry.cron_id);
+                created_tasks.push(scheduled);
+            }
+            Err(reason) => report.failed.push((entry.cron_id, reason)),
         }
-    });
+    }
+    save_task_registry(&task_registry)?;
+    save_worker_registry(&worker_registry)?;
     save_cron_registry(&registry)?;
 
-    match output_format {
-        CliOutputFormat::Text => {
-            if report.is_empty() {
-                println!("no cron entries were due");
-            } else {
-                for cron_id in &report.fired {
-                    println!("fired cron {cron_id}");
+    let runner = runtime::VerificationRunner::new(Some(env::current_dir()?));
+    let scheduler = runtime::DurableTaskScheduler::with_workers(
+        task_registry.clone(),
+        runner,
+        worker_registry.clone(),
+    )
+    .with_permission_mode(permission_mode);
+    let daemon = runtime::SchedulerDaemon::new(scheduler, scheduler_state_dir()?);
+    let mut scheduler_runs = Vec::new();
+    let mut scheduler_errors = Vec::new();
+    if !created_tasks.is_empty() {
+        for _ in 0..max_ticks {
+            match daemon.run_once() {
+                Ok(run) => {
+                    let idle = run.tick.status == runtime::DurableSchedulerStatus::Idle;
+                    scheduler_runs.push(run);
+                    save_task_registry(&task_registry)?;
+                    save_worker_registry(&worker_registry)?;
+                    if idle {
+                        break;
+                    }
                 }
-                for (cron_id, reason) in &report.failed {
-                    println!("cron {cron_id} failed: {reason}");
+                Err(error) => {
+                    scheduler_errors.push(error.to_string());
+                    break;
                 }
-            }
-        }
-        CliOutputFormat::Json | CliOutputFormat::StreamJson => {
-            for cron_id in &report.fired {
-                print_cron_output(
-                    json!({"type":"cron_fired","cron_id":cron_id}),
-                    output_format,
-                )?;
-            }
-            for (cron_id, reason) in &report.failed {
-                print_cron_output(
-                    json!({"type":"cron_fire_failed","cron_id":cron_id,"reason":reason}),
-                    output_format,
-                )?;
             }
         }
     }
+
+    let failures = report
+        .failed
+        .iter()
+        .map(|(cron_id, reason)| CronRunFailure {
+            cron_id: cron_id.clone(),
+            reason: reason.clone(),
+        })
+        .collect::<Vec<_>>();
+    let summary = CronRunSummary {
+        due: due_count,
+        fired: created_tasks.len(),
+        failed: failures.len(),
+        scheduler_runs: scheduler_runs.len(),
+        scheduler_errors: scheduler_errors.len(),
+        max_fires,
+        max_ticks,
+        permission_mode: permission_mode.as_str().to_string(),
+    };
+    let value = json!({
+        "type": "cron_run",
+        "summary": summary,
+        "created_tasks": created_tasks,
+        "failed": failures,
+        "scheduler": {
+            "runs": scheduler_runs,
+            "errors": scheduler_errors,
+            "state": daemon.load_state().ok(),
+            "state_path": daemon.state_path(),
+            "events_path": daemon.events_path(),
+        },
+        "paths": {
+            "cron_registry": cron_registry_dir()?.join("crons.json"),
+            "task_registry": task_registry_dir()?.join("tasks.json"),
+            "worker_registry": worker_registry_dir()?.join("workers.json"),
+            "task_memory": task_memory_dir()?.join("tasks.json"),
+            "route_feedback": route_feedback_dir()?.join("feedback.json"),
+        },
+        "warnings": warnings,
+    });
+
+    match output_format {
+        CliOutputFormat::Text => {
+            if value["summary"]["due"].as_u64().unwrap_or(0) == 0 {
+                println!("no cron entries were due");
+            } else {
+                println!("{}", render_cron_run_text(&value));
+            }
+        }
+        CliOutputFormat::Json => print_cron_output(value, output_format)?,
+        CliOutputFormat::StreamJson => {
+            for task in value["created_tasks"].as_array().into_iter().flatten() {
+                print_cron_output(
+                    json!({
+                        "type":"cron_fired",
+                        "cron_id":task["cron_id"],
+                        "task_id":task["task_id"],
+                    }),
+                    output_format,
+                )?;
+            }
+            for failure in value["failed"].as_array().into_iter().flatten() {
+                print_cron_output(
+                    json!({
+                        "type":"cron_fire_failed",
+                        "cron_id":failure["cron_id"],
+                        "reason":failure["reason"],
+                    }),
+                    output_format,
+                )?;
+            }
+            print_cron_output(value, output_format)?;
+        }
+    }
     Ok(())
+}
+
+fn create_durable_cron_task(
+    registry: &runtime::TaskRegistry,
+    entry: &runtime::team_cron_registry::CronEntry,
+    memory_store: &runtime::TaskMemoryStore,
+) -> Result<CronScheduledTaskReport, String> {
+    let packet = runtime::TaskPacket {
+        objective: entry.prompt.trim().to_string(),
+        scope: "cron-scheduled-agent".to_string(),
+        repo: ".".to_string(),
+        branch_policy: format!("cron:{}; use current branch", entry.cron_id),
+        acceptance_tests: Vec::new(),
+        commit_policy: "do not commit automatically from cron".to_string(),
+        reporting_contract: "enqueue durable task, run scheduler daemon, persist task memory and route feedback".to_string(),
+        escalation_policy: "background cron recovery is policy-gated; block when user permission or elevated access is required".to_string(),
+    };
+    let task = registry
+        .create_from_packet(packet)
+        .map_err(|error| error.to_string())?;
+    let task = persist_task_packet_plan(registry, &task).map_err(|error| error.to_string())?;
+    let memory_context = memory_store.context_for_task(&task);
+    Ok(CronScheduledTaskReport {
+        cron_id: entry.cron_id.clone(),
+        task_id: task.task_id.clone(),
+        task_type: runtime::TaskMemoryStore::task_type_for(&task),
+        prompt: entry.prompt.clone(),
+        memory_context,
+    })
+}
+
+fn render_cron_run_text(value: &Value) -> String {
+    let summary = &value["summary"];
+    let mut lines = vec![format!(
+        "Cron run\n  Due               {}\n  Fired             {}\n  Failed            {}\n  Scheduler ticks   {}\n  Permission mode   {}",
+        summary["due"].as_u64().unwrap_or(0),
+        summary["fired"].as_u64().unwrap_or(0),
+        summary["failed"].as_u64().unwrap_or(0),
+        summary["scheduler_runs"].as_u64().unwrap_or(0),
+        summary["permission_mode"].as_str().unwrap_or("read-only"),
+    )];
+    for task in value["created_tasks"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "  Fired cron        {} -> {}",
+            task["cron_id"].as_str().unwrap_or_default(),
+            task["task_id"].as_str().unwrap_or_default()
+        ));
+    }
+    for failure in value["failed"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "  Failed cron       {}: {}",
+            failure["cron_id"].as_str().unwrap_or_default(),
+            failure["reason"].as_str().unwrap_or_default()
+        ));
+    }
+    for error in value["scheduler"]["errors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        lines.push(format!(
+            "  Scheduler error   {}",
+            error.as_str().unwrap_or_default()
+        ));
+    }
+    lines.join("\n")
 }
 fn print_task_json(value: Value) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", serde_json::to_string_pretty(&value)?);
@@ -15544,6 +15766,28 @@ mod tests {
                     description: None,
                 },
                 output_format: CliOutputFormat::Text,
+                permission_mode: PermissionMode::ReadOnly,
+            }
+        );
+
+        assert_eq!(
+            parse_args(&[
+                "--permission-mode".to_string(),
+                "workspace-write".to_string(),
+                "cron".to_string(),
+                "run".to_string(),
+                "--max-fires=2".to_string(),
+                "--max-ticks".to_string(),
+                "3".to_string(),
+            ])
+            .expect("cron run should parse"),
+            CliAction::Cron {
+                command: CronCliCommand::Run {
+                    max_fires: 2,
+                    max_ticks: 3,
+                },
+                output_format: CliOutputFormat::Text,
+                permission_mode: PermissionMode::WorkspaceWrite,
             }
         );
 

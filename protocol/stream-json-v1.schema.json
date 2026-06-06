@@ -158,6 +158,9 @@
           "$ref": "#/$defs/taskSchedulerDaemonLogsEvent"
         },
         {
+          "$ref": "#/$defs/cronEvent"
+        },
+        {
           "$ref": "#/$defs/routeFeedbackSummaryEvent"
         },
         {
@@ -241,6 +244,12 @@
         "task_scheduler_daemon_run",
         "task_scheduler_daemon_status",
         "task_scheduler_daemon_logs",
+        "cron_list",
+        "cron_create",
+        "cron_delete",
+        "cron_fired",
+        "cron_fire_failed",
+        "cron_run",
         "route_feedback_summary",
         "benchmark_suite",
         "benchmark_task",
@@ -1587,6 +1596,48 @@
             },
             "events_path": {
               "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "cronEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "cron_list",
+                "cron_create",
+                "cron_delete",
+                "cron_fired",
+                "cron_fire_failed",
+                "cron_run"
+              ]
+            },
+            "cron_id": {
+              "type": "string"
+            },
+            "task_id": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "object"
+            },
+            "created_tasks": {
+              "type": "array"
+            },
+            "failed": {
+              "type": "array"
+            },
+            "scheduler": {
+              "type": "object"
             }
           }
         }

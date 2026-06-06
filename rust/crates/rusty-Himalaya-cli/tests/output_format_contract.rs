@@ -669,6 +669,62 @@ fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
 }
 
 #[test]
+fn cron_run_creates_durable_task_and_scheduler_state() {
+    let root = unique_temp_dir("cron-durable-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let created = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "cron",
+            "add",
+            "* * * * *",
+            "Inspect scheduler queue",
+        ],
+    );
+    assert_eq!(created["type"], "cron_create");
+    let cron_id = created["cron"]["cron_id"]
+        .as_str()
+        .expect("cron id")
+        .to_string();
+
+    let run = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "cron",
+            "run",
+            "--max-fires",
+            "1",
+            "--max-ticks",
+            "1",
+        ],
+    );
+    assert_eq!(run["type"], "cron_run");
+    assert_eq!(run["summary"]["due"], 1);
+    assert_eq!(run["summary"]["fired"], 1);
+    assert_eq!(run["summary"]["failed"], 0);
+    assert_eq!(run["summary"]["permission_mode"], "read-only");
+    assert_eq!(run["created_tasks"][0]["cron_id"], cron_id);
+    assert_eq!(
+        run["created_tasks"][0]["task_type"],
+        "packet:cron-scheduled-agent"
+    );
+    assert!(run["created_tasks"][0]["memory_context"].is_object());
+    assert!(run["scheduler"]["runs"]
+        .as_array()
+        .expect("scheduler runs")
+        .iter()
+        .any(|entry| entry["tick"]["selected_task_id"] == run["created_tasks"][0]["task_id"]));
+    assert!(root.join(".Himalaya/tasks/tasks.json").exists());
+    assert!(root.join(".Himalaya/memory/tasks.json").exists());
+    assert!(root.join(".Himalaya/scheduler/state.json").exists());
+}
+
+#[test]
 fn route_feedback_summary_emits_metric_summaries() {
     let root = unique_temp_dir("route-feedback-summary-json");
     fs::create_dir_all(root.join(".Himalaya/routes")).expect("route feedback dir should exist");

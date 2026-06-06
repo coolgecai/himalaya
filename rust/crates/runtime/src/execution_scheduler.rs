@@ -132,6 +132,8 @@ pub struct SchedulerDaemonRun {
     pub state: SchedulerDaemonState,
     pub tick: DurableSchedulerTick,
     pub event: SchedulerDaemonEvent,
+    pub recovery_event: Option<SchedulerDaemonEvent>,
+    pub recovered_stale_lock: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +176,7 @@ impl SchedulerDaemon {
     pub fn run_once(&self) -> io::Result<SchedulerDaemonRun> {
         fs::create_dir_all(&self.state_dir)?;
         let lock = SchedulerDaemonLock::acquire(self.lock_path())?;
+        let recovered_stale_lock = lock.recovered_stale_lock;
         let previous_state = self.load_state().ok();
         let tick = self.scheduler.tick().map_err(io::Error::other)?;
         let now = scheduler_now_secs();
@@ -194,9 +197,20 @@ impl SchedulerDaemon {
             message: tick.message.clone(),
         };
         self.save_state(&state)?;
+        let recovery_event = if recovered_stale_lock {
+            Some(self.append_recover_stale_lock_event(&state)?)
+        } else {
+            None
+        };
         let event = self.append_event(&state, &tick)?;
         drop(lock);
-        Ok(SchedulerDaemonRun { state, tick, event })
+        Ok(SchedulerDaemonRun {
+            state,
+            tick,
+            event,
+            recovery_event,
+            recovered_stale_lock,
+        })
     }
 
     pub fn load_state(&self) -> io::Result<SchedulerDaemonState> {
@@ -225,7 +239,7 @@ impl SchedulerDaemon {
         };
         self.save_state(&state)?;
         let event = SchedulerDaemonEvent {
-            seq: state.tick_count.saturating_add(1),
+            seq: self.next_event_seq()?,
             timestamp: state.updated_at,
             event: "stop".to_string(),
             status: state.status,
@@ -275,12 +289,31 @@ impl SchedulerDaemon {
         tick: &DurableSchedulerTick,
     ) -> io::Result<SchedulerDaemonEvent> {
         let event = SchedulerDaemonEvent {
-            seq: state.tick_count,
+            seq: self.next_event_seq()?,
             timestamp: state.updated_at,
             event: "tick".to_string(),
             status: state.status,
             selected_task_id: tick.selected_task_id.clone(),
             message: tick.message.clone(),
+        };
+        self.append_event_line(&event)?;
+        Ok(event)
+    }
+
+    fn append_recover_stale_lock_event(
+        &self,
+        state: &SchedulerDaemonState,
+    ) -> io::Result<SchedulerDaemonEvent> {
+        let event = SchedulerDaemonEvent {
+            seq: self.next_event_seq()?,
+            timestamp: state.updated_at,
+            event: "recover_stale_lock".to_string(),
+            status: state.status,
+            selected_task_id: None,
+            message: format!(
+                "recovered stale scheduler lock: {}",
+                state.lock_path.display()
+            ),
         };
         self.append_event_line(&event)?;
         Ok(event)
@@ -296,10 +329,23 @@ impl SchedulerDaemon {
         writeln!(file, "{line}")?;
         Ok(())
     }
+
+    fn next_event_seq(&self) -> io::Result<u64> {
+        match fs::read_to_string(self.events_path()) {
+            Ok(contents) => Ok(contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+                .saturating_add(1) as u64),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(1),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 struct SchedulerDaemonLock {
     path: PathBuf,
+    recovered_stale_lock: bool,
 }
 
 impl SchedulerDaemonLock {
@@ -310,7 +356,9 @@ impl SchedulerDaemonLock {
                 if error.kind() == io::ErrorKind::AlreadyExists && lock_owner_is_stale(&path) =>
             {
                 let _ = fs::remove_file(&path);
-                Self::create(path)
+                let mut lock = Self::create(path)?;
+                lock.recovered_stale_lock = true;
+                Ok(lock)
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -324,7 +372,10 @@ impl SchedulerDaemonLock {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
                 writeln!(file, "{}", std::process::id())?;
-                Ok(Self { path })
+                Ok(Self {
+                    path,
+                    recovered_stale_lock: false,
+                })
             }
             Err(error) => Err(error),
         }
@@ -926,6 +977,18 @@ mod tests {
 
         assert_eq!(run.tick.selected_task_id.as_deref(), Some(task_id.as_str()));
         assert_eq!(run.state.tick_count, 1);
+        assert!(run.recovered_stale_lock);
+        assert_eq!(
+            run.recovery_event
+                .as_ref()
+                .map(|event| event.event.as_str()),
+            Some("recover_stale_lock")
+        );
+        assert!(daemon
+            .load_events()
+            .expect("events should load")
+            .iter()
+            .any(|event| event.event == "recover_stale_lock"));
         assert!(!daemon.lock_path().exists());
         let _ = std::fs::remove_dir_all(&state_dir);
     }

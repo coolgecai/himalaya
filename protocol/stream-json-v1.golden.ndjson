@@ -20,6 +20,7 @@
 {"type":"task_scheduler_daemon_run","runs":[],"state":null,"protocol_version":1}
 {"type":"task_scheduler_daemon_status","state":null,"state_path":"/tmp/golden-state.json","events_path":"/tmp/golden-events.jsonl","protocol_version":1}
 {"type":"task_scheduler_daemon_logs","events":[],"events_path":"/tmp/golden-events.jsonl","protocol_version":1}
+{"type":"cron_run","summary":{"due":1,"fired":1,"failed":0,"scheduler_runs":1,"scheduler_errors":0,"max_fires":16,"max_ticks":1,"permission_mode":"read-only"},"created_tasks":[{"cron_id":"cron-golden","task_id":"task-golden","task_type":"packet:cron-scheduled-agent","memory_context":{"task_type":"packet:cron-scheduled-agent","similar_count":0,"recommendations":["No memory-informed planning adjustment is available yet."]}}],"failed":[],"scheduler":{"runs":[],"errors":[],"state":null},"protocol_version":1}
 {"type":"route_feedback_summary","summaries":[{"phase":"coding","model":"sonnet","total":2,"failures":0,"recovery_triggered":0,"success_rate":1,"avg_latency_ms":1200,"avg_tokens":3000,"avg_cost_usd":0.02}],"feedback_count":2,"feedback_path":"/tmp/golden-feedback.json","protocol_version":1}
 {"type":"benchmark_suite","suite_id":"complex-coding-agent-v1","version":"2026.05","tasks":[{"id":"task-golden","title":"Golden task"}],"protocol_version":1}
 {"type":"benchmark_task","task":{"id":"task-golden","title":"Golden task"},"protocol_version":1}

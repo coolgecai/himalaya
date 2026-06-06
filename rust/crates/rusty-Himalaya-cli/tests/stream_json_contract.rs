@@ -57,6 +57,12 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "task_scheduler_daemon_run",
         "task_scheduler_daemon_status",
         "task_scheduler_daemon_logs",
+        "cron_list",
+        "cron_create",
+        "cron_delete",
+        "cron_fired",
+        "cron_fire_failed",
+        "cron_run",
         "route_feedback_summary",
         "benchmark_suite",
         "benchmark_task",
@@ -186,6 +192,7 @@ fn golden_stream_json_transcript_matches_contract() {
         "recovery_action_event",
         "task_execution_event",
         "task_scheduler_daemon_logs",
+        "cron_run",
         "route_feedback_summary",
         "benchmark_run",
         "worker_spawn",
@@ -937,21 +944,16 @@ fn team_convergence_drives_roles_end_to_end() {
 
 #[test]
 fn cron_run_fires_due_entry_end_to_end() {
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
-    let server = runtime
-        .block_on(MockAnthropicService::spawn())
-        .expect("mock service should start");
     let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-cron-run"));
     workspace.create();
 
-    // Helper: run an arbitrary CLI invocation in the workspace against the mock.
+    // Helper: run an arbitrary CLI invocation in the workspace.
     let run_cli = |args: &[&str]| -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_Himalaya"));
         command
             .current_dir(&workspace.root)
             .env_clear()
             .env("ANTHROPIC_API_KEY", "test-stream-json-key")
-            .env("ANTHROPIC_BASE_URL", server.base_url().as_str())
             .env("Himalaya_CONFIG_HOME", &workspace.config_home)
             .env("HOME", &workspace.home)
             .env("NO_COLOR", "1")
@@ -960,22 +962,45 @@ fn cron_run_fires_due_entry_end_to_end() {
         command.output().expect("Himalaya should launch")
     };
 
-    // Seed a cron due every minute whose prompt selects the mock scenario.
-    let add = run_cli(&[
-        "cron",
-        "add",
-        "* * * * *",
-        &format!("{SCENARIO_PREFIX}streaming_text"),
-    ]);
+    // Seed a cron due every minute. Firing creates a durable task instead of
+    // invoking the model inline.
+    let add = run_cli(&["cron", "add", "* * * * *", "Inspect scheduler health"]);
     assert_success(&add);
 
-    // Fire due crons; each fire re-invokes the binary against the mock.
-    let run = run_cli(&["cron", "run", "--output-format", "stream-json"]);
+    // Fire due crons; each fire creates a persisted task and drives one
+    // scheduler daemon tick.
+    let run = run_cli(&[
+        "cron",
+        "run",
+        "--max-ticks",
+        "1",
+        "--output-format",
+        "stream-json",
+    ]);
     assert_success(&run);
     let events = parse_stream_json_stdout(&run.stdout);
     assert!(
         events.iter().any(|event| event["type"] == "cron_fired"),
         "expected a cron_fired event: {events:?}"
+    );
+    let cron_run = events
+        .iter()
+        .find(|event| event["type"] == "cron_run")
+        .expect("expected a cron_run event");
+    assert_eq!(cron_run["summary"]["fired"], 1);
+    assert_eq!(cron_run["summary"]["permission_mode"], "read-only");
+    assert_eq!(
+        cron_run["created_tasks"][0]["task_type"],
+        "packet:cron-scheduled-agent"
+    );
+    assert!(cron_run["created_tasks"][0]["task_id"].as_str().is_some());
+    assert!(cron_run["created_tasks"][0]["memory_context"].is_object());
+    assert!(
+        cron_run["scheduler"]["runs"]
+            .as_array()
+            .expect("scheduler runs array")
+            .len()
+            >= 1
     );
 
     // The fired entry's run was recorded in the persisted registry.
@@ -992,6 +1017,42 @@ fn cron_run_fires_due_entry_end_to_end() {
         run_count >= 1,
         "fired cron should have run_count >= 1: {crons}"
     );
+    let task_id = cron_run["created_tasks"][0]["task_id"]
+        .as_str()
+        .expect("task id should be present");
+    let tasks_path = workspace
+        .root
+        .join(".Himalaya")
+        .join("tasks")
+        .join("tasks.json");
+    let tasks: Value =
+        serde_json::from_str(&fs::read_to_string(&tasks_path).expect("tasks.json should exist"))
+            .expect("tasks.json should parse");
+    assert!(tasks["tasks"]
+        .as_array()
+        .expect("tasks array")
+        .iter()
+        .any(|task| task["task_id"] == task_id && task["task_packet"].is_object()));
+    let memory_path = workspace
+        .root
+        .join(".Himalaya")
+        .join("memory")
+        .join("tasks.json");
+    let memory: Value =
+        serde_json::from_str(&fs::read_to_string(&memory_path).expect("memory should exist"))
+            .expect("memory should parse");
+    assert!(memory["entries"]
+        .as_array()
+        .expect("memory entries")
+        .iter()
+        .any(|entry| entry["task_id"] == task_id
+            && entry["task_type"] == "packet:cron-scheduled-agent"));
+    assert!(workspace
+        .root
+        .join(".Himalaya")
+        .join("scheduler")
+        .join("state.json")
+        .exists());
 }
 
 fn run_stream_json_case(
@@ -1416,6 +1477,40 @@ fn assert_stream_event_schema(event: &Value) {
                 "task_scheduler_daemon_logs requires events array: {event:?}"
             );
             assert_non_empty_string(&event["events_path"]);
+        }
+        "cron_list" => assert!(
+            event["crons"].is_array(),
+            "cron_list requires crons array: {event:?}"
+        ),
+        "cron_create" | "cron_delete" => assert!(
+            event["cron"].is_object(),
+            "cron create/delete requires cron object: {event:?}"
+        ),
+        "cron_fired" => {
+            assert_non_empty_string(&event["cron_id"]);
+            assert_non_empty_string(&event["task_id"]);
+        }
+        "cron_fire_failed" => {
+            assert_non_empty_string(&event["cron_id"]);
+            assert_non_empty_string(&event["reason"]);
+        }
+        "cron_run" => {
+            assert!(
+                event["summary"].is_object(),
+                "cron_run requires summary object: {event:?}"
+            );
+            assert!(
+                event["created_tasks"].is_array(),
+                "cron_run requires created_tasks array: {event:?}"
+            );
+            assert!(
+                event["failed"].is_array(),
+                "cron_run requires failed array: {event:?}"
+            );
+            assert!(
+                event["scheduler"].is_object(),
+                "cron_run requires scheduler object: {event:?}"
+            );
         }
         "route_feedback_summary" => {
             assert!(
