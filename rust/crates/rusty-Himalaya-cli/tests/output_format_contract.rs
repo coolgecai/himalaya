@@ -410,6 +410,10 @@ fn task_scheduler_tick_persists_durable_status() {
     );
     assert_eq!(daemon["type"], "task_scheduler_daemon_run");
     assert_eq!(daemon["command"], "start");
+    assert_eq!(daemon["run"]["status"], "running");
+    assert_eq!(daemon["run"]["permission_mode"], "prompt");
+    assert!(daemon["run"]["worker_supervisor_ticks"].is_array());
+    assert!(daemon["run"]["policy_audit"].is_array());
     assert!(!daemon["runs"]
         .as_array()
         .expect("daemon runs array")
@@ -419,6 +423,10 @@ fn task_scheduler_tick_persists_durable_status() {
         .as_str()
         .expect("state path")
         .contains(".Himalaya/scheduler/state.json"));
+    assert!(daemon["runs_path"]
+        .as_str()
+        .expect("runs path")
+        .contains(".Himalaya/scheduler/runs.jsonl"));
 
     let daemon_status = assert_json_command(
         &root,
@@ -426,6 +434,14 @@ fn task_scheduler_tick_persists_durable_status() {
     );
     assert_eq!(daemon_status["type"], "task_scheduler_daemon_status");
     assert_eq!(daemon_status["state"]["tick_count"], 1);
+    assert_eq!(
+        daemon_status["latest_run"]["run_id"],
+        daemon["run"]["run_id"]
+    );
+    assert!(daemon_status["runs_path"]
+        .as_str()
+        .expect("runs path")
+        .contains(".Himalaya/scheduler/runs.jsonl"));
 
     let daemon_logs = assert_json_command(
         &root,
@@ -447,6 +463,14 @@ fn task_scheduler_tick_persists_durable_status() {
             .len(),
         1
     );
+    assert_eq!(
+        daemon_logs["runs"]
+            .as_array()
+            .expect("autonomous runs array")
+            .len(),
+        1
+    );
+    assert_eq!(daemon_logs["runs"][0]["run_id"], daemon["run"]["run_id"]);
 
     let daemon_stop = assert_json_command(
         &root,
@@ -455,8 +479,10 @@ fn task_scheduler_tick_persists_durable_status() {
     assert_eq!(daemon_stop["type"], "task_scheduler_daemon_status");
     assert_eq!(daemon_stop["command"], "stop");
     assert_eq!(daemon_stop["state"]["status"], "stopped");
+    assert_eq!(daemon_stop["latest_run"]["run_id"], daemon["run"]["run_id"]);
     assert!(root.join(".Himalaya/scheduler/state.json").exists());
     assert!(root.join(".Himalaya/scheduler/events.jsonl").exists());
+    assert!(root.join(".Himalaya/scheduler/runs.jsonl").exists());
     assert!(root.join(".Himalaya/tasks/tasks.json").exists());
     assert!(root.join(".Himalaya/tasks/events.jsonl").exists());
 }
@@ -548,6 +574,7 @@ fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
         ],
     );
     assert_eq!(daemon_dispatch["type"], "task_scheduler_daemon_run");
+    assert_eq!(daemon_dispatch["run"]["status"], "running");
     assert_eq!(daemon_dispatch["runs"][0]["tick"]["status"], "running");
 
     let completed_workers = complete_active_workers(&root);
@@ -569,6 +596,7 @@ fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
         ],
     );
     assert_eq!(daemon_waiting["type"], "task_scheduler_daemon_run");
+    assert!(daemon_waiting["run"]["tick_count"].as_u64().unwrap_or(0) >= 1);
     assert!(daemon_waiting["runs"]
         .as_array()
         .expect("daemon waiting runs")
@@ -590,6 +618,7 @@ fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
         ],
     );
     assert_eq!(daemon_completed["type"], "task_scheduler_daemon_run");
+    assert_eq!(daemon_completed["run"]["status"], "idle");
     assert_eq!(daemon_completed["runs"][0]["tick"]["status"], "idle");
     assert_eq!(daemon_completed["state"]["last_tick"]["status"], "idle");
 
@@ -661,6 +690,7 @@ fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
         ],
     );
     assert_eq!(logs["type"], "task_scheduler_daemon_logs");
+    assert!(!logs["runs"].as_array().expect("autonomous runs").is_empty());
     assert!(logs["events"]
         .as_array()
         .expect("daemon events")
@@ -714,6 +744,12 @@ fn cron_run_creates_durable_task_and_scheduler_state() {
         "packet:cron-scheduled-agent"
     );
     assert!(run["created_tasks"][0]["memory_context"].is_object());
+    assert_eq!(run["autonomous_run"]["status"], "running");
+    assert!(run["autonomous_run"]["worker_supervisor_ticks"].is_array());
+    assert!(run["scheduler"]["runs_path"]
+        .as_str()
+        .expect("cron scheduler runs path")
+        .contains(".Himalaya/scheduler/runs.jsonl"));
     assert!(run["scheduler"]["runs"]
         .as_array()
         .expect("scheduler runs")
@@ -722,6 +758,7 @@ fn cron_run_creates_durable_task_and_scheduler_state() {
     assert!(root.join(".Himalaya/tasks/tasks.json").exists());
     assert!(root.join(".Himalaya/memory/tasks.json").exists());
     assert!(root.join(".Himalaya/scheduler/state.json").exists());
+    assert!(root.join(".Himalaya/scheduler/runs.jsonl").exists());
 }
 
 #[test]

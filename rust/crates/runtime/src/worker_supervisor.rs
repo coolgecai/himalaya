@@ -74,6 +74,14 @@ impl WorkerSupervisor {
     }
 
     pub fn tick(&self) -> Result<WorkerSupervisorTick, String> {
+        self.tick_inner(true)
+    }
+
+    pub fn observe(&self) -> Result<WorkerSupervisorTick, String> {
+        self.tick_inner(false)
+    }
+
+    fn tick_inner(&self, drive_scheduler: bool) -> Result<WorkerSupervisorTick, String> {
         let restarted_workers = self
             .workers
             .restart_stale_workers_now(DEFAULT_WORKER_LEASE_SECS);
@@ -83,16 +91,15 @@ impl WorkerSupervisor {
             self.workers.clone(),
         );
         let queue_before = scheduler.queue();
-        let scheduler_tick = queue_before
-            .iter()
-            .any(|task| {
+        let scheduler_tick = (drive_scheduler
+            && queue_before.iter().any(|task| {
                 matches!(
                     task.status,
                     DurableSchedulerStatus::Pending | DurableSchedulerStatus::Running
                 )
-            })
-            .then(|| scheduler.tick())
-            .transpose()?;
+            }))
+        .then(|| scheduler.tick())
+        .transpose()?;
         let scheduler_queue = scheduler.queue();
         let workers = self.workers.list();
         let active_workers = workers

@@ -4,6 +4,7 @@
 //! MCP plumbing, tool-facing file operations, and the core conversation loop
 //! that drives interactive and one-shot turns.
 
+pub mod autonomous_run;
 mod bash;
 pub mod bash_validation;
 pub mod benchmark;
@@ -69,6 +70,11 @@ pub mod verifier;
 pub mod worker_boot;
 pub mod worker_supervisor;
 
+pub use autonomous_run::{
+    append_autonomous_run_report, autonomous_runs_path, latest_autonomous_run_report,
+    load_autonomous_run_reports, AutonomousBlockedRecoveryAction, AutonomousRecoveryPolicyAudit,
+    AutonomousRunCoordinator, AutonomousRunReport, AutonomousRunStatus, AutonomousRunStep,
+};
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use benchmark::{
     complex_coding_benchmark_suite, run_benchmark_suite, run_complex_coding_benchmark,

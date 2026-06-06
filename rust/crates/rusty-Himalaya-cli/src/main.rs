@@ -7411,35 +7411,45 @@ fn run_cron_tick_command(
     save_worker_registry(&worker_registry)?;
     save_cron_registry(&registry)?;
 
-    let runner = runtime::VerificationRunner::new(Some(env::current_dir()?));
-    let scheduler = runtime::DurableTaskScheduler::with_workers(
-        task_registry.clone(),
-        runner,
-        worker_registry.clone(),
-    )
-    .with_permission_mode(permission_mode);
-    let daemon = runtime::SchedulerDaemon::new(scheduler, scheduler_state_dir()?);
-    let mut scheduler_runs = Vec::new();
+    let coordinator =
+        build_autonomous_run_coordinator(&task_registry, &worker_registry, permission_mode)?;
+    let mut autonomous_run = None;
     let mut scheduler_errors = Vec::new();
     if !created_tasks.is_empty() {
-        for _ in 0..max_ticks {
-            match daemon.run_once() {
-                Ok(run) => {
-                    let idle = run.tick.status == runtime::DurableSchedulerStatus::Idle;
-                    scheduler_runs.push(run);
-                    save_task_registry(&task_registry)?;
-                    save_worker_registry(&worker_registry)?;
-                    if idle {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    scheduler_errors.push(error.to_string());
-                    break;
-                }
+        match coordinator.run_with_persist(max_ticks, |_| {
+            save_task_registry(&task_registry)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            save_worker_registry(&worker_registry)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            Ok(())
+        }) {
+            Ok(report) => {
+                autonomous_run = Some(report);
+                save_task_registry(&task_registry)?;
+                save_worker_registry(&worker_registry)?;
+            }
+            Err(error) => {
+                scheduler_errors.push(error.to_string());
             }
         }
     }
+    let scheduler_runs = autonomous_run
+        .as_ref()
+        .map(|report| report.scheduler_runs.clone())
+        .unwrap_or_default();
+    let scheduler_state = autonomous_run
+        .as_ref()
+        .and_then(|report| report.latest_daemon_state.clone())
+        .or_else(|| {
+            let scheduler = runtime::DurableTaskScheduler::with_workers(
+                task_registry.clone(),
+                runtime::VerificationRunner::new(Some(env::current_dir().ok()?)),
+                worker_registry.clone(),
+            )
+            .with_permission_mode(permission_mode);
+            let daemon = runtime::SchedulerDaemon::new(scheduler, scheduler_state_dir().ok()?);
+            daemon.load_state().ok()
+        });
 
     let failures = report
         .failed
@@ -7467,10 +7477,12 @@ fn run_cron_tick_command(
         "scheduler": {
             "runs": scheduler_runs,
             "errors": scheduler_errors,
-            "state": daemon.load_state().ok(),
-            "state_path": daemon.state_path(),
-            "events_path": daemon.events_path(),
+            "state": scheduler_state,
+            "state_path": scheduler_state_dir()?.join("state.json"),
+            "events_path": scheduler_state_dir()?.join("events.jsonl"),
+            "runs_path": coordinator.runs_path(),
         },
+        "autonomous_run": autonomous_run,
         "paths": {
             "cron_registry": cron_registry_dir()?.join("crons.json"),
             "task_registry": task_registry_dir()?.join("tasks.json"),
@@ -8471,6 +8483,31 @@ fn scheduler_state_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(cwd.join(".Himalaya").join("scheduler"))
 }
 
+fn build_autonomous_run_coordinator(
+    registry: &runtime::TaskRegistry,
+    worker_registry: &runtime::WorkerRegistry,
+    permission_mode: PermissionMode,
+) -> Result<runtime::AutonomousRunCoordinator, Box<dyn std::error::Error>> {
+    let runner = runtime::VerificationRunner::new(Some(env::current_dir()?));
+    let scheduler = runtime::DurableTaskScheduler::with_workers(
+        registry.clone(),
+        runner.clone(),
+        worker_registry.clone(),
+    )
+    .with_permission_mode(permission_mode);
+    let state_dir = scheduler_state_dir()?;
+    let daemon = runtime::SchedulerDaemon::new(scheduler, &state_dir);
+    let supervisor =
+        runtime::WorkerSupervisor::new(worker_registry.clone(), registry.clone(), runner);
+    Ok(runtime::AutonomousRunCoordinator::new(
+        daemon,
+        supervisor,
+        registry.clone(),
+        state_dir,
+        permission_mode,
+    ))
+}
+
 fn cron_registry_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     Ok(cwd.join(".Himalaya").join("cron"))
@@ -9372,38 +9409,36 @@ fn run_task_daemon_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let registry = load_task_registry()?;
     let worker_registry = load_worker_registry()?;
-    let runner = runtime::VerificationRunner::new(Some(env::current_dir()?));
-    let scheduler = runtime::DurableTaskScheduler::with_workers(
-        registry.clone(),
-        runner,
-        worker_registry.clone(),
-    )
-    .with_permission_mode(permission_mode);
-    let daemon = runtime::SchedulerDaemon::new(scheduler, scheduler_state_dir()?);
+    let coordinator =
+        build_autonomous_run_coordinator(&registry, &worker_registry, permission_mode)?;
+    let daemon = runtime::SchedulerDaemon::new(
+        runtime::DurableTaskScheduler::with_workers(
+            registry.clone(),
+            runtime::VerificationRunner::new(Some(env::current_dir()?)),
+            worker_registry.clone(),
+        )
+        .with_permission_mode(permission_mode),
+        scheduler_state_dir()?,
+    );
     match command {
         TaskDaemonCliCommand::Start { max_ticks } => {
-            let mut runs = Vec::new();
-            for _ in 0..max_ticks {
-                let run = daemon.run_once()?;
-                let idle = run.tick.status == runtime::DurableSchedulerStatus::Idle;
-                runs.push(run);
-                save_task_registry(&registry)?;
-                save_worker_registry(&worker_registry)?;
-                if idle {
-                    break;
-                }
-            }
-            let state = runs.last().map(|run| run.state.clone());
+            let run = coordinator.run_with_persist(max_ticks, |_| {
+                save_task_registry(&registry)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                save_worker_registry(&worker_registry)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                Ok(())
+            })?;
+            save_task_registry(&registry)?;
+            save_worker_registry(&worker_registry)?;
+            let runs = run.scheduler_runs.clone();
+            let state = run.latest_daemon_state.clone();
             match output_format {
                 CliOutputFormat::Text => {
-                    if let Some(state) = &state {
-                        println!(
-                            "daemon {:?}: {} ({} tick(s))",
-                            state.status, state.message, state.tick_count
-                        );
-                    } else {
-                        println!("daemon did not run");
-                    }
+                    println!(
+                        "daemon {}: {} ({} autonomous tick(s))",
+                        run.status, run.message, run.tick_count
+                    );
                 }
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_task_output(
@@ -9412,8 +9447,10 @@ fn run_task_daemon_command(
                             "command":"start",
                             "runs":runs,
                             "state":state,
+                            "run":run,
                             "state_path":daemon.state_path(),
                             "events_path":daemon.events_path(),
+                            "runs_path":coordinator.runs_path(),
                         }),
                         output_format,
                     )?;
@@ -9422,9 +9459,15 @@ fn run_task_daemon_command(
         }
         TaskDaemonCliCommand::Status => {
             let state = daemon.load_state().ok();
+            let latest_run = coordinator.latest_run().ok().flatten();
             match output_format {
                 CliOutputFormat::Text => {
-                    if let Some(state) = &state {
+                    if let Some(run) = &latest_run {
+                        println!(
+                            "daemon {}: {} ({} autonomous tick(s))",
+                            run.status, run.message, run.tick_count
+                        );
+                    } else if let Some(state) = &state {
                         println!(
                             "daemon {:?}: {} ({} tick(s))",
                             state.status, state.message, state.tick_count
@@ -9438,8 +9481,10 @@ fn run_task_daemon_command(
                         json!({
                             "type":"task_scheduler_daemon_status",
                             "state":state,
+                            "latest_run":latest_run,
                             "state_path":daemon.state_path(),
                             "events_path":daemon.events_path(),
+                            "runs_path":coordinator.runs_path(),
                         }),
                         output_format,
                     )?;
@@ -9448,6 +9493,7 @@ fn run_task_daemon_command(
         }
         TaskDaemonCliCommand::Stop => {
             let state = daemon.stop()?;
+            let latest_run = coordinator.latest_run().ok().flatten();
             match output_format {
                 CliOutputFormat::Text => println!(
                     "daemon {:?}: {} ({} tick(s))",
@@ -9459,8 +9505,10 @@ fn run_task_daemon_command(
                             "type":"task_scheduler_daemon_status",
                             "command":"stop",
                             "state":state,
+                            "latest_run":latest_run,
                             "state_path":daemon.state_path(),
                             "events_path":daemon.events_path(),
+                            "runs_path":coordinator.runs_path(),
                         }),
                         output_format,
                     )?;
@@ -9471,17 +9519,23 @@ fn run_task_daemon_command(
             let events = daemon.load_events().unwrap_or_default();
             let start = events.len().saturating_sub(limit);
             let events = events.into_iter().skip(start).collect::<Vec<_>>();
+            let recent_runs = coordinator.load_runs(limit).unwrap_or_default();
             match output_format {
                 CliOutputFormat::Text => {
-                    if events.is_empty() {
-                        println!("No daemon events.");
-                    } else {
-                        for event in events {
-                            println!(
-                                "{}\t{}\t{:?}\t{}",
-                                event.seq, event.event, event.status, event.message
-                            );
-                        }
+                    if events.is_empty() && recent_runs.is_empty() {
+                        println!("No daemon events or autonomous runs.");
+                    }
+                    for run in recent_runs {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            run.run_id, run.status, run.tick_count, run.message
+                        );
+                    }
+                    for event in events {
+                        println!(
+                            "{}\t{}\t{:?}\t{}",
+                            event.seq, event.event, event.status, event.message
+                        );
                     }
                 }
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
@@ -9489,7 +9543,9 @@ fn run_task_daemon_command(
                         json!({
                             "type":"task_scheduler_daemon_logs",
                             "events":events,
+                            "runs":recent_runs,
                             "events_path":daemon.events_path(),
+                            "runs_path":coordinator.runs_path(),
                         }),
                         output_format,
                     )?;

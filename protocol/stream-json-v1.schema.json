@@ -1541,6 +1541,12 @@
                 "object",
                 "null"
               ]
+            },
+            "run": {
+              "type": "object"
+            },
+            "runs_path": {
+              "type": "string"
             }
           }
         }
@@ -1572,6 +1578,15 @@
             },
             "events_path": {
               "type": "string"
+            },
+            "latest_run": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "runs_path": {
+              "type": "string"
             }
           }
         }
@@ -1595,6 +1610,12 @@
               "type": "array"
             },
             "events_path": {
+              "type": "string"
+            },
+            "runs": {
+              "type": "array"
+            },
+            "runs_path": {
               "type": "string"
             }
           }
@@ -1638,6 +1659,12 @@
             },
             "scheduler": {
               "type": "object"
+            },
+            "autonomous_run": {
+              "type": [
+                "object",
+                "null"
+              ]
             }
           }
         }

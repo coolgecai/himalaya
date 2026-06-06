@@ -995,6 +995,8 @@ fn cron_run_fires_due_entry_end_to_end() {
     );
     assert!(cron_run["created_tasks"][0]["task_id"].as_str().is_some());
     assert!(cron_run["created_tasks"][0]["memory_context"].is_object());
+    assert_eq!(cron_run["autonomous_run"]["status"], "running");
+    assert!(cron_run["autonomous_run"]["worker_supervisor_ticks"].is_array());
     assert!(
         cron_run["scheduler"]["runs"]
             .as_array()
@@ -1462,6 +1464,15 @@ fn assert_stream_event_schema(event: &Value) {
                 event.get("state").is_some(),
                 "task_scheduler_daemon_run requires state field: {event:?}"
             );
+            if event.get("run").is_some() {
+                assert!(
+                    event["run"].is_object(),
+                    "task_scheduler_daemon_run run must be object when present: {event:?}"
+                );
+            }
+            if event.get("runs_path").is_some() {
+                assert_non_empty_string(&event["runs_path"]);
+            }
         }
         "task_scheduler_daemon_status" => {
             assert!(
@@ -1470,6 +1481,15 @@ fn assert_stream_event_schema(event: &Value) {
             );
             assert_non_empty_string(&event["state_path"]);
             assert_non_empty_string(&event["events_path"]);
+            if event.get("latest_run").is_some() && !event["latest_run"].is_null() {
+                assert!(
+                    event["latest_run"].is_object(),
+                    "task_scheduler_daemon_status latest_run must be object or null: {event:?}"
+                );
+            }
+            if event.get("runs_path").is_some() {
+                assert_non_empty_string(&event["runs_path"]);
+            }
         }
         "task_scheduler_daemon_logs" => {
             assert!(
@@ -1477,6 +1497,15 @@ fn assert_stream_event_schema(event: &Value) {
                 "task_scheduler_daemon_logs requires events array: {event:?}"
             );
             assert_non_empty_string(&event["events_path"]);
+            if event.get("runs").is_some() {
+                assert!(
+                    event["runs"].is_array(),
+                    "task_scheduler_daemon_logs runs must be array when present: {event:?}"
+                );
+            }
+            if event.get("runs_path").is_some() {
+                assert_non_empty_string(&event["runs_path"]);
+            }
         }
         "cron_list" => assert!(
             event["crons"].is_array(),
@@ -1511,6 +1540,12 @@ fn assert_stream_event_schema(event: &Value) {
                 event["scheduler"].is_object(),
                 "cron_run requires scheduler object: {event:?}"
             );
+            if event.get("autonomous_run").is_some() && !event["autonomous_run"].is_null() {
+                assert!(
+                    event["autonomous_run"].is_object(),
+                    "cron_run autonomous_run must be object or null: {event:?}"
+                );
+            }
         }
         "route_feedback_summary" => {
             assert!(
