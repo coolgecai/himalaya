@@ -171,6 +171,8 @@ pub struct ModelRouteDecision {
 pub struct ModelRouteFeedback {
     pub task_id: String,
     pub route: ModelRouteDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
     pub succeeded: Option<bool>,
     pub latency_ms: Option<u32>,
     pub input_tokens: Option<u64>,
@@ -198,6 +200,7 @@ impl ModelRouteFeedback {
         Self {
             task_id: task_id.into(),
             route,
+            task_type: None,
             succeeded: None,
             latency_ms: None,
             input_tokens: None,
@@ -213,6 +216,12 @@ impl ModelRouteFeedback {
             recovery_decision: None,
             plan_progress: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_task_type(mut self, task_type: Option<String>) -> Self {
+        self.task_type = task_type;
+        self
     }
 
     #[must_use]
@@ -265,6 +274,9 @@ impl ModelRouteFeedback {
     pub fn merge_observations(&mut self, observation: &Self) {
         if observation.succeeded.is_some() {
             self.succeeded = observation.succeeded;
+        }
+        if observation.task_type.is_some() {
+            self.task_type = observation.task_type.clone();
         }
         if observation.latency_ms.is_some() {
             self.latency_ms = observation.latency_ms;
@@ -436,6 +448,41 @@ impl ModelRouter {
                 primary_failure_rate * 100.0
             );
         }
+        decision
+    }
+
+    /// Select a route using feedback for the current task type first. When no
+    /// typed samples exist, this falls back to the unfiltered workspace/task
+    /// feedback path so existing adaptive behavior is preserved.
+    #[must_use]
+    pub fn select_with_task_feedback(
+        &self,
+        phase: ModelRoutePhase,
+        feedback: &[ModelRouteFeedback],
+        complexity: Option<u8>,
+        task_type: Option<&str>,
+    ) -> ModelRouteDecision {
+        let Some(task_type) = task_type.filter(|value| !value.trim().is_empty()) else {
+            return self.select_with_feedback_and_context(phase, feedback, complexity);
+        };
+        let typed_feedback = feedback
+            .iter()
+            .filter(|entry| entry.task_type.as_deref() == Some(task_type))
+            .cloned()
+            .collect::<Vec<_>>();
+        let typed_observed = typed_feedback
+            .iter()
+            .filter(|entry| entry.succeeded.is_some())
+            .count();
+        if typed_observed < self.policy.min_feedback_samples {
+            return self.select_with_feedback_and_context(phase, feedback, complexity);
+        }
+        let mut decision =
+            self.select_with_feedback_and_context(phase, &typed_feedback, complexity);
+        decision.reason = format!(
+            "{}; scoped to task memory type `{}`",
+            decision.reason, task_type
+        );
         decision
     }
 
@@ -739,6 +786,7 @@ mod tests {
         };
         let feedback = vec![
             ModelRouteFeedback::pending("task-1", primary.clone(), 1)
+                .with_task_type(Some("packet:runtime".to_string()))
                 .with_outcome(true, Some(false), false, Some("verify failed".to_string()))
                 .with_diagnostics(
                     Some("verification_command".to_string()),
@@ -748,6 +796,7 @@ mod tests {
                     None,
                 ),
             ModelRouteFeedback::pending("task-2", primary, 2)
+                .with_task_type(Some("packet:runtime".to_string()))
                 .with_outcome(true, Some(false), false, Some("verify failed".to_string()))
                 .with_diagnostics(
                     Some("verification_command".to_string()),
@@ -762,6 +811,69 @@ mod tests {
 
         assert_eq!(decision.model, "fallback");
         assert_eq!(decision.fallback_model, Some("primary".to_string()));
+    }
+
+    #[test]
+    fn task_type_feedback_scopes_adaptive_switching() {
+        let policy = MoERoutingPolicy::new(
+            "sonnet",
+            vec![
+                ModelRoute::new(ModelRoutePhase::Coding, "primary").with_weights(1, 1, 5),
+                ModelRoute::new(ModelRoutePhase::Coding, "fallback").with_weights(1, 1, 4),
+            ],
+        )
+        .with_adaptive(true, 2, 50);
+        let router = ModelRouter::new(policy);
+        let primary = ModelRouteDecision {
+            phase: ModelRoutePhase::Coding,
+            model: "primary".to_string(),
+            provider: None,
+            reason: "test".to_string(),
+            confidence: Some(0.8),
+            fallback_model: None,
+        };
+        let feedback = vec![
+            ModelRouteFeedback::pending("task-1", primary.clone(), 1)
+                .with_task_type(Some("packet:runtime".to_string()))
+                .with_outcome(false, Some(false), true, Some("failed".to_string())),
+            ModelRouteFeedback::pending("task-2", primary.clone(), 2)
+                .with_task_type(Some("packet:runtime".to_string()))
+                .with_outcome(false, Some(false), true, Some("failed".to_string())),
+            ModelRouteFeedback::pending("task-3", primary, 3)
+                .with_task_type(Some("packet:docs".to_string()))
+                .with_outcome(true, Some(true), false, Some("ok".to_string())),
+            ModelRouteFeedback::pending(
+                "task-4",
+                ModelRouteDecision {
+                    phase: ModelRoutePhase::Coding,
+                    model: "primary".to_string(),
+                    provider: None,
+                    reason: "test".to_string(),
+                    confidence: Some(0.8),
+                    fallback_model: None,
+                },
+                4,
+            )
+            .with_task_type(Some("packet:docs".to_string()))
+            .with_outcome(true, Some(true), false, Some("ok".to_string())),
+        ];
+
+        let runtime_decision = router.select_with_task_feedback(
+            ModelRoutePhase::Coding,
+            &feedback,
+            None,
+            Some("packet:runtime"),
+        );
+        let docs_decision = router.select_with_task_feedback(
+            ModelRoutePhase::Coding,
+            &feedback,
+            None,
+            Some("packet:docs"),
+        );
+
+        assert_eq!(runtime_decision.model, "fallback");
+        assert!(runtime_decision.reason.contains("packet:runtime"));
+        assert_eq!(docs_decision.model, "primary");
     }
 
     #[test]

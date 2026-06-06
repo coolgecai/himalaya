@@ -84,6 +84,17 @@ pub struct DurableSchedulerTick {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurableSchedulerExplain {
+    pub task_id: String,
+    pub selected_task_id: Option<String>,
+    pub would_select: bool,
+    pub task: DurableSchedulerTaskSnapshot,
+    pub decision_trace: Vec<DurableSchedulerDecisionTrace>,
+    pub queue: Vec<DurableSchedulerTaskSnapshot>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SchedulerDaemonStatus {
@@ -387,15 +398,7 @@ impl DurableTaskScheduler {
 
     pub fn tick(&self) -> Result<DurableSchedulerTick, String> {
         let queue_before = self.queue();
-        let selected = queue_before
-            .iter()
-            .filter(|task| task.runnable)
-            .max_by(|left, right| {
-                left.priority
-                    .cmp(&right.priority)
-                    .then_with(|| right.task_id.cmp(&left.task_id))
-            })
-            .cloned();
+        let selected = selected_scheduler_task(&queue_before);
         let decision_trace = scheduler_decision_trace(&queue_before, selected.as_ref());
         let Some(snapshot) = selected else {
             return Ok(DurableSchedulerTick {
@@ -450,6 +453,33 @@ impl DurableTaskScheduler {
         })
     }
 
+    pub fn explain(&self, task_id: &str) -> Result<DurableSchedulerExplain, String> {
+        let queue = self.queue();
+        let selected = selected_scheduler_task(&queue);
+        let decision_trace = scheduler_decision_trace(&queue, selected.as_ref());
+        let task = queue
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .cloned()
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        let reason = decision_trace
+            .iter()
+            .find(|trace| trace.task_id == task_id)
+            .map(|trace| trace.reason.clone())
+            .unwrap_or_else(|| "task not present in scheduler decision trace".to_string());
+        Ok(DurableSchedulerExplain {
+            task_id: task_id.to_string(),
+            selected_task_id: selected.as_ref().map(|task| task.task_id.clone()),
+            would_select: selected
+                .as_ref()
+                .is_some_and(|selected| selected.task_id == task_id),
+            task,
+            decision_trace,
+            queue,
+            reason,
+        })
+    }
+
     #[must_use]
     pub fn queue(&self) -> Vec<DurableSchedulerTaskSnapshot> {
         let mut tasks = self.registry.list(None);
@@ -459,6 +489,20 @@ impl DurableTaskScheduler {
             .map(|task| task_snapshot(task, self.worker_registry.as_ref()))
             .collect()
     }
+}
+
+fn selected_scheduler_task(
+    queue: &[DurableSchedulerTaskSnapshot],
+) -> Option<DurableSchedulerTaskSnapshot> {
+    queue
+        .iter()
+        .filter(|task| task.runnable)
+        .max_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| right.task_id.cmp(&left.task_id))
+        })
+        .cloned()
 }
 
 fn task_snapshot(
@@ -936,6 +980,12 @@ mod tests {
         let task = registry.create("scheduled task", Some("missing plan"));
         let scheduler = DurableTaskScheduler::new(registry.clone(), VerificationRunner::new(None));
 
+        let initial_explain = scheduler
+            .explain(&task.task_id)
+            .expect("scheduler explain should work before tick");
+        assert!(initial_explain.would_select);
+        assert!(initial_explain.reason.contains("selected"));
+
         let tick = scheduler.tick().expect("tick should run");
 
         assert_eq!(tick.status, DurableSchedulerStatus::Blocked);
@@ -958,6 +1008,13 @@ mod tests {
                 && !trace.selected
                 && trace.reason.contains("blocked without executable recovery")
         }));
+        let blocked_explain = scheduler
+            .explain(&task.task_id)
+            .expect("scheduler explain should work after block");
+        assert!(!blocked_explain.would_select);
+        assert!(blocked_explain
+            .reason
+            .contains("blocked without executable recovery"));
     }
 
     #[test]

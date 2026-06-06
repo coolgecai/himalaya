@@ -146,6 +146,9 @@
           "$ref": "#/$defs/taskSchedulerQueueEvent"
         },
         {
+          "$ref": "#/$defs/taskSchedulerExplainEvent"
+        },
+        {
           "$ref": "#/$defs/taskSchedulerDaemonRunEvent"
         },
         {
@@ -234,6 +237,7 @@
         "task_packet_status",
         "task_scheduler_tick",
         "task_scheduler_queue",
+        "task_scheduler_explain",
         "task_scheduler_daemon_run",
         "task_scheduler_daemon_status",
         "task_scheduler_daemon_logs",
@@ -1275,6 +1279,26 @@
             },
             "queue": {
               "type": "array"
+            }
+          }
+        }
+      ]
+    },
+    "taskSchedulerExplainEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "explanation"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_scheduler_explain"
+            },
+            "explanation": {
+              "type": "object"
             }
           }
         }

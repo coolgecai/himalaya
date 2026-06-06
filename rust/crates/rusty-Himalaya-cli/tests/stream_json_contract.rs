@@ -53,6 +53,7 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "task_packet_status",
         "task_scheduler_tick",
         "task_scheduler_queue",
+        "task_scheduler_explain",
         "task_scheduler_daemon_run",
         "task_scheduler_daemon_status",
         "task_scheduler_daemon_logs",
@@ -1386,6 +1387,10 @@ fn assert_stream_event_schema(event: &Value) {
         "task_scheduler_queue" => assert!(
             event["queue"].is_array(),
             "task_scheduler_queue requires queue array: {event:?}"
+        ),
+        "task_scheduler_explain" => assert!(
+            event["explanation"].is_object(),
+            "task_scheduler_explain requires explanation object: {event:?}"
         ),
         "task_scheduler_daemon_run" => {
             assert!(

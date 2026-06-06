@@ -335,6 +335,29 @@ fn task_scheduler_tick_persists_durable_status() {
     assert_eq!(queue["queue"][0]["task_id"], task_id);
     assert_eq!(queue["queue"][0]["status"], "pending");
 
+    let explain = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "scheduler",
+            "explain",
+            &task_id,
+        ],
+    );
+    assert_eq!(explain["type"], "task_scheduler_explain");
+    assert_eq!(explain["explanation"]["task_id"], task_id);
+    assert_eq!(explain["explanation"]["would_select"], true);
+    assert!(explain["explanation"]["reason"]
+        .as_str()
+        .expect("explain reason")
+        .contains("selected"));
+    let text_explain = run_Himalaya(&root, &["tasks", "scheduler", "explain", &task_id], &[]);
+    assert!(text_explain.status.success());
+    let text_explain_stdout = String::from_utf8(text_explain.stdout).expect("text explain stdout");
+    assert!(text_explain_stdout.contains("Scheduler explain"));
+
     let tick = assert_json_command(
         &root,
         &["--output-format", "json", "tasks", "scheduler", "tick"],
@@ -612,6 +635,8 @@ fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
     );
     assert_eq!(review["type"], "task_review");
     assert_eq!(review["task"]["task_id"], task_id);
+    assert!(review["planning_context"].is_object());
+    assert!(review["recovery_policy"].is_object());
     assert!(review["recommendations"]
         .as_array()
         .expect("recommendations array")

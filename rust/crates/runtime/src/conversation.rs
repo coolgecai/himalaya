@@ -3622,11 +3622,16 @@ where
             .map(|step| format!("- {}: {}", step.id, step.title))
             .collect::<Vec<_>>()
             .join("\n");
+        let memory_context = self.task_memory_planning_context(task_id);
+        let memory_block = memory_context
+            .as_ref()
+            .map(|context| format!("\n\nMemory-informed planning context:\n{context}"))
+            .unwrap_or_default();
         let request = ApiRequest {
             system_prompt: vec![PLANNING_SYSTEM_PROMPT.to_string()],
             messages: vec![ConversationMessage::user_text(format!(
-                "Task (complexity {}/5): {user_input}\n\nA heuristic pre-plan proposed these steps:\n{heuristic_steps}\n\nProduce a short, concrete execution plan (3-7 ordered steps) that improves on the heuristic where useful. Note risks and the recommended order. Be specific to this task.",
-                task.complexity
+                "Task (complexity {}/5): {user_input}\n\nA heuristic pre-plan proposed these steps:\n{heuristic_steps}{memory_block}\n\nProduce a short, concrete execution plan (3-7 ordered steps) that improves on the heuristic where useful. Note risks and the recommended order. Be specific to this task.",
+                task.complexity,
             ))],
             model_route: Some(route),
         };
@@ -3667,11 +3672,16 @@ where
             crate::ModelRoutePhase::Planning,
             Some(task.complexity),
         );
+        let memory_context = self.task_memory_planning_context(task_id);
+        let memory_block = memory_context
+            .as_ref()
+            .map(|context| format!("\n\nMemory-informed planning context:\n{context}"))
+            .unwrap_or_default();
         let request = ApiRequest {
             system_prompt: vec![STRUCTURED_PLAN_SYSTEM_PROMPT.to_string()],
             messages: vec![ConversationMessage::user_text(format!(
-                "Task (complexity {}/5): {user_input}\n\nReturn ONLY a JSON object: {{\"steps\":[{{\"id\":\"kebab-id\",\"title\":\"...\",\"depends_on\":[\"other-id\"],\"parallelizable\":false,\"estimated_effort\":1,\"acceptance\":[\"shell command that must pass\"],\"capabilities\":[\"read\"]}}],\"notes\":[\"...\"]}}. 2-7 steps. depends_on must reference declared ids only. No prose outside the JSON.",
-                task.complexity
+                "Task (complexity {}/5): {user_input}{memory_block}\n\nReturn ONLY a JSON object: {{\"steps\":[{{\"id\":\"kebab-id\",\"title\":\"...\",\"depends_on\":[\"other-id\"],\"parallelizable\":false,\"estimated_effort\":1,\"acceptance\":[\"shell command that must pass\"],\"capabilities\":[\"read\"]}}],\"notes\":[\"...\"]}}. 2-7 steps. depends_on must reference declared ids only. No prose outside the JSON.",
+                task.complexity,
             ))],
             model_route: Some(route),
         };
@@ -4193,6 +4203,80 @@ where
         self.select_model_route_for_task_with_complexity(task_id, phase, None)
     }
 
+    fn task_memory_planning_context(&self, task_id: &str) -> Option<String> {
+        let task = self.task_registry.get(task_id)?;
+        let store = crate::TaskMemoryStore::from_tasks(&self.task_registry.list(None));
+        let context = store.context_for_task(&task);
+        let has_specific_memory = context.similar_count > 0
+            || !context.successful_acceptance_tests.is_empty()
+            || !context.common_failure_classes.is_empty()
+            || context
+                .recovery_actions
+                .iter()
+                .any(|action| action.total > 0);
+        if !has_specific_memory {
+            return None;
+        }
+        let mut lines = vec![format!(
+            "- Task memory type: {} ({} similar task(s))",
+            context.task_type, context.similar_count
+        )];
+        if !context.successful_acceptance_tests.is_empty() {
+            lines.push(format!(
+                "- Reuse or adapt successful acceptance tests: {}",
+                context
+                    .successful_acceptance_tests
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        if !context.common_failure_classes.is_empty() {
+            let failures = context
+                .common_failure_classes
+                .iter()
+                .map(|(class, count)| format!("{class}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("- Pre-check recurring failure classes: {failures}"));
+        }
+        let recovery = context
+            .recovery_actions
+            .iter()
+            .take(3)
+            .map(|action| {
+                format!(
+                    "{} {:.0}% success ({} total, {} blocked)",
+                    action.kind,
+                    action.success_rate * 100.0,
+                    action.total,
+                    action.blocked
+                )
+            })
+            .collect::<Vec<_>>();
+        if !recovery.is_empty() {
+            lines.push(format!(
+                "- Prefer historically effective recovery actions: {}",
+                recovery.join("; ")
+            ));
+        }
+        if let Some(rate) = context.route_failure_rate {
+            lines.push(format!(
+                "- Similar route failure rate: {:.0}%",
+                rate * 100.0
+            ));
+        }
+        if !context.recommendations.is_empty() {
+            lines.push(format!(
+                "- Memory recommendations: {}",
+                context.recommendations.join(" ")
+            ));
+        }
+        Some(lines.join("\n"))
+    }
+
     fn select_model_route_for_task_with_complexity(
         &self,
         task_id: &str,
@@ -4200,15 +4284,19 @@ where
         complexity: Option<u8>,
     ) -> ModelRouteDecision {
         let mut feedback = self.workspace_route_feedback.clone();
+        let task = self.task_registry.get(task_id);
+        let task_type = task.as_ref().map(crate::TaskMemoryStore::task_type_for);
         feedback.extend(
-            self.task_registry
-                .get(task_id)
-                .map(|task| task.route_feedback)
+            task.as_ref()
+                .map(|task| task.route_feedback.clone())
                 .unwrap_or_default(),
         );
-        let decision = self
-            .model_router
-            .select_with_feedback_and_context(phase, &feedback, complexity);
+        let decision = self.model_router.select_with_task_feedback(
+            phase,
+            &feedback,
+            complexity,
+            task_type.as_deref(),
+        );
         if let Some(reporter) = &self.model_route_event_reporter {
             reporter.emit_model_route_event(&decision);
         }
@@ -4219,7 +4307,8 @@ where
                 task_id.to_string(),
                 decision.clone(),
                 current_time_millis() / 1_000,
-            ),
+            )
+            .with_task_type(task_type),
         );
         decision
     }

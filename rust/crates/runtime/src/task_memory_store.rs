@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -67,6 +67,17 @@ pub struct RecoveryActionMemorySummary {
     pub executed: usize,
     pub blocked: usize,
     pub success_rate: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskMemoryContext {
+    pub task_type: String,
+    pub similar_count: usize,
+    pub successful_acceptance_tests: Vec<String>,
+    pub common_failure_classes: BTreeMap<String, usize>,
+    pub recovery_actions: Vec<RecoveryActionMemorySummary>,
+    pub route_failure_rate: Option<f32>,
+    pub recommendations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -160,36 +171,19 @@ impl TaskMemoryStore {
 
     #[must_use]
     pub fn recovery_action_summaries(&self) -> Vec<RecoveryActionMemorySummary> {
-        let mut summaries = BTreeMap::<String, RecoveryActionMemorySummary>::new();
-        for signal in self
-            .entries
-            .iter()
-            .flat_map(|entry| entry.recovery_actions.iter())
-        {
-            let summary = summaries.entry(signal.kind.clone()).or_insert_with(|| {
-                RecoveryActionMemorySummary {
-                    kind: signal.kind.clone(),
-                    total: 0,
-                    executed: 0,
-                    blocked: 0,
-                    success_rate: 0.0,
-                }
-            });
-            summary.total += 1;
-            summary.executed += usize::from(signal.executed && !signal.blocked);
-            summary.blocked += usize::from(signal.blocked);
-        }
-        summaries
-            .into_values()
-            .map(|mut summary| {
-                summary.success_rate = if summary.total == 0 {
-                    0.0
-                } else {
-                    summary.executed as f32 / summary.total as f32
-                };
-                summary
-            })
-            .collect()
+        recovery_action_summaries_for_entries(self.entries.iter())
+    }
+
+    #[must_use]
+    pub fn recovery_action_summaries_for_type(
+        &self,
+        task_type: &str,
+    ) -> Vec<RecoveryActionMemorySummary> {
+        recovery_action_summaries_for_entries(
+            self.entries
+                .iter()
+                .filter(|entry| entry.task_type == task_type),
+        )
     }
 
     #[must_use]
@@ -197,6 +191,93 @@ impl TaskMemoryStore {
         self.entries
             .iter()
             .filter(|entry| entry.task_type == task_type)
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn context_for_task(&self, task: &Task) -> TaskMemoryContext {
+        let current = TaskMemoryEntry::from_task(task);
+        self.context_for_entry(&current)
+    }
+
+    #[must_use]
+    pub fn context_for_entry(&self, current: &TaskMemoryEntry) -> TaskMemoryContext {
+        let similar = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.task_type == current.task_type && entry.task_id != current.task_id
+            })
+            .collect::<Vec<_>>();
+        let mut tests = BTreeSet::new();
+        let mut failure_classes = BTreeMap::<String, usize>::new();
+        let mut route_feedback_count = 0_usize;
+        let mut route_failures = 0_usize;
+        for entry in &similar {
+            if entry.completed {
+                tests.extend(entry.acceptance_tests.iter().cloned());
+            }
+            if let Some(class) = entry.latest_failure_class.as_ref() {
+                *failure_classes.entry(class.clone()).or_insert(0) += 1;
+            }
+            route_feedback_count += entry.route_feedback_count;
+            route_failures += entry.route_failures;
+        }
+        let mut recovery_actions = recovery_action_summaries_for_entries(similar.iter().copied());
+        recovery_actions.sort_by(|left, right| {
+            right
+                .success_rate
+                .total_cmp(&left.success_rate)
+                .then_with(|| right.executed.cmp(&left.executed))
+                .then_with(|| left.blocked.cmp(&right.blocked))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        let route_failure_rate = (route_feedback_count > 0)
+            .then_some(route_failures as f32 / route_feedback_count as f32);
+        let successful_acceptance_tests = tests.into_iter().collect::<Vec<_>>();
+        let recommendations = memory_context_recommendations(
+            &successful_acceptance_tests,
+            &failure_classes,
+            &recovery_actions,
+            route_failure_rate,
+        );
+        TaskMemoryContext {
+            task_type: current.task_type.clone(),
+            similar_count: similar.len(),
+            successful_acceptance_tests,
+            common_failure_classes: failure_classes,
+            recovery_actions,
+            route_failure_rate,
+            recommendations,
+        }
+    }
+
+    #[must_use]
+    pub fn task_type_for(task: &Task) -> String {
+        task_type(task)
+    }
+
+    #[must_use]
+    pub fn entry_task_type(task: &Task) -> String {
+        task_type(task)
+    }
+
+    #[must_use]
+    pub fn memory_feedback_for_task<'a>(
+        &self,
+        task: &Task,
+        feedback: impl Iterator<Item = &'a crate::ModelRouteFeedback>,
+    ) -> Vec<crate::ModelRouteFeedback> {
+        let task_type = task_type(task);
+        feedback
+            .filter(|entry| {
+                entry.task_type.as_deref() == Some(task_type.as_str())
+                    || (entry.task_type.is_none()
+                        && self
+                            .entry_for_task(&entry.task_id)
+                            .is_some_and(|memory| memory.task_type == task_type))
+            })
             .cloned()
             .collect()
     }
@@ -210,6 +291,79 @@ impl TaskMemoryStore {
             recovery_actions: self.recovery_action_summaries(),
         }
     }
+}
+
+fn recovery_action_summaries_for_entries<'a>(
+    entries: impl Iterator<Item = &'a TaskMemoryEntry>,
+) -> Vec<RecoveryActionMemorySummary> {
+    let mut summaries = BTreeMap::<String, RecoveryActionMemorySummary>::new();
+    for signal in entries.flat_map(|entry| entry.recovery_actions.iter()) {
+        let summary =
+            summaries
+                .entry(signal.kind.clone())
+                .or_insert_with(|| RecoveryActionMemorySummary {
+                    kind: signal.kind.clone(),
+                    total: 0,
+                    executed: 0,
+                    blocked: 0,
+                    success_rate: 0.0,
+                });
+        summary.total += 1;
+        summary.executed += usize::from(signal.executed && !signal.blocked);
+        summary.blocked += usize::from(signal.blocked);
+    }
+    summaries
+        .into_values()
+        .map(|mut summary| {
+            summary.success_rate = if summary.total == 0 {
+                0.0
+            } else {
+                summary.executed as f32 / summary.total as f32
+            };
+            summary
+        })
+        .collect()
+}
+
+fn memory_context_recommendations(
+    tests: &[String],
+    failure_classes: &BTreeMap<String, usize>,
+    recovery_actions: &[RecoveryActionMemorySummary],
+    route_failure_rate: Option<f32>,
+) -> Vec<String> {
+    let mut recommendations = Vec::new();
+    if !tests.is_empty() {
+        recommendations.push(format!(
+            "Seed planning with {} successful acceptance test(s) from similar tasks.",
+            tests.len()
+        ));
+    }
+    if let Some((class, count)) = failure_classes.iter().max_by_key(|(_, count)| *count) {
+        recommendations.push(format!(
+            "Pre-check recurring failure class `{class}` observed in {count} similar task(s)."
+        ));
+    }
+    if let Some(action) = recovery_actions
+        .iter()
+        .find(|action| action.total > 0 && action.success_rate >= 0.5)
+    {
+        recommendations.push(format!(
+            "Prefer recovery action `{}` first; historical success rate is {:.0}%.",
+            action.kind,
+            action.success_rate * 100.0
+        ));
+    }
+    if route_failure_rate.is_some_and(|rate| rate >= 0.5) {
+        recommendations.push(
+            "Route similar tasks conservatively; historical route failure rate is high."
+                .to_string(),
+        );
+    }
+    if recommendations.is_empty() {
+        recommendations
+            .push("No memory-informed planning adjustment is available yet.".to_string());
+    }
+    recommendations
 }
 
 impl TaskMemoryEntry {
@@ -397,6 +551,30 @@ mod tests {
         assert_eq!(entry.recovery_actions[0].kind, "SwitchModel");
         assert_eq!(store.summaries()[0].completed, 1);
         assert_eq!(store.recovery_action_summaries()[0].executed, 1);
+    }
+
+    #[test]
+    fn context_for_task_uses_similar_task_memory() {
+        let mut previous = packet_task();
+        previous.task_id = "previous-task".to_string();
+        let mut current = packet_task();
+        current.task_id = "current-task".to_string();
+        current.recovery_action_executions.clear();
+        let store = TaskMemoryStore::from_tasks(&[previous, current.clone()]);
+
+        let context = store.context_for_task(&current);
+
+        assert_eq!(context.task_type, "packet:runtime-scheduler");
+        assert_eq!(context.similar_count, 1);
+        assert_eq!(
+            context.successful_acceptance_tests,
+            vec!["python3 --version"]
+        );
+        assert_eq!(context.recovery_actions[0].kind, "SwitchModel");
+        assert!(context
+            .recommendations
+            .iter()
+            .any(|item| item.contains("acceptance test")));
     }
 
     #[test]

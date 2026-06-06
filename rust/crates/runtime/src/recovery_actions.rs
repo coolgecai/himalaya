@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    FailureScenario, PermissionMode, RecoveryOrchestratorOutcome, RecoveryStep, TaskRegistry,
-    TaskStatus,
+    FailureScenario, PermissionMode, RecoveryOrchestratorOutcome, RecoveryStep, TaskMemoryContext,
+    TaskRegistry, TaskStatus,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +87,48 @@ impl RecoveryActionEngine {
             });
         }
         RecoveryActionPlan { task_id, actions }
+    }
+
+    #[must_use]
+    pub fn plan_with_memory_context(
+        &self,
+        task_id: impl Into<String>,
+        outcome: &RecoveryOrchestratorOutcome,
+        node_id: Option<String>,
+        memory_context: Option<&TaskMemoryContext>,
+    ) -> RecoveryActionPlan {
+        let mut plan = self.plan(task_id, outcome, node_id);
+        let Some(context) = memory_context else {
+            return plan;
+        };
+        let mut indexed = plan.actions.into_iter().enumerate().collect::<Vec<_>>();
+        indexed.sort_by(|left, right| {
+            let left_signal = memory_signal_for_kind(context, &left.1.kind);
+            let right_signal = memory_signal_for_kind(context, &right.1.kind);
+            right_signal
+                .success_rate
+                .total_cmp(&left_signal.success_rate)
+                .then_with(|| right_signal.executed.cmp(&left_signal.executed))
+                .then_with(|| left_signal.blocked.cmp(&right_signal.blocked))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        plan.actions = indexed
+            .into_iter()
+            .map(|(_, mut action)| {
+                let signal = memory_signal_for_kind(context, &action.kind);
+                if signal.total > 0 {
+                    action.message = format!(
+                        "{} (memory: {:.0}% success across {} similar action(s), {} blocked)",
+                        action.message,
+                        signal.success_rate * 100.0,
+                        signal.total,
+                        signal.blocked
+                    );
+                }
+                action
+            })
+            .collect();
+        plan
     }
 
     #[must_use]
@@ -220,6 +262,37 @@ impl RecoveryActionEngine {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RecoveryMemorySignal {
+    total: usize,
+    executed: usize,
+    blocked: usize,
+    success_rate: f32,
+}
+
+fn memory_signal_for_kind(
+    context: &TaskMemoryContext,
+    kind: &RecoveryActionKind,
+) -> RecoveryMemorySignal {
+    let kind = format!("{kind:?}");
+    context
+        .recovery_actions
+        .iter()
+        .find(|summary| summary.kind == kind)
+        .map(|summary| RecoveryMemorySignal {
+            total: summary.total,
+            executed: summary.executed,
+            blocked: summary.blocked,
+            success_rate: summary.success_rate,
+        })
+        .unwrap_or(RecoveryMemorySignal {
+            total: 0,
+            executed: 0,
+            blocked: 0,
+            success_rate: 0.0,
+        })
+}
+
 fn recovery_steps(outcome: &RecoveryOrchestratorOutcome) -> Vec<RecoveryStep> {
     if let Some(steps) = outcome.events.iter().find_map(|event| match event {
         crate::RecoveryEvent::RecoveryAttempted { recipe, .. } => Some(recipe.steps.clone()),
@@ -327,7 +400,7 @@ mod tests {
     use super::*;
     use crate::{
         FailureScenario, PlanDag, PlanDagEdge, PlanDagNode, PlanExecution, PlanNodeKind,
-        RecoveryOrchestrator,
+        RecoveryActionMemorySummary, RecoveryOrchestrator, TaskMemoryContext,
     };
 
     fn registry_with_failed_node() -> (TaskRegistry, String) {
@@ -473,5 +546,46 @@ mod tests {
 
         assert!(execution.results[0].blocked);
         assert!(!execution.results[0].executed);
+    }
+
+    #[test]
+    fn memory_context_ranks_successful_recovery_action_first() {
+        let engine = RecoveryActionEngine::new();
+        let outcome = RecoveryOrchestratorOutcome {
+            scenario: FailureScenario::ProviderFailure,
+            result: crate::RecoveryResult::PartialRecovery {
+                recovered: Vec::new(),
+                remaining: vec![
+                    RecoveryStep::EscalateToHuman {
+                        reason: "fallback".to_string(),
+                    },
+                    RecoveryStep::RestartWorker,
+                ],
+            },
+            decision: crate::RecoveryOrchestratorDecision::Blocked {
+                reason: "test".to_string(),
+            },
+            events: Vec::new(),
+        };
+        let context = TaskMemoryContext {
+            task_type: "packet:runtime".to_string(),
+            similar_count: 2,
+            successful_acceptance_tests: Vec::new(),
+            common_failure_classes: Default::default(),
+            recovery_actions: vec![RecoveryActionMemorySummary {
+                kind: "SwitchModel".to_string(),
+                total: 2,
+                executed: 2,
+                blocked: 0,
+                success_rate: 1.0,
+            }],
+            route_failure_rate: None,
+            recommendations: Vec::new(),
+        };
+
+        let plan = engine.plan_with_memory_context("task-1", &outcome, None, Some(&context));
+
+        assert_eq!(plan.actions[0].kind, RecoveryActionKind::SwitchModel);
+        assert!(plan.actions[0].message.contains("memory: 100% success"));
     }
 }

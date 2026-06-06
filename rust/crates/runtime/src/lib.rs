@@ -110,10 +110,10 @@ pub use decisioning::{
     Tool, ToolHistoryEntry, ToolSelector,
 };
 pub use execution_scheduler::{
-    durable_status_for_task, DurableSchedulerStatus, DurableSchedulerTaskSnapshot,
-    DurableSchedulerTick, DurableTaskScheduler, ExecutionScheduler, SchedulerDaemon,
-    SchedulerDaemonEvent, SchedulerDaemonRun, SchedulerDaemonState, SchedulerDaemonStatus,
-    SchedulerNodeOutcome, SchedulerNodeSelection,
+    durable_status_for_task, DurableSchedulerExplain, DurableSchedulerStatus,
+    DurableSchedulerTaskSnapshot, DurableSchedulerTick, DurableTaskScheduler, ExecutionScheduler,
+    SchedulerDaemon, SchedulerDaemonEvent, SchedulerDaemonRun, SchedulerDaemonState,
+    SchedulerDaemonStatus, SchedulerNodeOutcome, SchedulerNodeSelection,
 };
 pub use failure_classifier::{FailureClassification, FailureClassifier};
 pub use file_ops::{
@@ -230,8 +230,8 @@ pub use task_execution_engine::{
     TaskPlanProgress,
 };
 pub use task_memory_store::{
-    RecoveryActionMemorySummary, TaskMemoryEntry, TaskMemorySnapshot, TaskMemoryStore,
-    TaskMemorySummary, TaskRecoveryActionSignal,
+    RecoveryActionMemorySummary, TaskMemoryContext, TaskMemoryEntry, TaskMemorySnapshot,
+    TaskMemoryStore, TaskMemorySummary, TaskRecoveryActionSignal,
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
 pub use task_registry::{

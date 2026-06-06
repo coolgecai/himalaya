@@ -688,6 +688,7 @@ enum TaskPacketCliCommand {
 enum TaskSchedulerCliCommand {
     Tick,
     Queue,
+    Explain { task_id: String },
     Run { max_ticks: usize },
     Status,
 }
@@ -1460,7 +1461,7 @@ fn parse_task_cli_command(args: &[String]) -> Result<TaskCliCommand, String> {
             task_id: task_id.clone(),
         }),
         Some((other, _)) => Err(format!(
-            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|review <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
+            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|review <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler explain <task-id>|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
         )),
     }
 }
@@ -1490,10 +1491,13 @@ fn parse_task_scheduler_cli_command(args: &[String]) -> Result<TaskSchedulerCliC
     {
         None | Some(("tick", [])) => Ok(TaskSchedulerCliCommand::Tick),
         Some(("queue", [])) => Ok(TaskSchedulerCliCommand::Queue),
+        Some(("explain", [task_id])) => Ok(TaskSchedulerCliCommand::Explain {
+            task_id: task_id.clone(),
+        }),
         Some(("status", [])) => Ok(TaskSchedulerCliCommand::Status),
         Some(("run", rest)) => parse_task_scheduler_run_args(rest),
         Some((other, _)) => Err(format!(
-            "unknown tasks scheduler command: {other}\nUsage: Himalaya tasks scheduler [tick|queue|run [--once|--max-ticks N]|status]"
+            "unknown tasks scheduler command: {other}\nUsage: Himalaya tasks scheduler [tick|queue|explain <task-id>|run [--once|--max-ticks N]|status]"
         )),
     }
 }
@@ -8537,6 +8541,7 @@ fn task_report_value(
         .entry_for_task(&task_id)
         .cloned()
         .unwrap_or_else(|| runtime::TaskMemoryEntry::from_task(&task));
+    let memory_context = memory_store.context_for_entry(&memory_entry);
     let similar_memory_count = memory_store
         .similar_entries(&memory_entry.task_type)
         .into_iter()
@@ -8577,6 +8582,7 @@ fn task_report_value(
         "latest_recovery_action": latest_recovery_action,
         "task_memory": {
             "entry": memory_entry,
+            "context": memory_context,
             "similar_count": similar_memory_count,
             "summaries": memory_store.summaries(),
             "recovery_actions": memory_store.recovery_action_summaries(),
@@ -8604,6 +8610,7 @@ fn task_review_value(
     let latest_failure = &report["latest_failure"];
     let route_feedback = &report["route_feedback"];
     let recovery_action = &report["latest_recovery_action"];
+    let memory_context = report["task_memory"]["context"].clone();
     let route_summary_count = route_feedback["summaries"].as_array().map_or(0, Vec::len);
     let recovery_results = recovery_action["results"]
         .as_array()
@@ -8620,7 +8627,7 @@ fn task_review_value(
     Ok(json!({
         "type": "task_review",
         "task": report["task"].clone(),
-        "report": report,
+        "report": report.clone(),
         "failure_summary": {
             "class": latest_failure["failure_class"].as_str(),
             "reason": latest_failure["reason"].as_str(),
@@ -8638,6 +8645,17 @@ fn task_review_value(
             "routes": route_feedback["summaries"].clone(),
         },
         "memory_summary": report["task_memory"].clone(),
+        "planning_context": {
+            "task_type": memory_context["task_type"].clone(),
+            "similar_count": memory_context["similar_count"].clone(),
+            "successful_acceptance_tests": memory_context["successful_acceptance_tests"].clone(),
+            "common_failure_classes": memory_context["common_failure_classes"].clone(),
+            "recommendations": memory_context["recommendations"].clone(),
+        },
+        "recovery_policy": {
+            "actions": memory_context["recovery_actions"].clone(),
+            "route_failure_rate": memory_context["route_failure_rate"].clone(),
+        },
         "recommendations": recommendations,
     }))
 }
@@ -8686,6 +8704,14 @@ fn task_review_recommendations(report: &Value) -> Vec<String> {
         recommendations.push(format!(
             "Consult {similar_count} similar task memory entry/entries before planning the next task."
         ));
+    }
+    if let Some(items) = report["task_memory"]["context"]["recommendations"].as_array() {
+        recommendations.extend(
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|item| format!("Memory policy: {item}")),
+        );
     }
     if completed && !blocked {
         recommendations.push(
@@ -8870,6 +8896,17 @@ fn render_task_report_text(value: &Value) -> String {
             task_memory["similar_count"].as_u64().unwrap_or(0)
         ));
     }
+    if let Some(recommendations) = task_memory["context"]["recommendations"].as_array() {
+        if !recommendations.is_empty() {
+            lines.push("  Memory policy".to_string());
+            lines.extend(
+                recommendations
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|item| format!("    - {item}")),
+            );
+        }
+    }
     lines.join("\n")
 }
 
@@ -8909,6 +8946,20 @@ fn render_task_review_text(value: &Value) -> String {
                 .filter_map(Value::as_str)
                 .map(|item| format!("    - {item}")),
         );
+    }
+    lines.join("\n")
+}
+
+fn render_scheduler_explain_text(value: &runtime::DurableSchedulerExplain) -> String {
+    let mut lines = vec![format!(
+        "Scheduler explain\n  Task              {}\n  Would select      {}\n  Priority          {}\n  Runnable          {}\n  Reason            {}",
+        value.task_id, value.would_select, value.task.priority, value.task.runnable, value.reason
+    )];
+    if let Some(selected) = value.selected_task_id.as_ref() {
+        lines.push(format!("  Selected task     {selected}"));
+    }
+    if let Some(skip_reason) = value.task.skip_reason.as_ref() {
+        lines.push(format!("  Skip reason       {skip_reason}"));
     }
     lines.join("\n")
 }
@@ -9005,6 +9056,20 @@ fn run_task_scheduler_command(
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_task_output(
                         json!({"type":"task_scheduler_queue","queue":queue}),
+                        output_format,
+                    )?;
+                }
+            }
+        }
+        TaskSchedulerCliCommand::Explain { task_id } => {
+            let explanation = scheduler.explain(&task_id)?;
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!("{}", render_scheduler_explain_text(&explanation))
+                }
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(
+                        json!({"type":"task_scheduler_explain","explanation":explanation}),
                         output_format,
                     )?;
                 }
@@ -13349,7 +13414,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|review <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [prompt]|execute <task-id>|verify <task-id>|recover <task-id>|cancel <task-id>]"
+        "  Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|review <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler explain <task-id>|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [prompt]|execute <task-id>|verify <task-id>|recover <task-id>|cancel <task-id>]"
     )?;
     writeln!(
         out,
@@ -14735,6 +14800,19 @@ mod tests {
                 .expect("tasks scheduler queue should parse"),
             TaskCliCommand::Scheduler {
                 command: TaskSchedulerCliCommand::Queue,
+            }
+        );
+        assert_eq!(
+            parse_task_cli_command(&[
+                "scheduler".to_string(),
+                "explain".to_string(),
+                "task-1".to_string(),
+            ])
+            .expect("tasks scheduler explain should parse"),
+            TaskCliCommand::Scheduler {
+                command: TaskSchedulerCliCommand::Explain {
+                    task_id: "task-1".to_string(),
+                },
             }
         );
         assert_eq!(

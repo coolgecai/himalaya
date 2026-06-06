@@ -181,6 +181,9 @@ fn now_secs() -> u64 {
 }
 
 fn enrich_feedback_from_task_signals(task: &Task, feedback: &mut ModelRouteFeedback) {
+    if feedback.task_type.is_none() {
+        feedback.task_type = Some(crate::TaskMemoryStore::task_type_for(task));
+    }
     if let Some(result) = task.verification_result.as_ref() {
         feedback.succeeded = Some(result.passed);
         feedback.verification_passed = Some(result.passed);

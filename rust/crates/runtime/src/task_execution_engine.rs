@@ -7,9 +7,10 @@ use crate::{
     FailureClassification, FailureClassifier, ModelRouteDecision, ModelRouteFeedback,
     ModelRoutePhase, PermissionMode, PlanDag, PlanDagNode, PlanExecution, PlanNodeKind,
     PlanNodeStatus, RecoveryActionEngine, RecoveryActionExecution, RecoveryOrchestrator,
-    RecoveryOrchestratorOutcome, TaskPacket, TaskRegistry, TaskStatus, TeamCoordinator,
-    VerificationCommandResult, VerificationDecision, VerificationRequest, VerificationResult,
-    VerificationRunner, Worker, WorkerRegistry, WorkerStatus,
+    RecoveryOrchestratorOutcome, TaskMemoryContext, TaskMemoryStore, TaskPacket, TaskRegistry,
+    TaskStatus, TeamCoordinator, VerificationCommandResult, VerificationDecision,
+    VerificationRequest, VerificationResult, VerificationRunner, Worker, WorkerRegistry,
+    WorkerStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +66,8 @@ pub struct TaskExecutionReport {
     pub recovery_action: Option<RecoveryActionExecution>,
     pub final_status: TaskStatus,
     pub plan_progress: Option<TaskPlanProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_context: Option<TaskMemoryContext>,
     pub completed: bool,
     pub blocked: bool,
     pub message: String,
@@ -354,7 +357,15 @@ impl TaskExecutionEngine {
             }
             let node_id = current_plan_node(&self.registry, task_id);
             let engine = RecoveryActionEngine::new();
-            let plan = engine.plan(task_id.to_string(), &recovery_outcome, node_id);
+            let memory_context = self.registry.get(task_id).map(|task| {
+                TaskMemoryStore::from_tasks(&self.registry.list(None)).context_for_task(&task)
+            });
+            let plan = engine.plan_with_memory_context(
+                task_id.to_string(),
+                &recovery_outcome,
+                node_id,
+                memory_context.as_ref(),
+            );
             let action_execution =
                 engine.execute_against_registry(plan, permission_mode, &self.registry);
             let should_retry = action_execution.results.iter().any(|result| {
@@ -383,7 +394,7 @@ impl TaskExecutionEngine {
             .registry
             .get(task_id)
             .ok_or_else(|| format!("task not found: {task_id}"))?;
-        let report = task_execution_report_from_parts(
+        let mut report = task_execution_report_from_parts(
             task_id,
             outcome,
             verification_result,
@@ -392,6 +403,9 @@ impl TaskExecutionEngine {
             recovery,
             recovery_action,
             &final_task,
+        );
+        report.memory_context = Some(
+            TaskMemoryStore::from_tasks(&self.registry.list(None)).context_for_task(&final_task),
         );
         self.registry
             .record_task_execution_report(task_id, report.clone())?;
@@ -462,6 +476,10 @@ impl TaskExecutionEngine {
             .failure
             .as_ref()
             .map(|failure| failure.failure_class.clone());
+        let task_type = self
+            .registry
+            .get(&report.task_id)
+            .map(|task| TaskMemoryStore::task_type_for(&task));
         let note = Some(route_feedback_note(
             report,
             verification_decision.as_str(),
@@ -469,6 +487,7 @@ impl TaskExecutionEngine {
         ));
         let feedback =
             ModelRouteFeedback::pending(report.task_id.clone(), route, execution_now_secs())
+                .with_task_type(task_type)
                 .with_outcome(
                     report.completed && !report.blocked,
                     Some(verification_passed),
@@ -861,6 +880,10 @@ pub fn task_execution_report_from_parts(
         recovery_action,
         final_status: final_task.status,
         plan_progress: task_plan_progress(final_task),
+        memory_context: Some(
+            TaskMemoryStore::from_tasks(std::slice::from_ref(final_task))
+                .context_for_task(final_task),
+        ),
         completed,
         blocked,
         message,
