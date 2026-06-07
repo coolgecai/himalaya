@@ -711,6 +711,147 @@ fn task_scheduler_tick_persists_durable_status() {
 }
 
 #[test]
+fn autonomous_diagnostics_user_path_surfaces_next_actions() {
+    let root = unique_temp_dir("autonomous-diagnostics-user-path");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+    let packet_path = root.join("packet.json");
+    fs::write(
+        &packet_path,
+        r#"{
+  "objective": "Inspect autonomous daemon diagnostics",
+  "scope": "rust/crates/rusty-Himalaya-cli",
+  "repo": ".",
+  "branch_policy": "use current branch",
+  "acceptance_tests": ["python3 --version"],
+  "commit_policy": "do not commit automatically",
+  "reporting_contract": "surface next operator action",
+  "escalation_policy": "ask the user if blocked"
+}
+"#,
+    )
+    .expect("packet fixture should write");
+
+    let packet_arg = packet_path.to_str().expect("packet path should be utf8");
+    let created = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "packet",
+            "create",
+            packet_arg,
+        ],
+    );
+    assert_eq!(created["type"], "task_packet_create");
+    let started = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "daemon",
+            "start",
+            "--once",
+        ],
+    );
+    assert_eq!(started["type"], "task_scheduler_daemon_run");
+
+    let status = assert_text_command(&root, &["tasks", "daemon", "status"]);
+    assert_text_contains_all(
+        &status,
+        &[
+            "Health checkpoint",
+            "Next action",
+            "Safety",
+            "Guidance:",
+            "policy",
+        ],
+    );
+
+    let logs = assert_text_command(&root, &["tasks", "daemon", "logs", "--limit", "3"]);
+    assert_text_contains_all(
+        &logs,
+        &[
+            "Health checkpoint",
+            "Next action",
+            "Safety",
+            "Guidance:",
+            "policy",
+        ],
+    );
+
+    let report = assert_text_command(
+        &root,
+        &[
+            "tasks",
+            "daemon",
+            "report",
+            "--limit",
+            "5",
+            "--max-ticks",
+            "3",
+        ],
+    );
+    assert_text_contains_all(
+        &report,
+        &[
+            "Daemon report",
+            "Autonomous integration",
+            "Next action",
+            "Safety",
+            "Guidance:",
+            "Recommendations:",
+        ],
+    );
+
+    let evaluation = assert_text_command(
+        &root,
+        &[
+            "tasks",
+            "daemon",
+            "evaluate",
+            "--limit",
+            "5",
+            "--max-ticks",
+            "3",
+        ],
+    );
+    assert_text_contains_all(
+        &evaluation,
+        &[
+            "Autonomous evaluation",
+            "Total score",
+            "Autonomous integration",
+            "Next action",
+            "Guidance:",
+        ],
+    );
+
+    let replay = assert_text_command(
+        &root,
+        &[
+            "tasks",
+            "daemon",
+            "replay",
+            "--limit",
+            "5",
+            "--max-ticks",
+            "3",
+        ],
+    );
+    assert_text_contains_all(
+        &replay,
+        &[
+            "Autonomous trace replay",
+            "Current policy",
+            "Next action",
+            "Decisions:",
+        ],
+    );
+}
+
+#[test]
 fn daemon_worker_scheduler_smoke_completes_dispatched_task() {
     let root = unique_temp_dir("daemon-worker-scheduler-smoke");
     fs::create_dir_all(&root).expect("temp dir should exist");
@@ -1867,6 +2008,26 @@ fn complete_active_workers(root: &Path) -> Vec<String> {
 
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {
     assert_json_command_with_env(current_dir, args, &[])
+}
+
+fn assert_text_command(current_dir: &Path, args: &[&str]) -> String {
+    let output = run_Himalaya(current_dir, args, &[]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("stdout should be utf8")
+}
+
+fn assert_text_contains_all(text: &str, expected: &[&str]) {
+    for value in expected {
+        assert!(
+            text.contains(value),
+            "expected text to contain {value:?}\n\n{text}"
+        );
+    }
 }
 
 fn assert_json_command_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
