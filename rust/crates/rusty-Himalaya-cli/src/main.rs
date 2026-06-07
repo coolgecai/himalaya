@@ -4426,8 +4426,12 @@ fn render_autonomous_evaluation_text(value: &Value) -> String {
 
 fn render_autonomous_integration_text(value: &Value) -> String {
     let report = value.get("integration").unwrap_or(value);
+    let health = value.get("health");
     let summary = &report["summary"];
-    let status = report["status"].as_str().unwrap_or("unknown");
+    let status = health
+        .and_then(|health| health["status"].as_str())
+        .or_else(|| report["status"].as_str())
+        .unwrap_or("unknown");
     let failed = report["invariants"]
         .as_array()
         .map(|invariants| {
@@ -4446,9 +4450,29 @@ fn render_autonomous_integration_text(value: &Value) -> String {
                 .count()
         })
         .unwrap_or(0);
-    let mut lines = vec![
-        "Autonomous integration".to_string(),
-        format!("  Status            {status}"),
+    let mut lines = vec!["Autonomous integration".to_string()];
+    if let Some(health) = health {
+        lines.push(format!("  Status            {status}"));
+        if let Some(headline) = health["headline"].as_str() {
+            lines.push(format!("  Summary           {headline}"));
+        }
+        if let Some(next_action) = health["next_action"].as_str() {
+            lines.push(format!("  Next action       {next_action}"));
+        }
+        lines.push(format!(
+            "  Safety            iterate={} apply_policy={}",
+            health["safe_to_iterate"].as_bool().unwrap_or(false),
+            health["safe_to_apply_policy"].as_bool().unwrap_or(false)
+        ));
+        if let Some(blockers) = health["blockers"].as_array() {
+            for blocker in blockers.iter().filter_map(Value::as_str).take(3) {
+                lines.push(format!("  Blocker           {blocker}"));
+            }
+        }
+    } else {
+        lines.push(format!("  Status            {status}"));
+    }
+    lines.extend([
         format!(
             "  Tasks             {} total / {} runnable / {} blocked",
             summary["task_count"].as_u64().unwrap_or(0),
@@ -4477,7 +4501,7 @@ fn render_autonomous_integration_text(value: &Value) -> String {
             summary["policy_anomaly_count"].as_u64().unwrap_or(0)
         ),
         format!("  Invariants        {failed} failed / {warnings} warning(s)"),
-    ];
+    ]);
     if let Some(stages) = report["replay"]["stages"].as_array() {
         lines.push("Replay stages:".to_string());
         for stage in stages.iter().take(8) {
@@ -11272,6 +11296,7 @@ fn run_task_daemon_command(
             let integration = runtime::review_autonomous_integration(
                 build_autonomous_integration_input(limit, max_ticks, permission_mode)?,
             );
+            let health = runtime::autonomous_health_view(&integration);
             match output_format {
                 CliOutputFormat::Text => {
                     println!(
@@ -11292,6 +11317,7 @@ fn run_task_daemon_command(
                         "{}",
                         render_autonomous_integration_text(&json!({
                             "integration": integration,
+                            "health": health,
                         }))
                     );
                 }
@@ -11305,6 +11331,7 @@ fn run_task_daemon_command(
                             "summary":review.summary,
                             "policy_recommendation":review.recommendation,
                             "integration":integration,
+                            "health":health,
                             "state_path":daemon.state_path(),
                             "events_path":daemon.events_path(),
                             "runs_path":coordinator.runs_path(),
@@ -11322,12 +11349,14 @@ fn run_task_daemon_command(
             let integration = runtime::review_autonomous_integration(
                 build_autonomous_integration_input(limit, max_ticks, permission_mode)?,
             );
+            let health = runtime::autonomous_health_view(&integration);
             let value = json!({
                 "type":"task_scheduler_daemon_evaluation",
                 "state":state,
                 "latest_run":latest_run,
                 "evaluation":evaluation,
                 "integration":integration,
+                "health":health,
                 "state_path":daemon.state_path(),
                 "events_path":daemon.events_path(),
                 "runs_path":coordinator.runs_path(),
@@ -15884,11 +15913,26 @@ mod tests {
                 "recommendations": [
                     "Complete missing golden replay stages."
                 ]
+            },
+            "health": {
+                "status": "degraded",
+                "headline": "Autonomous loop is usable but missing complete evidence.",
+                "next_action": "Complete missing golden replay stages.",
+                "safe_to_iterate": true,
+                "safe_to_apply_policy": false,
+                "blockers": [],
+                "warnings": ["replay routing_policy_replay needs evidence"],
+                "highlights": ["tasks=2 runnable=1 blocked=1"]
             }
         }));
 
         assert!(text.contains("Autonomous integration"));
         assert!(text.contains("Status            degraded"));
+        assert!(text.contains(
+            "Summary           Autonomous loop is usable but missing complete evidence."
+        ));
+        assert!(text.contains("Next action       Complete missing golden replay stages."));
+        assert!(text.contains("Safety            iterate=true apply_policy=false"));
         assert!(text.contains("2 total / 1 runnable / 1 blocked"));
         assert!(text.contains("routing_policy_replay: warning"));
         assert!(text.contains("Complete missing golden replay stages."));

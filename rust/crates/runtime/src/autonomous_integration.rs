@@ -11,6 +11,7 @@ use crate::{
 };
 
 pub const AUTONOMOUS_INTEGRATION_REPORT_VERSION: u32 = 1;
+pub const AUTONOMOUS_HEALTH_VIEW_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct AutonomousIntegrationInput {
@@ -125,6 +126,19 @@ pub struct AutonomousIntegrationReport {
     pub recommendations: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutonomousHealthView {
+    pub version: u32,
+    pub status: AutonomousIntegrationStatus,
+    pub headline: String,
+    pub next_action: String,
+    pub safe_to_iterate: bool,
+    pub safe_to_apply_policy: bool,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+    pub highlights: Vec<String>,
+}
+
 #[must_use]
 pub fn review_autonomous_integration(
     input: AutonomousIntegrationInput,
@@ -145,6 +159,27 @@ pub fn review_autonomous_integration(
         invariants,
         replay,
         recommendations,
+    }
+}
+
+#[must_use]
+pub fn autonomous_health_view(report: &AutonomousIntegrationReport) -> AutonomousHealthView {
+    let blockers = health_blockers(report);
+    let warnings = health_warnings(report);
+    let safe_to_iterate = blockers.is_empty();
+    let safe_to_apply_policy = report.status == AutonomousIntegrationStatus::Healthy
+        && report.summary.policy_anomaly_count == 0
+        && blockers.is_empty();
+    AutonomousHealthView {
+        version: AUTONOMOUS_HEALTH_VIEW_VERSION,
+        status: report.status,
+        headline: health_headline(report.status),
+        next_action: health_next_action(report, &blockers),
+        safe_to_iterate,
+        safe_to_apply_policy,
+        blockers,
+        warnings,
+        highlights: health_highlights(report),
     }
 }
 
@@ -846,6 +881,140 @@ fn integration_recommendations(
     recommendations
 }
 
+fn health_headline(status: AutonomousIntegrationStatus) -> String {
+    match status {
+        AutonomousIntegrationStatus::Healthy => {
+            "Autonomous loop is healthy and ready for supervised iteration.".to_string()
+        }
+        AutonomousIntegrationStatus::Degraded => {
+            "Autonomous loop is usable but missing complete evidence.".to_string()
+        }
+        AutonomousIntegrationStatus::Blocked => {
+            "Autonomous loop is blocked by failed integration invariants.".to_string()
+        }
+    }
+}
+
+fn health_next_action(report: &AutonomousIntegrationReport, blockers: &[String]) -> String {
+    if let Some(blocker) = blockers.first() {
+        return format!("Resolve blocker: {blocker}");
+    }
+    if report.status == AutonomousIntegrationStatus::Degraded {
+        return report.recommendations.first().cloned().unwrap_or_else(|| {
+            "Collect missing daemon, memory, routing, policy, or replay evidence.".to_string()
+        });
+    }
+    "Continue with a bounded autonomous run or governed policy dry-run.".to_string()
+}
+
+fn health_blockers(report: &AutonomousIntegrationReport) -> Vec<String> {
+    let mut blockers = Vec::new();
+    blockers.extend(
+        report
+            .components
+            .iter()
+            .filter(|component| component.status == AutonomousIntegrationCheckStatus::Failed)
+            .map(|component| format!("{}: {}", component.name, component.message)),
+    );
+    blockers.extend(
+        report
+            .invariants
+            .iter()
+            .filter(|invariant| invariant.status == AutonomousIntegrationCheckStatus::Failed)
+            .map(|invariant| {
+                if invariant.evidence.is_empty() {
+                    format!("{}: {}", invariant.name, invariant.message)
+                } else {
+                    format!(
+                        "{}: {} ({})",
+                        invariant.name,
+                        invariant.message,
+                        invariant.evidence.join(", ")
+                    )
+                }
+            }),
+    );
+    blockers.extend(
+        report
+            .replay
+            .stages
+            .iter()
+            .filter(|stage| stage.status == AutonomousIntegrationCheckStatus::Failed)
+            .map(|stage| format!("replay {} failed", stage.name)),
+    );
+    blockers
+}
+
+fn health_warnings(report: &AutonomousIntegrationReport) -> Vec<String> {
+    let mut warnings = Vec::new();
+    warnings.extend(
+        report
+            .components
+            .iter()
+            .filter(|component| component.status == AutonomousIntegrationCheckStatus::Warning)
+            .map(|component| format!("{}: {}", component.name, component.message)),
+    );
+    warnings.extend(
+        report
+            .invariants
+            .iter()
+            .filter(|invariant| invariant.status == AutonomousIntegrationCheckStatus::Warning)
+            .map(|invariant| {
+                if invariant.evidence.is_empty() {
+                    format!("{}: {}", invariant.name, invariant.message)
+                } else {
+                    format!(
+                        "{}: {} ({})",
+                        invariant.name,
+                        invariant.message,
+                        invariant.evidence.join(", ")
+                    )
+                }
+            }),
+    );
+    warnings.extend(
+        report
+            .replay
+            .stages
+            .iter()
+            .filter(|stage| stage.status == AutonomousIntegrationCheckStatus::Warning)
+            .map(|stage| format!("replay {} needs evidence", stage.name)),
+    );
+    warnings
+}
+
+fn health_highlights(report: &AutonomousIntegrationReport) -> Vec<String> {
+    vec![
+        format!(
+            "tasks={} runnable={} blocked={}",
+            report.summary.task_count,
+            report.summary.runnable_task_count,
+            report.summary.blocked_task_count
+        ),
+        format!(
+            "workers={} active={} blocked={}",
+            report.summary.worker_count,
+            report.summary.active_worker_count,
+            report.summary.blocked_worker_count
+        ),
+        format!(
+            "memory={} route_feedback={}",
+            report.summary.task_memory_entries, report.summary.route_feedback_entries
+        ),
+        format!(
+            "policy_lifecycles={} policy_anomalies={}",
+            report.summary.policy_lifecycle_count, report.summary.policy_anomaly_count
+        ),
+        format!(
+            "replay_stages={} passed={} warnings={} failed={}",
+            report.replay.stage_count,
+            report.replay.passed_stage_count,
+            report.replay.warning_stage_count,
+            report.replay.failed_stage_count
+        ),
+    ]
+}
+
 fn duplicates<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut counts = BTreeMap::<&str, usize>::new();
     for value in values {
@@ -1045,6 +1214,47 @@ mod tests {
     }
 
     #[test]
+    fn health_view_allows_iteration_and_policy_apply_when_healthy() {
+        let report = review_autonomous_integration(base_input());
+        let health = autonomous_health_view(&report);
+
+        assert_eq!(health.status, AutonomousIntegrationStatus::Healthy);
+        assert!(health.safe_to_iterate);
+        assert!(health.safe_to_apply_policy);
+        assert!(health.blockers.is_empty());
+        assert!(health
+            .next_action
+            .contains("bounded autonomous run or governed policy dry-run"));
+    }
+
+    #[test]
+    fn health_view_allows_iteration_but_not_policy_apply_when_degraded() {
+        let mut input = base_input();
+        input.route_feedback = RouteFeedbackStore::new();
+        input.evaluation = Some(evaluate_autonomous_loop(AutonomousEvaluationInput {
+            tasks: input.tasks.clone(),
+            task_memory: input.task_memory.clone(),
+            route_feedback: input.route_feedback.clone(),
+            autonomous_runs: input.autonomous_runs.clone(),
+            permission_mode: PermissionMode::ReadOnly,
+            requested_max_ticks: 3,
+            policy_replay: input.policy_replay.clone(),
+        }));
+
+        let report = review_autonomous_integration(input);
+        let health = autonomous_health_view(&report);
+
+        assert_eq!(health.status, AutonomousIntegrationStatus::Degraded);
+        assert!(health.safe_to_iterate);
+        assert!(!health.safe_to_apply_policy);
+        assert!(health.blockers.is_empty());
+        assert!(health
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("routing")));
+    }
+
+    #[test]
     fn integration_report_flags_unknown_feedback_task() {
         let mut input = base_input();
         input.route_feedback = RouteFeedbackStore::from_feedback(vec![route_feedback("missing")]);
@@ -1060,6 +1270,25 @@ mod tests {
             .expect("route feedback invariant");
         assert_eq!(invariant.status, AutonomousIntegrationCheckStatus::Failed);
         assert_eq!(invariant.evidence, vec!["missing".to_string()]);
+    }
+
+    #[test]
+    fn health_view_blocks_iteration_when_invariant_fails() {
+        let mut input = base_input();
+        input.route_feedback = RouteFeedbackStore::from_feedback(vec![route_feedback("missing")]);
+        input.evaluation = None;
+
+        let report = review_autonomous_integration(input);
+        let health = autonomous_health_view(&report);
+
+        assert_eq!(health.status, AutonomousIntegrationStatus::Blocked);
+        assert!(!health.safe_to_iterate);
+        assert!(!health.safe_to_apply_policy);
+        assert!(health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("route_feedback_reference_tasks")));
+        assert!(health.next_action.contains("Resolve blocker"));
     }
 
     #[test]

@@ -83,11 +83,12 @@ pub use autonomous_evaluation::{
     AUTONOMOUS_EVALUATION_VERSION,
 };
 pub use autonomous_integration::{
-    review_autonomous_integration, AutonomousIntegrationCheckStatus,
-    AutonomousIntegrationComponent, AutonomousIntegrationInput, AutonomousIntegrationInvariant,
-    AutonomousIntegrationReplayStage, AutonomousIntegrationReplaySummary,
-    AutonomousIntegrationReport, AutonomousIntegrationSeverity, AutonomousIntegrationStatus,
-    AutonomousIntegrationSummary, AUTONOMOUS_INTEGRATION_REPORT_VERSION,
+    autonomous_health_view, review_autonomous_integration, AutonomousHealthView,
+    AutonomousIntegrationCheckStatus, AutonomousIntegrationComponent, AutonomousIntegrationInput,
+    AutonomousIntegrationInvariant, AutonomousIntegrationReplayStage,
+    AutonomousIntegrationReplaySummary, AutonomousIntegrationReport, AutonomousIntegrationSeverity,
+    AutonomousIntegrationStatus, AutonomousIntegrationSummary, AUTONOMOUS_HEALTH_VIEW_VERSION,
+    AUTONOMOUS_INTEGRATION_REPORT_VERSION,
 };
 pub use autonomous_run::{
     append_autonomous_run_report, autonomous_runs_path, latest_autonomous_run_report,

@@ -27,6 +27,16 @@ The runtime constructor is pure: it does not read files, write files, start work
 - `replay`: golden replay stage coverage for the end-to-end autonomous path
 - `recommendations`: operator-oriented next actions
 
+P7-B also derives an `AutonomousHealthView` from the integration report. It is the user-facing convergence layer for daemon report/evaluate output:
+
+- `headline`: short human-readable status summary
+- `next_action`: the single most useful next operator action
+- `safe_to_iterate`: whether another bounded autonomous run is reasonable
+- `safe_to_apply_policy`: whether governed policy apply is currently supported by healthy evidence
+- `blockers`, `warnings`, and `highlights`: compact operational context
+
+The health view is still read-only. It never starts workers, ticks the scheduler, writes ledgers, applies policy, or rolls anything back.
+
 ## Invariants
 
 The current hard checks verify that scheduler queues/events, task memory entries, route feedback, and plan worker ids reference known tasks/workers. Evaluation counters are also checked against the diagnostic snapshot.
@@ -50,3 +60,5 @@ This makes dry-run policy simulations visible without confusing them with persis
 ## CLI Surface
 
 `Himalaya tasks daemon report` and `Himalaya tasks daemon evaluate` include the integration report in JSON and stream-json output. Text output appends a compact integration summary after the existing daemon or evaluation section.
+
+Those same commands now include `health` in JSON and stream-json output. Text output prints the health status, headline, next action, and safe-to-iterate/apply-policy flags before lower-level counters.

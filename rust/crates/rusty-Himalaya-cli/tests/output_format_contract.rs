@@ -610,6 +610,11 @@ fn task_scheduler_tick_persists_durable_status() {
     assert!(daemon_report["integration"]["summary"].is_object());
     assert!(daemon_report["integration"]["invariants"].is_array());
     assert!(daemon_report["integration"]["replay"]["stages"].is_array());
+    assert!(daemon_report["health"].is_object());
+    assert!(daemon_report["health"]["status"].is_string());
+    assert!(daemon_report["health"]["next_action"].is_string());
+    assert!(daemon_report["health"]["safe_to_iterate"].is_boolean());
+    assert!(daemon_report["health"]["safe_to_apply_policy"].is_boolean());
 
     let daemon_evaluation = assert_json_command(
         &root,
@@ -648,6 +653,9 @@ fn task_scheduler_tick_persists_durable_status() {
     );
     assert!(daemon_evaluation["integration"].is_object());
     assert!(daemon_evaluation["integration"]["summary"].is_object());
+    assert!(daemon_evaluation["health"].is_object());
+    assert!(daemon_evaluation["health"]["status"].is_string());
+    assert!(daemon_evaluation["health"]["next_action"].is_string());
 
     let daemon_replay = assert_json_command(
         &root,
