@@ -9615,6 +9615,15 @@ fn render_policy_replay_text(value: &Value) -> String {
     let mut lines = vec![format!(
         "Policy replay\n  Lifecycles {lifecycles}\n  Events     {events}\n  Anomalies  {anomalies}\n  Malformed  {malformed}"
     )];
+    if let Some(domains) = render_json_count_map(&summary["domain_counts"], 5) {
+        lines.push(format!("  Domains   {domains}"));
+    }
+    if let Some(actions) = render_json_count_map(&summary["action_counts"], 5) {
+        lines.push(format!("  Actions   {actions}"));
+    }
+    if let Some(anomaly_kinds) = render_json_count_map(&summary["anomaly_kind_counts"], 5) {
+        lines.push(format!("  Anomaly kinds {anomaly_kinds}"));
+    }
     for lifecycle in replay["lifecycles"]
         .as_array()
         .cloned()
@@ -9635,12 +9644,30 @@ fn render_policy_apply_plan_text(value: &Value) -> String {
     let plan = &value["plan"];
     let status = plan["status"].as_str().unwrap_or("unknown");
     let actions = plan["actions"].as_array().map_or(0, Vec::len);
+    let adapters = plan["adapters"].as_array().map_or(0, Vec::len);
     let blockers = plan["blockers"].as_array().map_or(0, Vec::len);
     let recorded = value["recorded"].as_bool().unwrap_or(false);
     let mut lines = vec![format!(
-        "Policy apply plan\n  Status   {status}\n  Actions  {actions}\n  Blockers {blockers}\n  Recorded {recorded}"
+        "Policy apply plan\n  Status   {status}\n  Actions  {actions}\n  Adapters {adapters}\n  Blockers {blockers}\n  Recorded {recorded}"
     )];
+    if let Some(adapters) = plan["adapters"].as_array() {
+        lines.push("Adapters:".to_string());
+        for adapter in adapters.iter().take(6) {
+            let domain = adapter["domain"].as_str().unwrap_or("unknown");
+            let name = adapter["name"].as_str().unwrap_or("unknown");
+            let persistent = adapter["supports_persistent_apply"]
+                .as_bool()
+                .unwrap_or(false);
+            let dry_run = adapter["supports_dry_run"].as_bool().unwrap_or(false);
+            let rollback = adapter["supports_rollback"].as_bool().unwrap_or(false);
+            let planned_only = adapter["planned_only"].as_bool().unwrap_or(false);
+            lines.push(format!(
+                "  - {domain}/{name}: persistent={persistent}, dry_run={dry_run}, rollback={rollback}, planned_only={planned_only}"
+            ));
+        }
+    }
     if let Some(actions) = plan["actions"].as_array() {
+        lines.push("Actions:".to_string());
         for action in actions {
             let domain = action["domain"].as_str().unwrap_or("unknown");
             let proposal = action["proposal_id"].as_str().unwrap_or("none");
@@ -9661,10 +9688,14 @@ fn render_governed_policy_apply_text(value: &Value) -> String {
     let applied = apply["applied"].as_bool().unwrap_or(false);
     let blockers = apply["blockers"].as_array().map_or(0, Vec::len);
     let receipt = apply["receipt"]["id"].as_str().unwrap_or("unknown");
+    let adapter = apply["receipt"]["adapter"].as_str().unwrap_or("none");
+    let adapter_report_kind = apply["adapter_report"]["kind"].as_str().unwrap_or("none");
     let mut lines = vec![format!(
         "Policy apply\n  Status   {status}\n  Dry run  {dry_run}\n  Applied  {applied}\n  Blockers {blockers}"
     )];
     lines.push(format!("  Receipt  {receipt}"));
+    lines.push(format!("  Adapter  {adapter}"));
+    lines.push(format!("  Adapter report {adapter_report_kind}"));
     for blocker in apply["structured_blockers"]
         .as_array()
         .cloned()
@@ -9685,10 +9716,16 @@ fn render_governed_policy_rollback_text(value: &Value) -> String {
     let rolled_back = rollback["rolled_back"].as_bool().unwrap_or(false);
     let blockers = rollback["blockers"].as_array().map_or(0, Vec::len);
     let receipt = rollback["receipt"]["id"].as_str().unwrap_or("unknown");
+    let adapter = rollback["receipt"]["adapter"].as_str().unwrap_or("none");
+    let adapter_report_kind = rollback["adapter_report"]["kind"]
+        .as_str()
+        .unwrap_or("none");
     let mut lines = vec![format!(
         "Policy rollback\n  Status      {status}\n  Rolled back {rolled_back}\n  Blockers    {blockers}"
     )];
     lines.push(format!("  Receipt     {receipt}"));
+    lines.push(format!("  Adapter     {adapter}"));
+    lines.push(format!("  Adapter report {adapter_report_kind}"));
     for blocker in rollback["structured_blockers"]
         .as_array()
         .cloned()
@@ -9701,6 +9738,26 @@ fn render_governed_policy_rollback_text(value: &Value) -> String {
         lines.push(format!("  - {kind}: {reason}"));
     }
     lines.join("\n")
+}
+
+fn render_json_count_map(value: &Value, limit: usize) -> Option<String> {
+    let object = value.as_object()?;
+    if object.is_empty() {
+        return None;
+    }
+    let mut counts = object
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_u64().unwrap_or(0)))
+        .collect::<Vec<_>>();
+    counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    Some(
+        counts
+            .into_iter()
+            .take(limit)
+            .map(|(key, count)| format!("{key}={count}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 fn run_worker_command(
@@ -15481,10 +15538,11 @@ mod tests {
         parse_history_count, parse_policy_cli_command, parse_route_cli_command,
         parse_task_cli_command, parse_worker_cli_command, permission_policy, print_help_to,
         push_output_block, render_config_report, render_diff_report, render_diff_report_for,
-        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        render_governed_policy_apply_text, render_memory_report, render_policy_apply_plan_text,
+        render_policy_replay_text, render_prompt_history_report, render_repl_help,
+        render_resume_usage, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, slash_command_status, status_context,
         stream_json_event, summarize_tool_payload_for_markdown, validate_no_args,
         write_mcp_server_fixture, BenchmarkCliCommand, CliAction, CliOutputFormat, CliToolExecutor,
@@ -15541,6 +15599,95 @@ mod tests {
             event["protocol_version"],
             serde_json::Value::from(STREAM_PROTOCOL_VERSION)
         );
+    }
+
+    #[test]
+    fn policy_apply_plan_text_includes_adapter_summary() {
+        let text = render_policy_apply_plan_text(&json!({
+            "type": "policy_apply_plan",
+            "recorded": false,
+            "plan": {
+                "status": "planned",
+                "blockers": [],
+                "adapters": [{
+                    "domain": "routing",
+                    "name": "routing_policy",
+                    "supports_persistent_apply": true,
+                    "supports_dry_run": true,
+                    "supports_rollback": true,
+                    "planned_only": false
+                }],
+                "actions": [{
+                    "domain": "routing",
+                    "proposal_id": "route-proposal-1",
+                    "status": "planned",
+                    "executable": true
+                }]
+            }
+        }));
+
+        assert!(text.contains("Adapters 1"));
+        assert!(text.contains("routing/routing_policy"));
+        assert!(text.contains("persistent=true"));
+        assert!(text.contains("Actions:"));
+    }
+
+    #[test]
+    fn policy_apply_text_includes_adapter_report_kind() {
+        let text = render_governed_policy_apply_text(&json!({
+            "type": "policy_apply",
+            "apply": {
+                "status": "dry_run_passed",
+                "dry_run": true,
+                "applied": false,
+                "blockers": [],
+                "receipt": {
+                    "id": "policy-apply-1-receipt",
+                    "adapter": "routing_policy"
+                },
+                "adapter_report": {
+                    "kind": "routing_apply",
+                    "report": {}
+                },
+                "structured_blockers": []
+            }
+        }));
+
+        assert!(text.contains("Adapter  routing_policy"));
+        assert!(text.contains("Adapter report routing_apply"));
+    }
+
+    #[test]
+    fn policy_replay_text_includes_distribution_summary() {
+        let text = render_policy_replay_text(&json!({
+            "type": "policy_replay",
+            "replay": {
+                "summary": {
+                    "lifecycle_count": 2,
+                    "event_count": 4,
+                    "anomaly_count": 1,
+                    "malformed_lines": 0,
+                    "domain_counts": {
+                        "routing": 1,
+                        "memory": 1
+                    },
+                    "action_counts": {
+                        "apply_routing_policy_overlay": 2,
+                        "dry_run_memory_policy_coverage": 2
+                    },
+                    "anomaly_kind_counts": {
+                        "duplicate_status": 1
+                    }
+                },
+                "lifecycles": []
+            }
+        }));
+
+        assert!(text.contains("Domains"));
+        assert!(text.contains("routing=1"));
+        assert!(text.contains("Actions"));
+        assert!(text.contains("dry_run_memory_policy_coverage=2"));
+        assert!(text.contains("Anomaly kinds duplicate_status=1"));
     }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {

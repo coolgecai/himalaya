@@ -481,6 +481,7 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use super::*;
@@ -650,6 +651,9 @@ mod tests {
                 event_count: 1,
                 anomaly_count: 0,
                 malformed_lines: 0,
+                domain_counts: BTreeMap::new(),
+                action_counts: BTreeMap::new(),
+                anomaly_kind_counts: BTreeMap::new(),
             },
         };
 
