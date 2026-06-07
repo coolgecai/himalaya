@@ -22,10 +22,14 @@ export type KnownStreamEventType =
   | 'recovery_event'
   | 'recovery_action_event'
   | 'task_execution_event'
+  | 'task_execution_report_event'
   | 'local_command'
   | 'recovery_suggestion'
   | 'task_list'
   | 'task_show'
+  | 'task_status'
+  | 'task_report'
+  | 'task_review'
   | 'task_execution'
   | 'task_recovery'
   | 'task_verification'
@@ -38,13 +42,37 @@ export type KnownStreamEventType =
   | 'task_packet_status'
   | 'task_scheduler_tick'
   | 'task_scheduler_queue'
+  | 'task_scheduler_explain'
   | 'task_scheduler_daemon_run'
   | 'task_scheduler_daemon_status'
   | 'task_scheduler_daemon_logs'
+  | 'task_scheduler_daemon_report'
+  | 'task_scheduler_daemon_evaluation'
+  | 'task_scheduler_daemon_replay'
+  | 'autonomous_preflight_blocked'
+  | 'cron_list'
+  | 'cron_create'
+  | 'cron_delete'
+  | 'cron_fired'
+  | 'cron_fire_failed'
+  | 'cron_run'
   | 'route_feedback_summary'
+  | 'route_optimizer_report'
+  | 'route_optimizer_replay'
+  | 'route_policy_proposal'
+  | 'route_policy_apply'
+  | 'route_policy_rollback'
+  | 'route_policy_list'
+  | 'policy_review'
+  | 'policy_apply_plan'
+  | 'policy_apply'
+  | 'policy_rollback'
+  | 'policy_ledger'
+  | 'policy_replay'
   | 'benchmark_suite'
   | 'benchmark_task'
   | 'benchmark_run'
+  | 'benchmark_autonomous'
   | 'worker_list'
   | 'worker_create'
   | 'worker_spawn'
@@ -399,10 +427,14 @@ export const KNOWN_STREAM_EVENT_TYPES: readonly KnownStreamEventType[] = [
   'recovery_event',
   'recovery_action_event',
   'task_execution_event',
+  'task_execution_report_event',
   'local_command',
   'recovery_suggestion',
   'task_list',
   'task_show',
+  'task_status',
+  'task_report',
+  'task_review',
   'task_execution',
   'task_recovery',
   'task_verification',
@@ -415,13 +447,37 @@ export const KNOWN_STREAM_EVENT_TYPES: readonly KnownStreamEventType[] = [
   'task_packet_status',
   'task_scheduler_tick',
   'task_scheduler_queue',
+  'task_scheduler_explain',
   'task_scheduler_daemon_run',
   'task_scheduler_daemon_status',
   'task_scheduler_daemon_logs',
+  'task_scheduler_daemon_report',
+  'task_scheduler_daemon_evaluation',
+  'task_scheduler_daemon_replay',
+  'autonomous_preflight_blocked',
+  'cron_list',
+  'cron_create',
+  'cron_delete',
+  'cron_fired',
+  'cron_fire_failed',
+  'cron_run',
   'route_feedback_summary',
+  'route_optimizer_report',
+  'route_optimizer_replay',
+  'route_policy_proposal',
+  'route_policy_apply',
+  'route_policy_rollback',
+  'route_policy_list',
+  'policy_review',
+  'policy_apply_plan',
+  'policy_apply',
+  'policy_rollback',
+  'policy_ledger',
+  'policy_replay',
   'benchmark_suite',
   'benchmark_task',
   'benchmark_run',
+  'benchmark_autonomous',
   'worker_list',
   'worker_create',
   'worker_spawn',
@@ -574,6 +630,8 @@ function validateStreamEventShape(event: Record<string, unknown>): boolean {
       const outcome = event.task_execution_event as Record<string, unknown>;
       return hasString(outcome, 'task_id') && hasArray(outcome, 'steps') && hasBoolean(outcome, 'completed') && hasBoolean(outcome, 'blocked') && hasString(outcome, 'message');
     }
+    case 'task_execution_report_event':
+      return hasObject(event, 'task_execution_report_event');
     case 'local_command':
       return hasString(event, 'command') && hasString(event, 'status') && hasString(event, 'summary');
     case 'recovery_suggestion':
@@ -582,6 +640,12 @@ function validateStreamEventShape(event: Record<string, unknown>): boolean {
       return hasArray(event, 'tasks');
     case 'task_show':
       return hasObject(event, 'task') && hasArray(event, 'ledger');
+    case 'task_status':
+      return hasObject(event, 'task') && hasObject(event, 'verification') && hasObject(event, 'current_blocker') && hasArray(event, 'ledger') && 'plan_progress' in event;
+    case 'task_report':
+      return hasObject(event, 'task') && hasObject(event, 'status_snapshot') && hasObject(event, 'route_feedback');
+    case 'task_review':
+      return hasObject(event, 'task') && hasObject(event, 'report') && hasArray(event, 'recommendations');
     case 'task_execution':
       return hasObject(event, 'outcome');
     case 'task_recovery':
@@ -604,19 +668,64 @@ function validateStreamEventShape(event: Record<string, unknown>): boolean {
       return hasObject(event, 'tick');
     case 'task_scheduler_queue':
       return hasArray(event, 'queue');
+    case 'task_scheduler_explain':
+      return hasObject(event, 'explanation');
     case 'task_scheduler_daemon_run':
       return hasArray(event, 'runs') && ('state' in event);
     case 'task_scheduler_daemon_status':
       return 'state' in event && hasString(event, 'state_path') && hasString(event, 'events_path');
     case 'task_scheduler_daemon_logs':
       return hasArray(event, 'events') && hasString(event, 'events_path');
+    case 'task_scheduler_daemon_report':
+      return hasObject(event, 'summary') && hasObject(event, 'policy_recommendation') && hasObject(event, 'integration') && hasObject(event, 'health');
+    case 'task_scheduler_daemon_evaluation':
+      return hasObject(event, 'evaluation');
+    case 'task_scheduler_daemon_replay':
+      return hasObject(event, 'replay');
+    case 'autonomous_preflight_blocked':
+      return hasString(event, 'operation') && hasString(event, 'next_action') && hasObject(event, 'health');
+    case 'cron_list':
+      return hasArray(event, 'crons');
+    case 'cron_create':
+    case 'cron_delete':
+    case 'cron_fired':
+    case 'cron_fire_failed':
+      return hasString(event, 'cron_id');
+    case 'cron_run':
+      return hasObject(event, 'summary') && hasArray(event, 'created_tasks') && hasArray(event, 'failed');
     case 'route_feedback_summary':
       return hasArray(event, 'summaries') && hasNumber(event, 'feedback_count');
+    case 'route_optimizer_report':
+      return hasObject(event, 'report');
+    case 'route_optimizer_replay':
+      return hasObject(event, 'replay');
+    case 'route_policy_proposal':
+      return hasObject(event, 'proposal');
+    case 'route_policy_apply':
+      return hasObject(event, 'apply');
+    case 'route_policy_rollback':
+      return hasObject(event, 'rollback');
+    case 'route_policy_list':
+      return hasArray(event, 'proposals');
+    case 'policy_review':
+      return hasObject(event, 'review');
+    case 'policy_apply_plan':
+      return hasObject(event, 'plan');
+    case 'policy_apply':
+      return hasObject(event, 'apply');
+    case 'policy_rollback':
+      return hasObject(event, 'rollback');
+    case 'policy_ledger':
+      return hasObject(event, 'ledger');
+    case 'policy_replay':
+      return hasObject(event, 'replay');
     case 'benchmark_suite':
       return hasString(event, 'suite_id') && hasString(event, 'version') && hasArray(event, 'tasks');
     case 'benchmark_task':
       return hasObject(event, 'task');
     case 'benchmark_run':
+      return hasObject(event, 'run');
+    case 'benchmark_autonomous':
       return hasObject(event, 'run');
     case 'worker_list':
       return hasArray(event, 'workers');

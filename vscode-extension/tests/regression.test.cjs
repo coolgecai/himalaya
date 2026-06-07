@@ -519,12 +519,37 @@ test('stream protocol helpers behave as expected', async () => {
     ['task_packet_status', '{"type":"task_packet_status","task":{"task_id":"task-1"},"ledger":[],"verification_handoff":{},"protocol_version":1}'],
     ['task_scheduler_tick', '{"type":"task_scheduler_tick","tick":{"status":"blocked","selected_task_id":"task-1","queue":[]},"protocol_version":1}'],
     ['task_scheduler_queue', '{"type":"task_scheduler_queue","queue":[{"task_id":"task-1","status":"pending","task_status":"created"}],"protocol_version":1}'],
+    ['task_scheduler_explain', '{"type":"task_scheduler_explain","explanation":{"task_id":"task-1","selected":true},"protocol_version":1}'],
     ['task_scheduler_daemon_run', '{"type":"task_scheduler_daemon_run","runs":[],"state":null,"protocol_version":1}'],
     ['task_scheduler_daemon_status', '{"type":"task_scheduler_daemon_status","state":null,"state_path":"/tmp/state.json","events_path":"/tmp/events.jsonl","protocol_version":1}'],
+    ['task_scheduler_daemon_logs', '{"type":"task_scheduler_daemon_logs","events":[],"events_path":"/tmp/events.jsonl","health":{"status":"degraded","next_action":"Run report"},"protocol_version":1}'],
+    ['task_scheduler_daemon_report', '{"type":"task_scheduler_daemon_report","summary":{},"policy_recommendation":{},"integration":{},"health":{},"runs_path":"/tmp/runs.jsonl","protocol_version":1}'],
+    ['task_scheduler_daemon_evaluation', '{"type":"task_scheduler_daemon_evaluation","evaluation":{},"runs_path":"/tmp/runs.jsonl","protocol_version":1}'],
+    ['task_scheduler_daemon_replay', '{"type":"task_scheduler_daemon_replay","replay":{},"runs_path":"/tmp/runs.jsonl","protocol_version":1}'],
+    ['autonomous_preflight_blocked', '{"type":"autonomous_preflight_blocked","operation":"policy apply","next_action":"Run dry-run","health":{},"protocol_version":1}'],
+    ['cron_list', '{"type":"cron_list","crons":[],"protocol_version":1}'],
+    ['cron_create', '{"type":"cron_create","cron_id":"cron-1","protocol_version":1}'],
+    ['cron_delete', '{"type":"cron_delete","cron_id":"cron-1","protocol_version":1}'],
+    ['cron_fired', '{"type":"cron_fired","cron_id":"cron-1","task_id":"task-1","protocol_version":1}'],
+    ['cron_fire_failed', '{"type":"cron_fire_failed","cron_id":"cron-1","reason":"not due","protocol_version":1}'],
+    ['cron_run', '{"type":"cron_run","summary":{},"created_tasks":[],"failed":[],"scheduler":{},"protocol_version":1}'],
     ['route_feedback_summary', '{"type":"route_feedback_summary","summaries":[],"feedback_count":0,"feedback_path":"/tmp/feedback.json","protocol_version":1}'],
+    ['route_optimizer_report', '{"type":"route_optimizer_report","report":{},"protocol_version":1}'],
+    ['route_optimizer_replay', '{"type":"route_optimizer_replay","replay":{},"protocol_version":1}'],
+    ['route_policy_proposal', '{"type":"route_policy_proposal","proposal":{},"protocol_version":1}'],
+    ['route_policy_apply', '{"type":"route_policy_apply","apply":{},"protocol_version":1}'],
+    ['route_policy_rollback', '{"type":"route_policy_rollback","rollback":{},"protocol_version":1}'],
+    ['route_policy_list', '{"type":"route_policy_list","proposals":[],"protocol_version":1}'],
+    ['policy_review', '{"type":"policy_review","review":{},"protocol_version":1}'],
+    ['policy_apply_plan', '{"type":"policy_apply_plan","plan":{},"protocol_version":1}'],
+    ['policy_apply', '{"type":"policy_apply","apply":{},"protocol_version":1}'],
+    ['policy_rollback', '{"type":"policy_rollback","rollback":{},"protocol_version":1}'],
+    ['policy_ledger', '{"type":"policy_ledger","ledger":{},"protocol_version":1}'],
+    ['policy_replay', '{"type":"policy_replay","replay":{},"protocol_version":1}'],
     ['benchmark_suite', '{"type":"benchmark_suite","suite_id":"complex-coding-agent-v1","version":"2026.05","tasks":[],"protocol_version":1}'],
     ['benchmark_task', '{"type":"benchmark_task","task":{"id":"task-1","title":"Task"},"protocol_version":1}'],
     ['benchmark_run', '{"type":"benchmark_run","run":{"summary":{"total_tasks":10}},"protocol_version":1}'],
+    ['benchmark_autonomous', '{"type":"benchmark_autonomous","run":{"suite_id":"autonomous-agent-loop-v1"},"protocol_version":1}'],
     ['worker_list', '{"type":"worker_list","workers":[],"protocol_version":1}'],
     ['worker_create', '{"type":"worker_create","worker":{"worker_id":"worker-1","status":"spawning"},"protocol_version":1}'],
     ['worker_spawn', '{"type":"worker_spawn","worker":{"worker_id":"worker-1","status":"running","process":{"pid":123,"command":["sh","-c","exit 0"],"started_at":123}},"protocol_version":1}'],
@@ -589,7 +614,12 @@ test('stream protocol helpers behave as expected', async () => {
     '{"type":"task_scheduler_queue","tick":{},"protocol_version":1}',
     '{"type":"task_scheduler_daemon_run","state":null,"protocol_version":1}',
     '{"type":"task_scheduler_daemon_status","state":null,"protocol_version":1}',
+    '{"type":"task_scheduler_daemon_report","summary":{},"policy_recommendation":{},"protocol_version":1}',
+    '{"type":"autonomous_preflight_blocked","operation":"policy apply","protocol_version":1}',
+    '{"type":"cron_run","summary":{},"protocol_version":1}',
     '{"type":"route_feedback_summary","feedback_count":0,"protocol_version":1}',
+    '{"type":"route_policy_apply","proposal":{},"protocol_version":1}',
+    '{"type":"policy_apply","plan":{},"protocol_version":1}',
     '{"type":"benchmark_suite","suite_id":"complex-coding-agent-v1","version":"2026.05","protocol_version":1}',
     '{"type":"benchmark_task","tasks":[],"protocol_version":1}',
     '{"type":"benchmark_run","summary":{},"protocol_version":1}',
@@ -666,6 +696,9 @@ test('stream protocol helpers behave as expected', async () => {
   assert.match(streamProtocolSource, /'task_execution'/);
   assert.match(streamProtocolSource, /'recovery_action_event'/);
   assert.match(streamProtocolSource, /'task_execution_event'/);
+  assert.match(streamProtocolSource, /'autonomous_preflight_blocked'/);
+  assert.match(streamProtocolSource, /'policy_apply'/);
+  assert.match(streamProtocolSource, /'route_policy_apply'/);
   assert.match(streamProtocolSource, /recovery_action_event\?: RecoveryActionExecution/);
   assert.match(streamProtocolSource, /task_execution_event\?: TaskExecutionOutcome/);
   assert.match(streamProtocolSource, /export type RecoveryActionExecution/);
