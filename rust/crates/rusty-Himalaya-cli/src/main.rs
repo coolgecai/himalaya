@@ -4365,6 +4365,29 @@ fn build_autonomous_integration_input(
     })
 }
 
+#[derive(Debug, Clone)]
+struct AutonomousIntegrationReview {
+    integration: runtime::AutonomousIntegrationReport,
+    health: runtime::AutonomousHealthView,
+}
+
+fn build_autonomous_integration_review(
+    limit: usize,
+    max_ticks: usize,
+    permission_mode: PermissionMode,
+) -> Result<AutonomousIntegrationReview, Box<dyn std::error::Error>> {
+    let integration = runtime::review_autonomous_integration(build_autonomous_integration_input(
+        limit,
+        max_ticks,
+        permission_mode,
+    )?);
+    let health = runtime::autonomous_health_view(&integration);
+    Ok(AutonomousIntegrationReview {
+        integration,
+        health,
+    })
+}
+
 fn render_benchmark_value_text(value: &Value) -> String {
     match value["type"].as_str() {
         Some("benchmark_suite") => render_benchmark_list_text(value),
@@ -4517,6 +4540,26 @@ fn render_autonomous_integration_text(value: &Value) -> String {
         }
     }
     lines.extend(render_autonomous_guidance_lines(health, status));
+    lines.join("\n")
+}
+
+fn render_autonomous_daemon_report_text(
+    review: &runtime::AutonomousPolicyReview,
+    runs_path: &Path,
+) -> String {
+    let mut lines = vec![format!(
+        "Daemon report\n  Runs             {}\n  Blocked rate     {:.0}%\n  Consecutive block {}\n  Policy           {}\n  Max ticks        {} -> {}\n  Runs path        {}",
+        review.summary.considered_runs,
+        review.summary.blocked_rate * 100.0,
+        review.summary.consecutive_blocked_runs,
+        review.recommendation.action_label(),
+        review.recommendation.requested_max_ticks,
+        review.recommendation.recommended_max_ticks,
+        runs_path.display()
+    )];
+    for reason in &review.recommendation.reasons {
+        lines.push(format!("  Reason           {reason}"));
+    }
     lines.join("\n")
 }
 
@@ -11353,31 +11396,20 @@ fn run_task_daemon_command(
             let latest_run = coordinator.latest_run().ok().flatten();
             let recent_runs = coordinator.load_runs(limit).unwrap_or_default();
             let review = coordinator.review_policy(limit, max_ticks)?;
-            let integration = runtime::review_autonomous_integration(
-                build_autonomous_integration_input(limit, max_ticks, permission_mode)?,
-            );
-            let health = runtime::autonomous_health_view(&integration);
+            let integration_review =
+                build_autonomous_integration_review(limit, max_ticks, permission_mode)?;
             match output_format {
                 CliOutputFormat::Text => {
                     println!(
-                        "Daemon report\n  Runs             {}\n  Blocked rate     {:.0}%\n  Consecutive block {}\n  Policy           {}\n  Max ticks        {} -> {}\n  Runs path        {}",
-                        review.summary.considered_runs,
-                        review.summary.blocked_rate * 100.0,
-                        review.summary.consecutive_blocked_runs,
-                        review.recommendation.action_label(),
-                        review.recommendation.requested_max_ticks,
-                        review.recommendation.recommended_max_ticks,
-                        coordinator.runs_path().display()
+                        "{}",
+                        render_autonomous_daemon_report_text(&review, &coordinator.runs_path())
                     );
-                    for reason in &review.recommendation.reasons {
-                        println!("  Reason           {reason}");
-                    }
                     println!();
                     println!(
                         "{}",
                         render_autonomous_integration_text(&json!({
-                            "integration": integration,
-                            "health": health,
+                            "integration": integration_review.integration,
+                            "health": integration_review.health,
                         }))
                     );
                 }
@@ -11390,8 +11422,8 @@ fn run_task_daemon_command(
                             "runs":recent_runs,
                             "summary":review.summary,
                             "policy_recommendation":review.recommendation,
-                            "integration":integration,
-                            "health":health,
+                            "integration":integration_review.integration,
+                            "health":integration_review.health,
                             "state_path":daemon.state_path(),
                             "events_path":daemon.events_path(),
                             "runs_path":coordinator.runs_path(),
@@ -11406,17 +11438,15 @@ fn run_task_daemon_command(
             let latest_run = coordinator.latest_run().ok().flatten();
             let input = build_autonomous_evaluation_input(limit, max_ticks, permission_mode)?;
             let evaluation = runtime::evaluate_autonomous_loop(input);
-            let integration = runtime::review_autonomous_integration(
-                build_autonomous_integration_input(limit, max_ticks, permission_mode)?,
-            );
-            let health = runtime::autonomous_health_view(&integration);
+            let integration_review =
+                build_autonomous_integration_review(limit, max_ticks, permission_mode)?;
             let value = json!({
                 "type":"task_scheduler_daemon_evaluation",
                 "state":state,
                 "latest_run":latest_run,
                 "evaluation":evaluation,
-                "integration":integration,
-                "health":health,
+                "integration":integration_review.integration,
+                "health":integration_review.health,
                 "state_path":daemon.state_path(),
                 "events_path":daemon.events_path(),
                 "runs_path":coordinator.runs_path(),
@@ -15787,13 +15817,14 @@ mod tests {
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, parse_policy_cli_command, parse_route_cli_command,
         parse_task_cli_command, parse_worker_cli_command, permission_policy, print_help_to,
-        push_output_block, render_autonomous_integration_text, render_autonomous_replay_text,
-        render_config_report, render_diff_report, render_diff_report_for,
-        render_governed_policy_apply_text, render_memory_report, render_policy_apply_plan_text,
-        render_policy_replay_text, render_prompt_history_report, render_repl_help,
-        render_resume_usage, render_session_markdown, resolve_model_alias,
-        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
-        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
+        push_output_block, render_autonomous_daemon_report_text,
+        render_autonomous_integration_text, render_autonomous_replay_text, render_config_report,
+        render_diff_report, render_diff_report_for, render_governed_policy_apply_text,
+        render_memory_report, render_policy_apply_plan_text, render_policy_replay_text,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, slash_command_status, status_context,
         stream_json_event, summarize_tool_payload_for_markdown, validate_no_args,
         write_mcp_server_fixture, BenchmarkCliCommand, CliAction, CliOutputFormat, CliToolExecutor,
@@ -16030,6 +16061,52 @@ mod tests {
 
         assert!(text.contains("Next action       Review changed decisions before policy apply"));
         assert!(text.contains("! run-1: observed blocked, replay request_review"));
+    }
+
+    #[test]
+    fn autonomous_daemon_report_text_keeps_policy_summary_readable() {
+        let review = runtime::AutonomousPolicyReview {
+            summary: runtime::AutonomousRunHistorySummary {
+                runs_path: PathBuf::from("runs.jsonl"),
+                considered_runs: 3,
+                malformed_lines: 0,
+                latest_run_id: Some("run-3".to_string()),
+                status_counts: runtime::AutonomousRunStatusCounts {
+                    idle: 1,
+                    running: 1,
+                    blocked: 1,
+                },
+                idle_rate: 0.33,
+                running_rate: 0.33,
+                blocked_rate: 0.34,
+                average_ticks: 2.0,
+                average_ticks_to_idle: Some(1.0),
+                average_ticks_to_blocked: Some(3.0),
+                consecutive_blocked_runs: 1,
+                repeated_blocked_actions: Vec::new(),
+                repeated_blocked_risks: Vec::new(),
+                repeated_blocked_reasons: Vec::new(),
+                repeated_task_types: Vec::new(),
+            },
+            recommendation: runtime::AutonomousPolicyRecommendation {
+                requested_max_ticks: 4,
+                recommended_max_ticks: 2,
+                permission_mode: "read-only".to_string(),
+                conservative_permission_mode: "read-only".to_string(),
+                action: runtime::AutonomousPolicyAction::ReduceTicks,
+                review_required: false,
+                cool_down: false,
+                reasons: vec!["blocked rate is elevated".to_string()],
+            },
+        };
+
+        let text = render_autonomous_daemon_report_text(&review, Path::new("runs.jsonl"));
+
+        assert!(text.contains("Daemon report"));
+        assert!(text.contains("Runs             3"));
+        assert!(text.contains("Policy           reduce_ticks"));
+        assert!(text.contains("Max ticks        4 -> 2"));
+        assert!(text.contains("Reason           blocked rate is elevated"));
     }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
