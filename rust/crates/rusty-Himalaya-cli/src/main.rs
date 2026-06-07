@@ -4388,6 +4388,54 @@ fn build_autonomous_integration_review(
     })
 }
 
+fn autonomous_preflight_blocked_value(
+    operation: &str,
+    review: &AutonomousIntegrationReview,
+) -> Value {
+    json!({
+        "type": "autonomous_preflight_blocked",
+        "operation": operation,
+        "status": review.health.status,
+        "next_action": review.health.next_action,
+        "safe_to_iterate": review.health.safe_to_iterate,
+        "safe_to_apply_policy": review.health.safe_to_apply_policy,
+        "health": review.health,
+        "integration_summary": review.integration.summary,
+        "recommendations": review.integration.recommendations,
+    })
+}
+
+fn render_autonomous_preflight_blocked_text(value: &Value) -> String {
+    let operation = value["operation"].as_str().unwrap_or("operation");
+    let status = value["status"].as_str().unwrap_or("unknown");
+    let next_action = value["next_action"]
+        .as_str()
+        .unwrap_or("Inspect daemon report.");
+    let mut lines = vec![
+        "Autonomous preflight blocked".to_string(),
+        format!("  Operation         {operation}"),
+        format!("  Status            {status}"),
+        format!("  Next action       {next_action}"),
+        format!(
+            "  Safety            iterate={} apply_policy={}",
+            value["safe_to_iterate"].as_bool().unwrap_or(false),
+            value["safe_to_apply_policy"].as_bool().unwrap_or(false)
+        ),
+    ];
+    if let Some(blockers) = value["health"]["blockers"].as_array() {
+        for blocker in blockers.iter().filter_map(Value::as_str).take(5) {
+            lines.push(format!("  Blocker           {blocker}"));
+        }
+    }
+    if let Some(recommendations) = value["recommendations"].as_array() {
+        lines.push("Recommendations:".to_string());
+        for recommendation in recommendations.iter().filter_map(Value::as_str).take(5) {
+            lines.push(format!("  - {recommendation}"));
+        }
+    }
+    lines.join("\n")
+}
+
 fn render_benchmark_value_text(value: &Value) -> String {
     match value["type"].as_str() {
         Some("benchmark_suite") => render_benchmark_list_text(value),
@@ -9372,6 +9420,7 @@ fn print_route_output(
 
 fn render_route_output_text(value: &Value) -> String {
     match value["type"].as_str() {
+        Some("autonomous_preflight_blocked") => render_autonomous_preflight_blocked_text(value),
         Some("route_optimizer_report") => render_route_optimizer_text(value),
         Some("route_optimizer_replay") => render_route_optimizer_replay_text(value),
         Some("route_policy_proposal") => render_route_policy_proposal_text(value),
@@ -9774,6 +9823,17 @@ fn run_policy_command(
             proposal_id,
             dry_run,
         } => {
+            if !dry_run {
+                let integration_review =
+                    build_autonomous_integration_review(limit, max_ticks, permission_mode)?;
+                if !integration_review.health.safe_to_apply_policy {
+                    print_policy_output(
+                        autonomous_preflight_blocked_value("policy apply", &integration_review),
+                        output_format,
+                    )?;
+                    return Ok(());
+                }
+            }
             let input = build_policy_governance_input(limit, max_ticks, permission_mode)?;
             let scheduler_state = input.scheduler_state.clone();
             let autonomous_evaluation = input.autonomous_evaluation.clone();
@@ -9876,6 +9936,7 @@ fn print_policy_output(
 
 fn render_policy_output_text(value: &Value) -> String {
     match value["type"].as_str() {
+        Some("autonomous_preflight_blocked") => render_autonomous_preflight_blocked_text(value),
         Some("policy_ledger") => render_policy_ledger_text(value),
         Some("policy_replay") => render_policy_replay_text(value),
         Some("policy_apply_plan") => render_policy_apply_plan_text(value),
@@ -11288,6 +11349,16 @@ fn run_task_daemon_command(
     let report_limit = 20_usize;
     match command {
         TaskDaemonCliCommand::Start { max_ticks } => {
+            let integration_review =
+                build_autonomous_integration_review(report_limit, max_ticks, permission_mode)?;
+            if !integration_review.health.safe_to_iterate {
+                output_structured_report(
+                    autonomous_preflight_blocked_value("tasks daemon start", &integration_review),
+                    output_format,
+                    render_autonomous_preflight_blocked_text,
+                )?;
+                return Ok(());
+            }
             let run = coordinator.run_with_persist(max_ticks, |_| {
                 save_task_registry(&registry)
                     .map_err(|error| io::Error::other(error.to_string()))?;
@@ -15872,13 +15943,14 @@ mod tests {
         parse_history_count, parse_policy_cli_command, parse_route_cli_command,
         parse_task_cli_command, parse_worker_cli_command, permission_policy, print_help_to,
         push_output_block, render_autonomous_daemon_report_text,
-        render_autonomous_integration_text, render_autonomous_replay_text, render_config_report,
-        render_diff_report, render_diff_report_for, render_governed_policy_apply_text,
-        render_maturity_matrix_text, render_memory_report, render_policy_apply_plan_text,
-        render_policy_replay_text, render_prompt_history_report, render_repl_help,
-        render_resume_usage, render_session_markdown, resolve_model_alias,
-        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
-        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
+        render_autonomous_integration_text, render_autonomous_preflight_blocked_text,
+        render_autonomous_replay_text, render_config_report, render_diff_report,
+        render_diff_report_for, render_governed_policy_apply_text, render_maturity_matrix_text,
+        render_memory_report, render_policy_apply_plan_text, render_policy_replay_text,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, slash_command_status, status_context,
         stream_json_event, summarize_tool_payload_for_markdown, validate_no_args,
         write_mcp_server_fixture, BenchmarkCliCommand, CliAction, CliOutputFormat, CliToolExecutor,
@@ -16091,6 +16163,35 @@ mod tests {
         assert!(text
             .contains("Prefer report, evaluate, and replay until missing evidence is collected."));
         assert!(text.contains("Keep policy apply in dry-run mode until health is healthy."));
+    }
+
+    #[test]
+    fn autonomous_preflight_blocked_text_surfaces_recovery_action() {
+        let text = render_autonomous_preflight_blocked_text(&json!({
+            "type": "autonomous_preflight_blocked",
+            "operation": "policy apply",
+            "status": "blocked",
+            "next_action": "Run policy apply --dry-run and replay before persistent apply.",
+            "safe_to_iterate": true,
+            "safe_to_apply_policy": false,
+            "health": {
+                "blockers": [
+                    "policy replay has unresolved anomalies"
+                ]
+            },
+            "recommendations": [
+                "Review policy ledger anomalies before applying routing changes."
+            ]
+        }));
+
+        assert!(text.contains("Autonomous preflight blocked"));
+        assert!(text.contains("Operation         policy apply"));
+        assert!(text.contains(
+            "Next action       Run policy apply --dry-run and replay before persistent apply."
+        ));
+        assert!(text.contains("Safety            iterate=true apply_policy=false"));
+        assert!(text.contains("Blocker           policy replay has unresolved anomalies"));
+        assert!(text.contains("Review policy ledger anomalies before applying routing changes."));
     }
 
     #[test]

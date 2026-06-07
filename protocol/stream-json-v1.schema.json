@@ -167,6 +167,9 @@
           "$ref": "#/$defs/taskSchedulerDaemonReplayEvent"
         },
         {
+          "$ref": "#/$defs/autonomousPreflightBlockedEvent"
+        },
+        {
           "$ref": "#/$defs/cronEvent"
         },
         {
@@ -295,6 +298,7 @@
         "task_scheduler_daemon_report",
         "task_scheduler_daemon_evaluation",
         "task_scheduler_daemon_replay",
+        "autonomous_preflight_blocked",
         "cron_list",
         "cron_create",
         "cron_delete",
@@ -2152,6 +2156,49 @@
             },
             "runs_path": {
               "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "autonomousPreflightBlockedEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "operation",
+            "health",
+            "next_action"
+          ],
+          "properties": {
+            "type": {
+              "const": "autonomous_preflight_blocked"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "next_action": {
+              "type": "string"
+            },
+            "safe_to_iterate": {
+              "type": "boolean"
+            },
+            "safe_to_apply_policy": {
+              "type": "boolean"
+            },
+            "health": {
+              "type": "object"
+            },
+            "integration_summary": {
+              "type": "object"
+            },
+            "recommendations": {
+              "type": "array"
             }
           }
         }

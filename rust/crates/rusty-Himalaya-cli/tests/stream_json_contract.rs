@@ -60,6 +60,7 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "task_scheduler_daemon_report",
         "task_scheduler_daemon_evaluation",
         "task_scheduler_daemon_replay",
+        "autonomous_preflight_blocked",
         "cron_list",
         "cron_create",
         "cron_delete",
@@ -1101,11 +1102,19 @@ fn governed_policy_apply_emits_stream_json_events() {
     );
     let apply = apply_events
         .iter()
-        .find(|event| event["type"] == "policy_apply")
-        .expect("policy apply event should be emitted");
-    assert_eq!(apply["apply"]["status"], "applied");
-    assert_eq!(apply["apply"]["applied"], true);
-    assert_eq!(apply["apply"]["receipt"]["adapter"], "routing_policy");
+        .find(|event| event["type"] == "autonomous_preflight_blocked")
+        .expect("policy apply preflight event should be emitted");
+    assert_eq!(apply["operation"], "policy apply");
+    assert_eq!(apply["safe_to_apply_policy"], false);
+    assert!(apply["health"].is_object());
+
+    let route_apply_events =
+        run_stream_json_subcommand(&workspace, &["routes", "apply", &proposal_id]);
+    let route_apply = route_apply_events
+        .iter()
+        .find(|event| event["type"] == "route_policy_apply")
+        .expect("route policy apply event should be emitted");
+    assert_eq!(route_apply["apply"]["applied"], true);
 
     let rollback_events = run_stream_json_subcommand(
         &workspace,
@@ -2022,6 +2031,20 @@ fn assert_stream_event_schema(event: &Value) {
                 "task_scheduler_daemon_replay requires replay object: {event:?}"
             );
             assert_non_empty_string(&event["runs_path"]);
+        }
+        "autonomous_preflight_blocked" => {
+            assert!(
+                event["operation"].is_string(),
+                "autonomous_preflight_blocked requires operation string: {event:?}"
+            );
+            assert!(
+                event["health"].is_object(),
+                "autonomous_preflight_blocked requires health object: {event:?}"
+            );
+            assert!(
+                event["next_action"].is_string(),
+                "autonomous_preflight_blocked requires next_action string: {event:?}"
+            );
         }
         "cron_list" => assert!(
             event["crons"].is_array(),

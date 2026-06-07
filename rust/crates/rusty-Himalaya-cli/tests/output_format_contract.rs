@@ -1239,7 +1239,7 @@ fn route_feedback_summary_emits_metric_summaries() {
     );
     assert!(!root.join(".Himalaya/routes/applied-policy.json").exists());
 
-    let applied = assert_json_command(
+    let blocked_apply = assert_json_command(
         &root,
         &[
             "--output-format",
@@ -1252,12 +1252,18 @@ fn route_feedback_summary_emits_metric_summaries() {
             &proposal_id,
         ],
     );
-    assert_eq!(applied["type"], "policy_apply");
-    assert_eq!(applied["apply"]["status"], "applied");
-    assert_eq!(applied["apply"]["applied"], true);
-    assert_eq!(applied["apply"]["receipt"]["executed"], true);
-    assert_eq!(applied["apply"]["receipt"]["adapter"], "routing_policy");
-    assert!(applied["ledger_entry"].is_object());
+    assert_eq!(blocked_apply["type"], "autonomous_preflight_blocked");
+    assert_eq!(blocked_apply["operation"], "policy apply");
+    assert_eq!(blocked_apply["safe_to_apply_policy"], false);
+    assert!(blocked_apply["next_action"].is_string());
+    assert!(!root.join(".Himalaya/routes/applied-policy.json").exists());
+
+    let route_apply = assert_json_command(
+        &root,
+        &["--output-format", "json", "routes", "apply", &proposal_id],
+    );
+    assert_eq!(route_apply["type"], "route_policy_apply");
+    assert_eq!(route_apply["apply"]["applied"], true);
     assert!(root.join(".Himalaya/routes/applied-policy.json").exists());
 
     let rollback = assert_json_command(
