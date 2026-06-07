@@ -62,3 +62,13 @@ This makes dry-run policy simulations visible without confusing them with persis
 `Himalaya tasks daemon report` and `Himalaya tasks daemon evaluate` include the integration report in JSON and stream-json output. Text output appends a compact integration summary after the existing daemon or evaluation section.
 
 Those same commands now include `health` in JSON and stream-json output. Text output prints the health status, headline, next action, and safe-to-iterate/apply-policy flags before lower-level counters.
+
+## Recommended Workflow
+
+Use the read-only diagnostics before running or applying anything:
+
+1. `Himalaya tasks daemon report --limit 20 --max-ticks 3`
+2. `Himalaya tasks daemon evaluate --limit 20 --max-ticks 3`
+3. `Himalaya tasks daemon replay --limit 20 --max-ticks 3`
+
+If health is `blocked`, fix the listed blocker first. If health is `degraded`, prefer one bounded run such as `Himalaya tasks daemon start --max-ticks 1` and then re-run the report. Keep policy changes in dry-run mode until health is `healthy`.

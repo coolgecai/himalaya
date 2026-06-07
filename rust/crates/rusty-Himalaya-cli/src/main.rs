@@ -4516,7 +4516,59 @@ fn render_autonomous_integration_text(value: &Value) -> String {
             lines.push(format!("  - {recommendation}"));
         }
     }
+    lines.extend(render_autonomous_guidance_lines(health, status));
     lines.join("\n")
+}
+
+fn render_autonomous_guidance_lines(health: Option<&Value>, fallback_status: &str) -> Vec<String> {
+    let status = health
+        .and_then(|health| health["status"].as_str())
+        .unwrap_or(fallback_status);
+    let safe_to_iterate = health
+        .and_then(|health| health["safe_to_iterate"].as_bool())
+        .unwrap_or(status == "healthy" || status == "degraded");
+    let safe_to_apply_policy = health
+        .and_then(|health| health["safe_to_apply_policy"].as_bool())
+        .unwrap_or(status == "healthy");
+    let mut lines = vec!["Guidance:".to_string()];
+    match status {
+        "blocked" => {
+            lines.push(
+                "  - Resolve listed blockers before daemon start, scheduler run, or policy apply."
+                    .to_string(),
+            );
+            lines.push(
+                "  - Re-run `Himalaya tasks daemon report --limit 20 --max-ticks 3` after fixing state."
+                    .to_string(),
+            );
+        }
+        "degraded" => {
+            lines.push(
+                "  - Prefer report, evaluate, and replay until missing evidence is collected."
+                    .to_string(),
+            );
+            if safe_to_iterate {
+                lines.push(
+                    "  - Use a bounded run such as `Himalaya tasks daemon start --max-ticks 1`."
+                        .to_string(),
+                );
+            }
+        }
+        "healthy" => {
+            lines.push(
+                "  - Continue with a bounded daemon run or governed policy dry-run.".to_string(),
+            );
+        }
+        _ => {
+            lines.push(
+                "  - Re-run daemon report with JSON output for full diagnostics.".to_string(),
+            );
+        }
+    }
+    if !safe_to_apply_policy {
+        lines.push("  - Keep policy apply in dry-run mode until health is healthy.".to_string());
+    }
+    lines
 }
 
 fn render_autonomous_replay_text(value: &Value) -> String {
@@ -4537,6 +4589,14 @@ fn render_autonomous_replay_text(value: &Value) -> String {
         format!("  Runs              {considered}"),
         format!("  Changed decisions {changed}"),
         format!("  Current policy    {action} ({recommended_ticks} tick(s))"),
+        format!(
+            "  Next action       {}",
+            if changed > 0 {
+                "Review changed decisions before policy apply"
+            } else {
+                "Keep current autonomous policy"
+            }
+        ),
     ];
     if let Some(decisions) = replay["decisions"].as_array() {
         lines.push("Decisions:".to_string());
@@ -15535,11 +15595,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|review <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler explain <task-id>|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [prompt]|execute <task-id>|verify <task-id>|recover <task-id>|cancel <task-id>]"
+        "  Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|review <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler explain <task-id>|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|daemon report [--limit N] [--max-ticks N]|daemon evaluate [--limit N] [--max-ticks N]|daemon replay [--limit N] [--max-ticks N]|resume <task-id> [prompt]|execute <task-id>|verify <task-id>|recover <task-id>|cancel <task-id>]"
     )?;
     writeln!(
         out,
-        "      Inspect, resume, execute, verify, recover, schedule, daemonize, or cancel durable long-running tasks"
+        "      Inspect, resume, execute, verify, recover, schedule, daemonize, diagnose, or cancel durable long-running tasks"
     )?;
     writeln!(
         out,
@@ -15679,6 +15739,12 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  Himalaya mcp show my-server")?;
     writeln!(out, "  Himalaya /skills")?;
     writeln!(out, "  Himalaya doctor")?;
+    writeln!(
+        out,
+        "  Himalaya tasks daemon report --limit 20 --max-ticks 3"
+    )?;
+    writeln!(out, "  Himalaya tasks daemon evaluate --limit 20")?;
+    writeln!(out, "  Himalaya tasks daemon replay --limit 20")?;
     writeln!(out, "  Himalaya login")?;
     writeln!(out, "  Himalaya init")?;
     writeln!(out, "  Himalaya export")?;
@@ -15721,13 +15787,13 @@ mod tests {
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, parse_policy_cli_command, parse_route_cli_command,
         parse_task_cli_command, parse_worker_cli_command, permission_policy, print_help_to,
-        push_output_block, render_autonomous_integration_text, render_config_report,
-        render_diff_report, render_diff_report_for, render_governed_policy_apply_text,
-        render_memory_report, render_policy_apply_plan_text, render_policy_replay_text,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        push_output_block, render_autonomous_integration_text, render_autonomous_replay_text,
+        render_config_report, render_diff_report, render_diff_report_for,
+        render_governed_policy_apply_text, render_memory_report, render_policy_apply_plan_text,
+        render_policy_replay_text, render_prompt_history_report, render_repl_help,
+        render_resume_usage, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, slash_command_status, status_context,
         stream_json_event, summarize_tool_payload_for_markdown, validate_no_args,
         write_mcp_server_fixture, BenchmarkCliCommand, CliAction, CliOutputFormat, CliToolExecutor,
@@ -15936,6 +16002,34 @@ mod tests {
         assert!(text.contains("2 total / 1 runnable / 1 blocked"));
         assert!(text.contains("routing_policy_replay: warning"));
         assert!(text.contains("Complete missing golden replay stages."));
+        assert!(text.contains("Guidance:"));
+        assert!(text
+            .contains("Prefer report, evaluate, and replay until missing evidence is collected."));
+        assert!(text.contains("Keep policy apply in dry-run mode until health is healthy."));
+    }
+
+    #[test]
+    fn autonomous_replay_text_surfaces_review_guidance_for_policy_drift() {
+        let text = render_autonomous_replay_text(&json!({
+            "replay": {
+                "considered_runs": 2,
+                "changed_decisions": 1,
+                "policy_recommendation": {
+                    "action": "request_review",
+                    "recommended_max_ticks": 1
+                },
+                "decisions": [{
+                    "run_id": "run-1",
+                    "observed_status": "blocked",
+                    "replay_action": "request_review",
+                    "changed": true
+                }],
+                "recommendations": []
+            }
+        }));
+
+        assert!(text.contains("Next action       Review changed decisions before policy apply"));
+        assert!(text.contains("! run-1: observed blocked, replay request_review"));
     }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
@@ -18978,6 +19072,9 @@ UU conflicted.rs",
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
         assert!(help.contains("Himalaya --resume latest"));
         assert!(help.contains("Himalaya --resume latest /status /diff /export notes.txt"));
+        assert!(help.contains("Himalaya tasks daemon report --limit 20 --max-ticks 3"));
+        assert!(help.contains("Himalaya tasks daemon evaluate --limit 20"));
+        assert!(help.contains("Himalaya tasks daemon replay --limit 20"));
     }
 
     #[test]
