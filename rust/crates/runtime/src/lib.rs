@@ -72,8 +72,12 @@ pub mod worker_supervisor;
 
 pub use autonomous_run::{
     append_autonomous_run_report, autonomous_runs_path, latest_autonomous_run_report,
-    load_autonomous_run_reports, AutonomousBlockedRecoveryAction, AutonomousRecoveryPolicyAudit,
-    AutonomousRunCoordinator, AutonomousRunReport, AutonomousRunStatus, AutonomousRunStep,
+    load_autonomous_run_reports, load_autonomous_run_reports_with_diagnostics,
+    review_autonomous_policy, summarize_autonomous_runs, AutonomousBlockedRecoveryAction,
+    AutonomousPolicyAction, AutonomousPolicyRecommendation, AutonomousPolicyReview,
+    AutonomousRecoveryPolicyAudit, AutonomousRunCoordinator, AutonomousRunFrequency,
+    AutonomousRunHistorySummary, AutonomousRunLoad, AutonomousRunReadWarning, AutonomousRunReport,
+    AutonomousRunStatus, AutonomousRunStatusCounts, AutonomousRunStep, AutonomousRunStore,
 };
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use benchmark::{

@@ -414,6 +414,15 @@ fn task_scheduler_tick_persists_durable_status() {
     assert_eq!(daemon["run"]["permission_mode"], "prompt");
     assert!(daemon["run"]["worker_supervisor_ticks"].is_array());
     assert!(daemon["run"]["policy_audit"].is_array());
+    assert_eq!(daemon["run"]["prior_summary"]["considered_runs"], 0);
+    assert_eq!(
+        daemon["run"]["policy_recommendation"]["recommended_max_ticks"],
+        1
+    );
+    assert_eq!(daemon["summary"]["considered_runs"], 1);
+    assert_eq!(daemon["summary"]["status_counts"]["running"], 1);
+    assert_eq!(daemon["policy_recommendation"]["requested_max_ticks"], 1);
+    assert_eq!(daemon["policy_recommendation"]["recommended_max_ticks"], 1);
     assert!(!daemon["runs"]
         .as_array()
         .expect("daemon runs array")
@@ -438,6 +447,8 @@ fn task_scheduler_tick_persists_durable_status() {
         daemon_status["latest_run"]["run_id"],
         daemon["run"]["run_id"]
     );
+    assert_eq!(daemon_status["summary"]["considered_runs"], 1);
+    assert_eq!(daemon_status["policy_recommendation"]["action"], "continue");
     assert!(daemon_status["runs_path"]
         .as_str()
         .expect("runs path")
@@ -471,6 +482,49 @@ fn task_scheduler_tick_persists_durable_status() {
         1
     );
     assert_eq!(daemon_logs["runs"][0]["run_id"], daemon["run"]["run_id"]);
+    assert_eq!(daemon_logs["summary"]["considered_runs"], 1);
+    assert_eq!(
+        daemon_logs["policy_recommendation"]["recommended_max_ticks"],
+        1
+    );
+
+    let daemon_report = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "daemon",
+            "report",
+            "--limit",
+            "5",
+            "--max-ticks",
+            "3",
+        ],
+    );
+    assert_eq!(daemon_report["type"], "task_scheduler_daemon_report");
+    assert_eq!(
+        daemon_report["latest_run"]["run_id"],
+        daemon["run"]["run_id"]
+    );
+    assert_eq!(daemon_report["summary"]["considered_runs"], 1);
+    assert_eq!(
+        daemon_report["policy_recommendation"]["requested_max_ticks"],
+        3
+    );
+    assert!(
+        daemon_report["policy_recommendation"]["recommended_max_ticks"]
+            .as_u64()
+            .expect("recommended max ticks")
+            >= 1
+    );
+    assert_eq!(
+        daemon_report["runs"]
+            .as_array()
+            .expect("daemon report runs")
+            .len(),
+        1
+    );
 
     let daemon_stop = assert_json_command(
         &root,

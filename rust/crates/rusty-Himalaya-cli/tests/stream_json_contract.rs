@@ -57,6 +57,7 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "task_scheduler_daemon_run",
         "task_scheduler_daemon_status",
         "task_scheduler_daemon_logs",
+        "task_scheduler_daemon_report",
         "cron_list",
         "cron_create",
         "cron_delete",
@@ -1057,6 +1058,44 @@ fn cron_run_fires_due_entry_end_to_end() {
         .exists());
 }
 
+#[test]
+fn daemon_report_emits_policy_review_event() {
+    let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-daemon-report"));
+    workspace.create();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_Himalaya"));
+    command
+        .current_dir(&workspace.root)
+        .env_clear()
+        .env("ANTHROPIC_API_KEY", "test-stream-json-key")
+        .env("Himalaya_CONFIG_HOME", &workspace.config_home)
+        .env("HOME", &workspace.home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args([
+            "--output-format",
+            "stream-json",
+            "tasks",
+            "daemon",
+            "report",
+            "--max-ticks",
+            "3",
+        ]);
+    let output = command.output().expect("Himalaya should launch");
+    assert_success(&output);
+
+    let events = parse_stream_json_stdout(&output.stdout);
+    assert_all_events_are_versioned(&events);
+    let report = events
+        .iter()
+        .find(|event| event["type"] == "task_scheduler_daemon_report")
+        .expect("expected daemon report event");
+    assert_eq!(report["summary"]["considered_runs"], 0);
+    assert_eq!(report["policy_recommendation"]["requested_max_ticks"], 3);
+    assert_eq!(report["policy_recommendation"]["recommended_max_ticks"], 3);
+    assert_non_empty_string(&report["runs_path"]);
+}
+
 fn run_stream_json_case(
     workspace: &HarnessWorkspace,
     base_url: &str,
@@ -1473,6 +1512,18 @@ fn assert_stream_event_schema(event: &Value) {
             if event.get("runs_path").is_some() {
                 assert_non_empty_string(&event["runs_path"]);
             }
+            if event.get("summary").is_some() {
+                assert!(
+                    event["summary"].is_object(),
+                    "task_scheduler_daemon_run summary must be object when present: {event:?}"
+                );
+            }
+            if event.get("policy_recommendation").is_some() {
+                assert!(
+                    event["policy_recommendation"].is_object(),
+                    "task_scheduler_daemon_run policy_recommendation must be object when present: {event:?}"
+                );
+            }
         }
         "task_scheduler_daemon_status" => {
             assert!(
@@ -1490,6 +1541,18 @@ fn assert_stream_event_schema(event: &Value) {
             if event.get("runs_path").is_some() {
                 assert_non_empty_string(&event["runs_path"]);
             }
+            if event.get("summary").is_some() {
+                assert!(
+                    event["summary"].is_object(),
+                    "task_scheduler_daemon_status summary must be object when present: {event:?}"
+                );
+            }
+            if event.get("policy_recommendation").is_some() {
+                assert!(
+                    event["policy_recommendation"].is_object(),
+                    "task_scheduler_daemon_status policy_recommendation must be object when present: {event:?}"
+                );
+            }
         }
         "task_scheduler_daemon_logs" => {
             assert!(
@@ -1505,6 +1568,35 @@ fn assert_stream_event_schema(event: &Value) {
             }
             if event.get("runs_path").is_some() {
                 assert_non_empty_string(&event["runs_path"]);
+            }
+            if event.get("summary").is_some() {
+                assert!(
+                    event["summary"].is_object(),
+                    "task_scheduler_daemon_logs summary must be object when present: {event:?}"
+                );
+            }
+            if event.get("policy_recommendation").is_some() {
+                assert!(
+                    event["policy_recommendation"].is_object(),
+                    "task_scheduler_daemon_logs policy_recommendation must be object when present: {event:?}"
+                );
+            }
+        }
+        "task_scheduler_daemon_report" => {
+            assert!(
+                event["summary"].is_object(),
+                "task_scheduler_daemon_report requires summary object: {event:?}"
+            );
+            assert!(
+                event["policy_recommendation"].is_object(),
+                "task_scheduler_daemon_report requires policy_recommendation object: {event:?}"
+            );
+            assert_non_empty_string(&event["runs_path"]);
+            if event.get("runs").is_some() {
+                assert!(
+                    event["runs"].is_array(),
+                    "task_scheduler_daemon_report runs must be array when present: {event:?}"
+                );
             }
         }
         "cron_list" => assert!(

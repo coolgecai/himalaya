@@ -701,6 +701,7 @@ enum TaskDaemonCliCommand {
     Status,
     Stop,
     Logs { limit: usize },
+    Report { limit: usize, max_ticks: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1465,7 +1466,7 @@ fn parse_task_cli_command(args: &[String]) -> Result<TaskCliCommand, String> {
             task_id: task_id.clone(),
         }),
         Some((other, _)) => Err(format!(
-            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|review <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler explain <task-id>|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
+            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|review <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler explain <task-id>|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|daemon report [--limit N] [--max-ticks N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
         )),
     }
 }
@@ -1545,8 +1546,9 @@ fn parse_task_daemon_cli_command(args: &[String]) -> Result<TaskDaemonCliCommand
         Some(("start", rest)) => parse_task_daemon_start_args(rest),
         Some(("stop", [])) => Ok(TaskDaemonCliCommand::Stop),
         Some(("logs", rest)) => parse_task_daemon_logs_args(rest),
+        Some(("report", rest)) => parse_task_daemon_report_args(rest),
         Some((other, _)) => Err(format!(
-            "unknown tasks daemon command: {other}\nUsage: Himalaya tasks daemon [start [--once|--max-ticks N]|status|stop|logs [--limit N]]"
+            "unknown tasks daemon command: {other}\nUsage: Himalaya tasks daemon [start [--once|--max-ticks N]|status|stop|logs [--limit N]|report [--limit N] [--max-ticks N]]"
         )),
     }
 }
@@ -1583,6 +1585,48 @@ fn parse_task_daemon_logs_args(args: &[String]) -> Result<TaskDaemonCliCommand, 
         }
     }
     Ok(TaskDaemonCliCommand::Logs { limit })
+}
+
+fn parse_task_daemon_report_args(args: &[String]) -> Result<TaskDaemonCliCommand, String> {
+    let mut limit = 20_usize;
+    let mut max_ticks = 1_usize;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "tasks daemon report --limit requires a value".to_string())?;
+                limit = parse_positive_usize("--limit", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--limit=") => {
+                limit = parse_positive_usize("--limit", &value[8..])?;
+                index += 1;
+            }
+            "--max-ticks" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "tasks daemon report --max-ticks requires a value".to_string()
+                })?;
+                max_ticks = parse_positive_usize("--max-ticks", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--max-ticks=") => {
+                max_ticks = parse_positive_usize("--max-ticks", &value[12..])?;
+                index += 1;
+            }
+            "--once" => {
+                max_ticks = 1;
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown tasks daemon report argument: {other}\nUsage: Himalaya tasks daemon report [--limit N] [--once|--max-ticks N]"
+                ));
+            }
+        }
+    }
+    Ok(TaskDaemonCliCommand::Report { limit, max_ticks })
 }
 
 fn parse_positive_usize(name: &str, value: &str) -> Result<usize, String> {
@@ -9420,6 +9464,7 @@ fn run_task_daemon_command(
         .with_permission_mode(permission_mode),
         scheduler_state_dir()?,
     );
+    let report_limit = 20_usize;
     match command {
         TaskDaemonCliCommand::Start { max_ticks } => {
             let run = coordinator.run_with_persist(max_ticks, |_| {
@@ -9433,11 +9478,18 @@ fn run_task_daemon_command(
             save_worker_registry(&worker_registry)?;
             let runs = run.scheduler_runs.clone();
             let state = run.latest_daemon_state.clone();
+            let review = coordinator.review_policy(report_limit, max_ticks)?;
             match output_format {
                 CliOutputFormat::Text => {
                     println!(
                         "daemon {}: {} ({} autonomous tick(s))",
                         run.status, run.message, run.tick_count
+                    );
+                    println!(
+                        "policy {}: max_ticks {} -> {}",
+                        review.recommendation.action_label(),
+                        review.recommendation.requested_max_ticks,
+                        review.recommendation.recommended_max_ticks
                     );
                 }
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
@@ -9448,6 +9500,8 @@ fn run_task_daemon_command(
                             "runs":runs,
                             "state":state,
                             "run":run,
+                            "summary":review.summary,
+                            "policy_recommendation":review.recommendation,
                             "state_path":daemon.state_path(),
                             "events_path":daemon.events_path(),
                             "runs_path":coordinator.runs_path(),
@@ -9460,6 +9514,7 @@ fn run_task_daemon_command(
         TaskDaemonCliCommand::Status => {
             let state = daemon.load_state().ok();
             let latest_run = coordinator.latest_run().ok().flatten();
+            let review = coordinator.review_policy(report_limit, 1)?;
             match output_format {
                 CliOutputFormat::Text => {
                     if let Some(run) = &latest_run {
@@ -9475,6 +9530,12 @@ fn run_task_daemon_command(
                     } else {
                         println!("daemon has not run");
                     }
+                    println!(
+                        "policy {}: max_ticks {} -> {}",
+                        review.recommendation.action_label(),
+                        review.recommendation.requested_max_ticks,
+                        review.recommendation.recommended_max_ticks
+                    );
                 }
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_task_output(
@@ -9482,6 +9543,8 @@ fn run_task_daemon_command(
                             "type":"task_scheduler_daemon_status",
                             "state":state,
                             "latest_run":latest_run,
+                            "summary":review.summary,
+                            "policy_recommendation":review.recommendation,
                             "state_path":daemon.state_path(),
                             "events_path":daemon.events_path(),
                             "runs_path":coordinator.runs_path(),
@@ -9520,6 +9583,7 @@ fn run_task_daemon_command(
             let start = events.len().saturating_sub(limit);
             let events = events.into_iter().skip(start).collect::<Vec<_>>();
             let recent_runs = coordinator.load_runs(limit).unwrap_or_default();
+            let review = coordinator.review_policy(limit, 1)?;
             match output_format {
                 CliOutputFormat::Text => {
                     if events.is_empty() && recent_runs.is_empty() {
@@ -9537,6 +9601,12 @@ fn run_task_daemon_command(
                             event.seq, event.event, event.status, event.message
                         );
                     }
+                    println!(
+                        "policy {}: max_ticks {} -> {}",
+                        review.recommendation.action_label(),
+                        review.recommendation.requested_max_ticks,
+                        review.recommendation.recommended_max_ticks
+                    );
                 }
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_task_output(
@@ -9544,6 +9614,47 @@ fn run_task_daemon_command(
                             "type":"task_scheduler_daemon_logs",
                             "events":events,
                             "runs":recent_runs,
+                            "summary":review.summary,
+                            "policy_recommendation":review.recommendation,
+                            "events_path":daemon.events_path(),
+                            "runs_path":coordinator.runs_path(),
+                        }),
+                        output_format,
+                    )?;
+                }
+            }
+        }
+        TaskDaemonCliCommand::Report { limit, max_ticks } => {
+            let state = daemon.load_state().ok();
+            let latest_run = coordinator.latest_run().ok().flatten();
+            let recent_runs = coordinator.load_runs(limit).unwrap_or_default();
+            let review = coordinator.review_policy(limit, max_ticks)?;
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!(
+                        "Daemon report\n  Runs             {}\n  Blocked rate     {:.0}%\n  Consecutive block {}\n  Policy           {}\n  Max ticks        {} -> {}\n  Runs path        {}",
+                        review.summary.considered_runs,
+                        review.summary.blocked_rate * 100.0,
+                        review.summary.consecutive_blocked_runs,
+                        review.recommendation.action_label(),
+                        review.recommendation.requested_max_ticks,
+                        review.recommendation.recommended_max_ticks,
+                        coordinator.runs_path().display()
+                    );
+                    for reason in &review.recommendation.reasons {
+                        println!("  Reason           {reason}");
+                    }
+                }
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(
+                        json!({
+                            "type":"task_scheduler_daemon_report",
+                            "state":state,
+                            "latest_run":latest_run,
+                            "runs":recent_runs,
+                            "summary":review.summary,
+                            "policy_recommendation":review.recommendation,
+                            "state_path":daemon.state_path(),
                             "events_path":daemon.events_path(),
                             "runs_path":coordinator.runs_path(),
                         }),
@@ -15114,6 +15225,22 @@ mod tests {
             .expect("tasks daemon logs should parse"),
             TaskCliCommand::Daemon {
                 command: TaskDaemonCliCommand::Logs { limit: 5 },
+            }
+        );
+        assert_eq!(
+            parse_task_cli_command(&[
+                "daemon".to_string(),
+                "report".to_string(),
+                "--limit=7".to_string(),
+                "--max-ticks".to_string(),
+                "3".to_string(),
+            ])
+            .expect("tasks daemon report should parse"),
+            TaskCliCommand::Daemon {
+                command: TaskDaemonCliCommand::Report {
+                    limit: 7,
+                    max_ticks: 3
+                },
             }
         );
         assert_eq!(

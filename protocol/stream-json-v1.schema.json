@@ -158,6 +158,9 @@
           "$ref": "#/$defs/taskSchedulerDaemonLogsEvent"
         },
         {
+          "$ref": "#/$defs/taskSchedulerDaemonReportEvent"
+        },
+        {
           "$ref": "#/$defs/cronEvent"
         },
         {
@@ -244,6 +247,7 @@
         "task_scheduler_daemon_run",
         "task_scheduler_daemon_status",
         "task_scheduler_daemon_logs",
+        "task_scheduler_daemon_report",
         "cron_list",
         "cron_create",
         "cron_delete",
@@ -1545,6 +1549,12 @@
             "run": {
               "type": "object"
             },
+            "summary": {
+              "type": "object"
+            },
+            "policy_recommendation": {
+              "type": "object"
+            },
             "runs_path": {
               "type": "string"
             }
@@ -1585,6 +1595,12 @@
                 "null"
               ]
             },
+            "summary": {
+              "type": "object"
+            },
+            "policy_recommendation": {
+              "type": "object"
+            },
             "runs_path": {
               "type": "string"
             }
@@ -1614,6 +1630,61 @@
             },
             "runs": {
               "type": "array"
+            },
+            "summary": {
+              "type": "object"
+            },
+            "policy_recommendation": {
+              "type": "object"
+            },
+            "runs_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "taskSchedulerDaemonReportEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "summary",
+            "policy_recommendation",
+            "runs_path"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_scheduler_daemon_report"
+            },
+            "state": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "latest_run": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "runs": {
+              "type": "array"
+            },
+            "summary": {
+              "type": "object"
+            },
+            "policy_recommendation": {
+              "type": "object"
+            },
+            "state_path": {
+              "type": "string"
+            },
+            "events_path": {
+              "type": "string"
             },
             "runs_path": {
               "type": "string"
