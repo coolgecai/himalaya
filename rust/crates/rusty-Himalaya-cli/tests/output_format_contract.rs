@@ -1186,6 +1186,9 @@ fn route_feedback_summary_emits_metric_summaries() {
     assert_eq!(plan["type"], "policy_apply_plan");
     assert_eq!(plan["recorded"], true);
     assert_eq!(plan["plan"]["status"], "planned");
+    assert!(plan["plan"]["fingerprint"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
     assert!(plan["plan"]["actions"]
         .as_array()
         .expect("governed plan actions")
@@ -1215,6 +1218,11 @@ fn route_feedback_summary_emits_metric_summaries() {
     assert_eq!(governed_dry_run["apply"]["status"], "dry_run_passed");
     assert_eq!(governed_dry_run["apply"]["applied"], false);
     assert!(governed_dry_run["apply"]["routing_report"].is_object());
+    assert!(governed_dry_run["apply"]["receipt"].is_object());
+    assert_eq!(
+        governed_dry_run["apply"]["receipt"]["plan_fingerprint"],
+        governed_dry_run["apply"]["plan"]["fingerprint"]
+    );
     assert!(!root.join(".Himalaya/routes/applied-policy.json").exists());
 
     let applied = assert_json_command(
@@ -1233,6 +1241,8 @@ fn route_feedback_summary_emits_metric_summaries() {
     assert_eq!(applied["type"], "policy_apply");
     assert_eq!(applied["apply"]["status"], "applied");
     assert_eq!(applied["apply"]["applied"], true);
+    assert_eq!(applied["apply"]["receipt"]["executed"], true);
+    assert_eq!(applied["apply"]["receipt"]["adapter"], "routing_policy");
     assert!(applied["ledger_entry"].is_object());
     assert!(root.join(".Himalaya/routes/applied-policy.json").exists());
 
@@ -1252,8 +1262,35 @@ fn route_feedback_summary_emits_metric_summaries() {
     assert_eq!(rollback["type"], "policy_rollback");
     assert_eq!(rollback["rollback"]["status"], "rolled_back");
     assert_eq!(rollback["rollback"]["rolled_back"], true);
+    assert_eq!(rollback["rollback"]["receipt"]["executed"], true);
     assert!(rollback["ledger_entry"].is_object());
     assert!(!root.join(".Himalaya/routes/applied-policy.json").exists());
+
+    let replay = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "policy",
+            "replay",
+            "--limit",
+            "20",
+        ],
+    );
+    assert_eq!(replay["type"], "policy_replay");
+    assert_eq!(replay["replay"]["summary"]["lifecycle_count"], 1);
+    assert!(
+        replay["replay"]["summary"]["event_count"]
+            .as_u64()
+            .expect("event count")
+            >= 4
+    );
+    assert!(replay["replay"]["lifecycles"]
+        .as_array()
+        .expect("lifecycles")
+        .iter()
+        .any(|lifecycle| lifecycle["proposal_id"] == proposal_id
+            && lifecycle["current_status"] == "rolled_back"));
 }
 
 #[test]

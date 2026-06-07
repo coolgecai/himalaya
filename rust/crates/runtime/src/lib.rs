@@ -205,12 +205,14 @@ pub use policy_engine::{
 pub use policy_governance::{
     load_policy_governance_ledger, policy_apply_plan_ledger_entry,
     policy_apply_report_ledger_entry, policy_governance_ledger_path,
-    policy_rollback_report_ledger_entry, review_policy_governance, PolicyApplyAction,
-    PolicyApplyCoordinator, PolicyApplyOperation, PolicyApplyPlan, PolicyApplyReport,
-    PolicyConflict, PolicyDecision, PolicyDomain, PolicyGate, PolicyGovernanceInput,
-    PolicyGovernanceLedger, PolicyGovernanceReview, PolicyLedgerEntry, PolicyLedgerLoad,
-    PolicyLedgerStatus, PolicyLedgerWarning, PolicyProposal, PolicyReference, PolicyReviewSummary,
-    PolicyRiskLevel, PolicyRollbackReport, POLICY_GOVERNANCE_LEDGER_FILE,
+    policy_rollback_report_ledger_entry, replay_policy_lifecycle, review_policy_governance,
+    PolicyActionReceipt, PolicyApplyAction, PolicyApplyCoordinator, PolicyApplyOperation,
+    PolicyApplyPlan, PolicyApplyReport, PolicyBlocker, PolicyBlockerKind, PolicyConflict,
+    PolicyDecision, PolicyDomain, PolicyGate, PolicyGovernanceInput, PolicyGovernanceLedger,
+    PolicyGovernanceReview, PolicyLedgerEntry, PolicyLedgerLoad, PolicyLedgerStatus,
+    PolicyLedgerWarning, PolicyLifecycle, PolicyLifecycleEvent, PolicyLifecycleReplay,
+    PolicyLifecycleReplaySummary, PolicyProposal, PolicyReference, PolicyReplayAnomaly,
+    PolicyReviewSummary, PolicyRiskLevel, PolicyRollbackReport, POLICY_GOVERNANCE_LEDGER_FILE,
     POLICY_GOVERNANCE_VERSION,
 };
 pub use prompt::{

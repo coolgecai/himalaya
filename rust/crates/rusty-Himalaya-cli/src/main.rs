@@ -826,6 +826,9 @@ enum PolicyCliCommand {
     Ledger {
         limit: usize,
     },
+    Replay {
+        limit: usize,
+    },
     Plan {
         limit: usize,
         max_ticks: usize,
@@ -1627,11 +1630,12 @@ fn parse_policy_cli_command(args: &[String]) -> Result<PolicyCliCommand, String>
         }),
         Some(("review", rest)) => parse_policy_review_args(rest),
         Some(("ledger" | "log", rest)) => parse_policy_ledger_args(rest),
+        Some(("replay", rest)) => parse_policy_replay_args(rest),
         Some(("plan", rest)) => parse_policy_plan_args(rest),
         Some(("apply", rest)) => parse_policy_apply_args(rest),
         Some(("rollback", rest)) => parse_policy_rollback_args(rest),
         Some((other, _)) => Err(format!(
-            "unknown policy command: {other}\nUsage: Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]|rollback [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]]"
+            "unknown policy command: {other}\nUsage: Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|replay [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]|rollback [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]]"
         )),
     }
 }
@@ -1707,6 +1711,32 @@ fn parse_policy_ledger_args(args: &[String]) -> Result<PolicyCliCommand, String>
         }
     }
     Ok(PolicyCliCommand::Ledger { limit })
+}
+
+fn parse_policy_replay_args(args: &[String]) -> Result<PolicyCliCommand, String> {
+    let mut limit = 100_usize;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "policy replay --limit requires a value".to_string())?;
+                limit = parse_positive_usize("--limit", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--limit=") => {
+                limit = parse_positive_usize("--limit", &value[8..])?;
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown policy replay argument: {other}\nUsage: Himalaya policy replay [--limit N]"
+                ));
+            }
+        }
+    }
+    Ok(PolicyCliCommand::Replay { limit })
 }
 
 fn parse_policy_plan_args(args: &[String]) -> Result<PolicyCliCommand, String> {
@@ -9383,6 +9413,18 @@ fn run_policy_command(
                 output_format,
             )?;
         }
+        PolicyCliCommand::Replay { limit } => {
+            let policy_dir = policy_governance_dir()?;
+            let replay = runtime::replay_policy_lifecycle(&policy_dir, limit)?;
+            print_policy_output(
+                json!({
+                    "type": "policy_replay",
+                    "replay": replay,
+                    "ledger_path": runtime::policy_governance_ledger_path(&policy_dir),
+                }),
+                output_format,
+            )?;
+        }
         PolicyCliCommand::Plan { limit, max_ticks } => {
             let input = build_policy_governance_input(limit, max_ticks, permission_mode)?;
             let review = runtime::review_policy_governance(input);
@@ -9504,6 +9546,7 @@ fn print_policy_output(
 fn render_policy_output_text(value: &Value) -> String {
     match value["type"].as_str() {
         Some("policy_ledger") => render_policy_ledger_text(value),
+        Some("policy_replay") => render_policy_replay_text(value),
         Some("policy_apply_plan") => render_policy_apply_plan_text(value),
         Some("policy_apply") => render_governed_policy_apply_text(value),
         Some("policy_rollback") => render_governed_policy_rollback_text(value),
@@ -9548,6 +9591,32 @@ fn render_policy_ledger_text(value: &Value) -> String {
     lines.join("\n")
 }
 
+fn render_policy_replay_text(value: &Value) -> String {
+    let replay = &value["replay"];
+    let summary = &replay["summary"];
+    let lifecycles = summary["lifecycle_count"].as_u64().unwrap_or(0);
+    let events = summary["event_count"].as_u64().unwrap_or(0);
+    let anomalies = summary["anomaly_count"].as_u64().unwrap_or(0);
+    let malformed = summary["malformed_lines"].as_u64().unwrap_or(0);
+    let mut lines = vec![format!(
+        "Policy replay\n  Lifecycles {lifecycles}\n  Events     {events}\n  Anomalies  {anomalies}\n  Malformed  {malformed}"
+    )];
+    for lifecycle in replay["lifecycles"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(10)
+    {
+        let domain = lifecycle["domain"].as_str().unwrap_or("unknown");
+        let proposal = lifecycle["proposal_id"].as_str().unwrap_or("unknown");
+        let status = lifecycle["current_status"].as_str().unwrap_or("unknown");
+        let count = lifecycle["events"].as_array().map_or(0, Vec::len);
+        lines.push(format!("  - {domain}/{proposal}: {status}, events={count}"));
+    }
+    lines.join("\n")
+}
+
 fn render_policy_apply_plan_text(value: &Value) -> String {
     let plan = &value["plan"];
     let status = plan["status"].as_str().unwrap_or("unknown");
@@ -9577,9 +9646,23 @@ fn render_governed_policy_apply_text(value: &Value) -> String {
     let dry_run = apply["dry_run"].as_bool().unwrap_or(false);
     let applied = apply["applied"].as_bool().unwrap_or(false);
     let blockers = apply["blockers"].as_array().map_or(0, Vec::len);
-    format!(
+    let receipt = apply["receipt"]["id"].as_str().unwrap_or("unknown");
+    let mut lines = vec![format!(
         "Policy apply\n  Status   {status}\n  Dry run  {dry_run}\n  Applied  {applied}\n  Blockers {blockers}"
-    )
+    )];
+    lines.push(format!("  Receipt  {receipt}"));
+    for blocker in apply["structured_blockers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(3)
+    {
+        let kind = blocker["kind"].as_str().unwrap_or("unknown");
+        let reason = blocker["reason"].as_str().unwrap_or("unknown");
+        lines.push(format!("  - {kind}: {reason}"));
+    }
+    lines.join("\n")
 }
 
 fn render_governed_policy_rollback_text(value: &Value) -> String {
@@ -9587,9 +9670,23 @@ fn render_governed_policy_rollback_text(value: &Value) -> String {
     let status = rollback["status"].as_str().unwrap_or("unknown");
     let rolled_back = rollback["rolled_back"].as_bool().unwrap_or(false);
     let blockers = rollback["blockers"].as_array().map_or(0, Vec::len);
-    format!(
+    let receipt = rollback["receipt"]["id"].as_str().unwrap_or("unknown");
+    let mut lines = vec![format!(
         "Policy rollback\n  Status      {status}\n  Rolled back {rolled_back}\n  Blockers    {blockers}"
-    )
+    )];
+    lines.push(format!("  Receipt     {receipt}"));
+    for blocker in rollback["structured_blockers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(3)
+    {
+        let kind = blocker["kind"].as_str().unwrap_or("unknown");
+        let reason = blocker["reason"].as_str().unwrap_or("unknown");
+        lines.push(format!("  - {kind}: {reason}"));
+    }
+    lines.join("\n")
 }
 
 fn run_worker_command(
@@ -15207,7 +15304,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing] [--proposal-id ID]|rollback [--domain routing] [--proposal-id ID]]"
+        "  Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|replay [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing] [--proposal-id ID]|rollback [--domain routing] [--proposal-id ID]]"
     )?;
     writeln!(
         out,
@@ -16791,6 +16888,11 @@ mod tests {
             ])
             .expect("policy ledger should parse"),
             PolicyCliCommand::Ledger { limit: 5 }
+        );
+        assert_eq!(
+            parse_policy_cli_command(&["replay".to_string(), "--limit=50".to_string()])
+                .expect("policy replay should parse"),
+            PolicyCliCommand::Replay { limit: 50 }
         );
         assert_eq!(
             parse_policy_cli_command(&[

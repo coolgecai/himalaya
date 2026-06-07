@@ -206,6 +206,9 @@
           "$ref": "#/$defs/policyLedgerEvent"
         },
         {
+          "$ref": "#/$defs/policyReplayEvent"
+        },
+        {
           "$ref": "#/$defs/benchmarkSuiteEvent"
         },
         {
@@ -310,6 +313,7 @@
         "policy_apply",
         "policy_rollback",
         "policy_ledger",
+        "policy_replay",
         "benchmark_suite",
         "benchmark_task",
         "benchmark_run",
@@ -1666,6 +1670,29 @@
               "const": "policy_ledger"
             },
             "ledger": {
+              "type": "object"
+            },
+            "ledger_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "policyReplayEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "replay"
+          ],
+          "properties": {
+            "type": {
+              "const": "policy_replay"
+            },
+            "replay": {
               "type": "object"
             },
             "ledger_path": {

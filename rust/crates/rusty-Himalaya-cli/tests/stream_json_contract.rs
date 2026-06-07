@@ -78,6 +78,7 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "policy_apply",
         "policy_rollback",
         "policy_ledger",
+        "policy_replay",
         "benchmark_suite",
         "benchmark_task",
         "benchmark_run",
@@ -1068,6 +1069,7 @@ fn governed_policy_apply_emits_stream_json_events() {
     assert_eq!(dry_run["apply"]["status"], "dry_run_passed");
     assert_eq!(dry_run["apply"]["applied"], false);
     assert!(dry_run["apply"]["routing_report"].is_object());
+    assert!(dry_run["apply"]["receipt"].is_object());
 
     let apply_events = run_stream_json_subcommand(
         &workspace,
@@ -1086,6 +1088,7 @@ fn governed_policy_apply_emits_stream_json_events() {
         .expect("policy apply event should be emitted");
     assert_eq!(apply["apply"]["status"], "applied");
     assert_eq!(apply["apply"]["applied"], true);
+    assert_eq!(apply["apply"]["receipt"]["adapter"], "routing_policy");
 
     let rollback_events = run_stream_json_subcommand(
         &workspace,
@@ -1104,6 +1107,20 @@ fn governed_policy_apply_emits_stream_json_events() {
         .expect("policy rollback event should be emitted");
     assert_eq!(rollback["rollback"]["status"], "rolled_back");
     assert_eq!(rollback["rollback"]["rolled_back"], true);
+    assert!(rollback["rollback"]["receipt"].is_object());
+
+    let replay_events = run_stream_json_subcommand(&workspace, &["policy", "replay"]);
+    let replay = replay_events
+        .iter()
+        .find(|event| event["type"] == "policy_replay")
+        .expect("policy replay event should be emitted");
+    assert!(replay["replay"]["lifecycles"].is_array());
+    assert!(
+        replay["replay"]["summary"]["event_count"]
+            .as_u64()
+            .expect("event count")
+            >= 4
+    );
 }
 
 #[test]
@@ -2057,6 +2074,10 @@ fn assert_stream_event_schema(event: &Value) {
         "policy_ledger" => assert!(
             event["ledger"].is_object(),
             "policy_ledger requires ledger object: {event:?}"
+        ),
+        "policy_replay" => assert!(
+            event["replay"].is_object(),
+            "policy_replay requires replay object: {event:?}"
         ),
         "benchmark_suite" => {
             assert_non_empty_string(&event["suite_id"]);
