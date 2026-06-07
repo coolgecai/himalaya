@@ -1419,6 +1419,8 @@ fn daemon_report_emits_policy_review_event() {
     assert_eq!(report["summary"]["considered_runs"], 0);
     assert_eq!(report["policy_recommendation"]["requested_max_ticks"], 3);
     assert_eq!(report["policy_recommendation"]["recommended_max_ticks"], 3);
+    assert!(report["integration"].is_object());
+    assert!(report["integration"]["summary"].is_object());
     assert_non_empty_string(&report["runs_path"]);
 }
 
@@ -1976,6 +1978,10 @@ fn assert_stream_event_schema(event: &Value) {
                 event["policy_recommendation"].is_object(),
                 "task_scheduler_daemon_report requires policy_recommendation object: {event:?}"
             );
+            assert!(
+                event["integration"].is_object(),
+                "task_scheduler_daemon_report requires integration object: {event:?}"
+            );
             assert_non_empty_string(&event["runs_path"]);
             if event.get("runs").is_some() {
                 assert!(
@@ -1989,6 +1995,12 @@ fn assert_stream_event_schema(event: &Value) {
                 event["evaluation"].is_object(),
                 "task_scheduler_daemon_evaluation requires evaluation object: {event:?}"
             );
+            if event.get("integration").is_some() {
+                assert!(
+                    event["integration"].is_object(),
+                    "task_scheduler_daemon_evaluation integration must be object when present: {event:?}"
+                );
+            }
             assert_non_empty_string(&event["runs_path"]);
         }
         "task_scheduler_daemon_replay" => {

@@ -606,6 +606,10 @@ fn task_scheduler_tick_persists_durable_status() {
             .len(),
         1
     );
+    assert!(daemon_report["integration"].is_object());
+    assert!(daemon_report["integration"]["summary"].is_object());
+    assert!(daemon_report["integration"]["invariants"].is_array());
+    assert!(daemon_report["integration"]["replay"]["stages"].is_array());
 
     let daemon_evaluation = assert_json_command(
         &root,
@@ -642,6 +646,8 @@ fn task_scheduler_tick_persists_durable_status() {
             ["requested_max_ticks"],
         3
     );
+    assert!(daemon_evaluation["integration"].is_object());
+    assert!(daemon_evaluation["integration"]["summary"].is_object());
 
     let daemon_replay = assert_json_command(
         &root,

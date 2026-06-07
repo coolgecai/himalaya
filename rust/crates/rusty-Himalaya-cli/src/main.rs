@@ -4300,6 +4300,71 @@ fn build_autonomous_evaluation_input(
     })
 }
 
+fn build_autonomous_integration_input(
+    limit: usize,
+    max_ticks: usize,
+    permission_mode: PermissionMode,
+) -> Result<runtime::AutonomousIntegrationInput, Box<dyn std::error::Error>> {
+    let registry = load_task_registry()?;
+    let worker_registry = load_worker_registry()?;
+    let tasks = registry.list(None);
+    let loaded_memory =
+        load_task_memory_store().unwrap_or_else(|_| runtime::TaskMemoryStore::new());
+    let task_memory = if loaded_memory.entries().is_empty() && !tasks.is_empty() {
+        runtime::TaskMemoryStore::from_tasks(&tasks)
+    } else {
+        loaded_memory
+    };
+    let route_feedback = load_route_feedback_store()?;
+    let routing_proposals = runtime::load_routing_policy_proposals(&route_feedback_dir()?)
+        .map(|snapshot| snapshot.proposals)
+        .unwrap_or_default();
+    let scheduler = runtime::DurableTaskScheduler::with_workers(
+        registry.clone(),
+        runtime::VerificationRunner::new(Some(env::current_dir()?)),
+        worker_registry.clone(),
+    )
+    .with_permission_mode(permission_mode);
+    let daemon = runtime::SchedulerDaemon::new(scheduler.clone(), scheduler_state_dir()?);
+    let scheduler_state = daemon.load_state().ok();
+    let scheduler_events = daemon.load_events().unwrap_or_default();
+    let scheduler_queue = scheduler.queue();
+    let policy_dir = policy_governance_dir()?;
+    let policy_ledger = runtime::PolicyGovernanceLedger::new(&policy_dir)
+        .load(limit)
+        .ok();
+    let policy_replay = runtime::replay_policy_lifecycle(&policy_dir, limit).ok();
+    let autonomous_runs =
+        runtime::load_autonomous_run_reports_with_diagnostics(&scheduler_state_dir()?, limit)?;
+    let evaluation = Some(runtime::evaluate_autonomous_loop(
+        runtime::AutonomousEvaluationInput {
+            tasks: tasks.clone(),
+            task_memory: task_memory.clone(),
+            route_feedback: route_feedback.clone(),
+            autonomous_runs: autonomous_runs.clone(),
+            permission_mode,
+            requested_max_ticks: max_ticks,
+            policy_replay: policy_replay.clone(),
+        },
+    ));
+    Ok(runtime::AutonomousIntegrationInput {
+        tasks,
+        task_ledger: registry.ledger(),
+        task_events: registry.event_log(),
+        scheduler_state,
+        scheduler_events,
+        scheduler_queue,
+        workers: worker_registry.list(),
+        task_memory,
+        route_feedback,
+        routing_proposals,
+        policy_ledger,
+        policy_replay,
+        autonomous_runs,
+        evaluation,
+    })
+}
+
 fn render_benchmark_value_text(value: &Value) -> String {
     match value["type"].as_str() {
         Some("benchmark_suite") => render_benchmark_list_text(value),
@@ -4353,6 +4418,77 @@ fn render_autonomous_evaluation_text(value: &Value) -> String {
     if let Some(recommendations) = report["recommendations"].as_array() {
         lines.push("Recommendations:".to_string());
         for recommendation in recommendations.iter().filter_map(Value::as_str) {
+            lines.push(format!("  - {recommendation}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_autonomous_integration_text(value: &Value) -> String {
+    let report = value.get("integration").unwrap_or(value);
+    let summary = &report["summary"];
+    let status = report["status"].as_str().unwrap_or("unknown");
+    let failed = report["invariants"]
+        .as_array()
+        .map(|invariants| {
+            invariants
+                .iter()
+                .filter(|invariant| invariant["status"].as_str() == Some("failed"))
+                .count()
+        })
+        .unwrap_or(0);
+    let warnings = report["invariants"]
+        .as_array()
+        .map(|invariants| {
+            invariants
+                .iter()
+                .filter(|invariant| invariant["status"].as_str() == Some("warning"))
+                .count()
+        })
+        .unwrap_or(0);
+    let mut lines = vec![
+        "Autonomous integration".to_string(),
+        format!("  Status            {status}"),
+        format!(
+            "  Tasks             {} total / {} runnable / {} blocked",
+            summary["task_count"].as_u64().unwrap_or(0),
+            summary["runnable_task_count"].as_u64().unwrap_or(0),
+            summary["blocked_task_count"].as_u64().unwrap_or(0)
+        ),
+        format!(
+            "  Scheduler         {}, {} tick(s)",
+            summary["scheduler_status"].as_str().unwrap_or("unknown"),
+            summary["scheduler_tick_count"].as_u64().unwrap_or(0)
+        ),
+        format!(
+            "  Workers           {} total / {} active / {} blocked",
+            summary["worker_count"].as_u64().unwrap_or(0),
+            summary["active_worker_count"].as_u64().unwrap_or(0),
+            summary["blocked_worker_count"].as_u64().unwrap_or(0)
+        ),
+        format!(
+            "  Memory/routes     {} memory / {} route feedback",
+            summary["task_memory_entries"].as_u64().unwrap_or(0),
+            summary["route_feedback_entries"].as_u64().unwrap_or(0)
+        ),
+        format!(
+            "  Policy replay     {} lifecycle(s), {} anomalie(s)",
+            summary["policy_lifecycle_count"].as_u64().unwrap_or(0),
+            summary["policy_anomaly_count"].as_u64().unwrap_or(0)
+        ),
+        format!("  Invariants        {failed} failed / {warnings} warning(s)"),
+    ];
+    if let Some(stages) = report["replay"]["stages"].as_array() {
+        lines.push("Replay stages:".to_string());
+        for stage in stages.iter().take(8) {
+            let name = stage["name"].as_str().unwrap_or("stage");
+            let status = stage["status"].as_str().unwrap_or("unknown");
+            lines.push(format!("  - {name}: {status}"));
+        }
+    }
+    if let Some(recommendations) = report["recommendations"].as_array() {
+        lines.push("Recommendations:".to_string());
+        for recommendation in recommendations.iter().filter_map(Value::as_str).take(5) {
             lines.push(format!("  - {recommendation}"));
         }
     }
@@ -11133,6 +11269,9 @@ fn run_task_daemon_command(
             let latest_run = coordinator.latest_run().ok().flatten();
             let recent_runs = coordinator.load_runs(limit).unwrap_or_default();
             let review = coordinator.review_policy(limit, max_ticks)?;
+            let integration = runtime::review_autonomous_integration(
+                build_autonomous_integration_input(limit, max_ticks, permission_mode)?,
+            );
             match output_format {
                 CliOutputFormat::Text => {
                     println!(
@@ -11148,6 +11287,13 @@ fn run_task_daemon_command(
                     for reason in &review.recommendation.reasons {
                         println!("  Reason           {reason}");
                     }
+                    println!();
+                    println!(
+                        "{}",
+                        render_autonomous_integration_text(&json!({
+                            "integration": integration,
+                        }))
+                    );
                 }
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_task_output(
@@ -11158,6 +11304,7 @@ fn run_task_daemon_command(
                             "runs":recent_runs,
                             "summary":review.summary,
                             "policy_recommendation":review.recommendation,
+                            "integration":integration,
                             "state_path":daemon.state_path(),
                             "events_path":daemon.events_path(),
                             "runs_path":coordinator.runs_path(),
@@ -11172,17 +11319,25 @@ fn run_task_daemon_command(
             let latest_run = coordinator.latest_run().ok().flatten();
             let input = build_autonomous_evaluation_input(limit, max_ticks, permission_mode)?;
             let evaluation = runtime::evaluate_autonomous_loop(input);
+            let integration = runtime::review_autonomous_integration(
+                build_autonomous_integration_input(limit, max_ticks, permission_mode)?,
+            );
             let value = json!({
                 "type":"task_scheduler_daemon_evaluation",
                 "state":state,
                 "latest_run":latest_run,
                 "evaluation":evaluation,
+                "integration":integration,
                 "state_path":daemon.state_path(),
                 "events_path":daemon.events_path(),
                 "runs_path":coordinator.runs_path(),
             });
             match output_format {
-                CliOutputFormat::Text => println!("{}", render_autonomous_evaluation_text(&value)),
+                CliOutputFormat::Text => {
+                    println!("{}", render_autonomous_evaluation_text(&value));
+                    println!();
+                    println!("{}", render_autonomous_integration_text(&value));
+                }
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_task_output(value, output_format)?;
                 }
@@ -15537,12 +15692,13 @@ mod tests {
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, parse_policy_cli_command, parse_route_cli_command,
         parse_task_cli_command, parse_worker_cli_command, permission_policy, print_help_to,
-        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
-        render_governed_policy_apply_text, render_memory_report, render_policy_apply_plan_text,
-        render_policy_replay_text, render_prompt_history_report, render_repl_help,
-        render_resume_usage, render_session_markdown, resolve_model_alias,
-        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
-        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
+        push_output_block, render_autonomous_integration_text, render_config_report,
+        render_diff_report, render_diff_report_for, render_governed_policy_apply_text,
+        render_memory_report, render_policy_apply_plan_text, render_policy_replay_text,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, slash_command_status, status_context,
         stream_json_event, summarize_tool_payload_for_markdown, validate_no_args,
         write_mcp_server_fixture, BenchmarkCliCommand, CliAction, CliOutputFormat, CliToolExecutor,
@@ -15688,6 +15844,54 @@ mod tests {
         assert!(text.contains("Actions"));
         assert!(text.contains("dry_run_memory_policy_coverage=2"));
         assert!(text.contains("Anomaly kinds duplicate_status=1"));
+    }
+
+    #[test]
+    fn autonomous_integration_text_surfaces_cross_domain_health() {
+        let text = render_autonomous_integration_text(&json!({
+            "integration": {
+                "status": "degraded",
+                "summary": {
+                    "task_count": 2,
+                    "runnable_task_count": 1,
+                    "blocked_task_count": 1,
+                    "scheduler_status": "running",
+                    "scheduler_tick_count": 3,
+                    "worker_count": 1,
+                    "active_worker_count": 1,
+                    "blocked_worker_count": 0,
+                    "task_memory_entries": 2,
+                    "route_feedback_entries": 2,
+                    "policy_lifecycle_count": 1,
+                    "policy_anomaly_count": 0
+                },
+                "invariants": [{
+                    "name": "memory_entries_reference_tasks",
+                    "status": "passed"
+                }, {
+                    "name": "policy_replay_has_no_anomalies",
+                    "status": "warning"
+                }],
+                "replay": {
+                    "stages": [{
+                        "name": "task_lifecycle",
+                        "status": "passed"
+                    }, {
+                        "name": "routing_policy_replay",
+                        "status": "warning"
+                    }]
+                },
+                "recommendations": [
+                    "Complete missing golden replay stages."
+                ]
+            }
+        }));
+
+        assert!(text.contains("Autonomous integration"));
+        assert!(text.contains("Status            degraded"));
+        assert!(text.contains("2 total / 1 runnable / 1 blocked"));
+        assert!(text.contains("routing_policy_replay: warning"));
+        assert!(text.contains("Complete missing golden replay stages."));
     }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {

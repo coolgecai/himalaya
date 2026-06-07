@@ -5,6 +5,7 @@
 //! that drives interactive and one-shot turns.
 
 pub mod autonomous_evaluation;
+pub mod autonomous_integration;
 pub mod autonomous_run;
 mod bash;
 pub mod bash_validation;
@@ -80,6 +81,13 @@ pub use autonomous_evaluation::{
     AutonomousEvaluationReport, AutonomousEvaluationScores, AutonomousTraceReplayDecision,
     AutonomousTraceReplayReport, AUTONOMOUS_BENCHMARK_SUITE_ID, AUTONOMOUS_BENCHMARK_VERSION,
     AUTONOMOUS_EVALUATION_VERSION,
+};
+pub use autonomous_integration::{
+    review_autonomous_integration, AutonomousIntegrationCheckStatus,
+    AutonomousIntegrationComponent, AutonomousIntegrationInput, AutonomousIntegrationInvariant,
+    AutonomousIntegrationReplayStage, AutonomousIntegrationReplaySummary,
+    AutonomousIntegrationReport, AutonomousIntegrationSeverity, AutonomousIntegrationStatus,
+    AutonomousIntegrationSummary, AUTONOMOUS_INTEGRATION_REPORT_VERSION,
 };
 pub use autonomous_run::{
     append_autonomous_run_report, autonomous_runs_path, latest_autonomous_run_report,
@@ -206,16 +214,16 @@ pub use policy_governance::{
     filter_policy_lifecycle_replay, load_policy_governance_ledger, policy_adapter_descriptors,
     policy_apply_plan_ledger_entry, policy_apply_report_ledger_entry,
     policy_governance_ledger_path, policy_rollback_report_ledger_entry, replay_policy_lifecycle,
-    review_policy_governance, MemoryPolicyDryRunReport, PolicyActionReceipt,
-    PolicyAdapterDescriptor, PolicyAdapterReport, PolicyApplyAction, PolicyApplyCoordinator,
-    PolicyApplyOperation, PolicyApplyPlan, PolicyApplyReport, PolicyBlocker, PolicyBlockerKind,
-    PolicyConflict, PolicyDecision, PolicyDomain, PolicyGate, PolicyGovernanceInput,
-    PolicyGovernanceLedger, PolicyGovernanceReview, PolicyLedgerEntry, PolicyLedgerLoad,
-    PolicyLedgerStatus, PolicyLedgerWarning, PolicyLifecycle, PolicyLifecycleEvent,
-    PolicyLifecycleReplay, PolicyLifecycleReplaySummary, PolicyProposal, PolicyReference,
-    PolicyReplayAnomaly, PolicyReviewSummary, PolicyRiskLevel, PolicyRollbackReport,
-    RecoveryPolicyDryRunReport, SchedulerPolicyDryRunReport, POLICY_GOVERNANCE_LEDGER_FILE,
-    POLICY_GOVERNANCE_VERSION,
+    replay_policy_lifecycle_entries, review_policy_governance, MemoryPolicyDryRunReport,
+    PolicyActionReceipt, PolicyAdapterDescriptor, PolicyAdapterReport, PolicyApplyAction,
+    PolicyApplyCoordinator, PolicyApplyOperation, PolicyApplyPlan, PolicyApplyReport,
+    PolicyBlocker, PolicyBlockerKind, PolicyConflict, PolicyDecision, PolicyDomain, PolicyGate,
+    PolicyGovernanceInput, PolicyGovernanceLedger, PolicyGovernanceReview, PolicyLedgerEntry,
+    PolicyLedgerLoad, PolicyLedgerStatus, PolicyLedgerWarning, PolicyLifecycle,
+    PolicyLifecycleEvent, PolicyLifecycleReplay, PolicyLifecycleReplaySummary, PolicyProposal,
+    PolicyReference, PolicyReplayAnomaly, PolicyReviewSummary, PolicyRiskLevel,
+    PolicyRollbackReport, RecoveryPolicyDryRunReport, SchedulerPolicyDryRunReport,
+    POLICY_GOVERNANCE_LEDGER_FILE, POLICY_GOVERNANCE_VERSION,
 };
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,
