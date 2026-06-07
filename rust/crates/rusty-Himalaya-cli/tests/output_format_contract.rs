@@ -1182,12 +1182,58 @@ fn route_feedback_summary_emits_metric_summaries() {
         .expect("dry-run blockers")
         .is_empty());
 
+    let plan = assert_json_command(&root, &["--output-format", "json", "policy", "plan"]);
+    assert_eq!(plan["type"], "policy_apply_plan");
+    assert_eq!(plan["recorded"], true);
+    assert_eq!(plan["plan"]["status"], "planned");
+    assert!(plan["plan"]["actions"]
+        .as_array()
+        .expect("governed plan actions")
+        .iter()
+        .any(|action| action["domain"] == "routing"
+            && action["proposal_id"] == proposal_id
+            && action["executable"] == true));
+    assert_eq!(plan["ledger_entry"]["status"], "planned");
+    assert!(root.join(".Himalaya/policy/ledger.jsonl").exists());
+
+    let governed_dry_run = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "policy",
+            "apply",
+            "--dry-run",
+            "--domain",
+            "routing",
+            "--proposal-id",
+            &proposal_id,
+        ],
+    );
+    assert_eq!(governed_dry_run["type"], "policy_apply");
+    assert_eq!(governed_dry_run["apply"]["dry_run"], true);
+    assert_eq!(governed_dry_run["apply"]["status"], "dry_run_passed");
+    assert_eq!(governed_dry_run["apply"]["applied"], false);
+    assert!(governed_dry_run["apply"]["routing_report"].is_object());
+    assert!(!root.join(".Himalaya/routes/applied-policy.json").exists());
+
     let applied = assert_json_command(
         &root,
-        &["--output-format", "json", "routes", "apply", &proposal_id],
+        &[
+            "--output-format",
+            "json",
+            "policy",
+            "apply",
+            "--domain",
+            "routing",
+            "--proposal-id",
+            &proposal_id,
+        ],
     );
-    assert_eq!(applied["type"], "route_policy_apply");
+    assert_eq!(applied["type"], "policy_apply");
+    assert_eq!(applied["apply"]["status"], "applied");
     assert_eq!(applied["apply"]["applied"], true);
+    assert!(applied["ledger_entry"].is_object());
     assert!(root.join(".Himalaya/routes/applied-policy.json").exists());
 
     let rollback = assert_json_command(
@@ -1195,13 +1241,18 @@ fn route_feedback_summary_emits_metric_summaries() {
         &[
             "--output-format",
             "json",
-            "routes",
+            "policy",
             "rollback",
+            "--domain",
+            "routing",
+            "--proposal-id",
             &proposal_id,
         ],
     );
-    assert_eq!(rollback["type"], "route_policy_rollback");
+    assert_eq!(rollback["type"], "policy_rollback");
+    assert_eq!(rollback["rollback"]["status"], "rolled_back");
     assert_eq!(rollback["rollback"]["rolled_back"], true);
+    assert!(rollback["ledger_entry"].is_object());
     assert!(!root.join(".Himalaya/routes/applied-policy.json").exists());
 }
 

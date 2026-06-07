@@ -826,6 +826,23 @@ enum PolicyCliCommand {
     Ledger {
         limit: usize,
     },
+    Plan {
+        limit: usize,
+        max_ticks: usize,
+    },
+    Apply {
+        limit: usize,
+        max_ticks: usize,
+        domain: Option<runtime::PolicyDomain>,
+        proposal_id: Option<String>,
+        dry_run: bool,
+    },
+    Rollback {
+        limit: usize,
+        max_ticks: usize,
+        domain: Option<runtime::PolicyDomain>,
+        proposal_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1610,8 +1627,11 @@ fn parse_policy_cli_command(args: &[String]) -> Result<PolicyCliCommand, String>
         }),
         Some(("review", rest)) => parse_policy_review_args(rest),
         Some(("ledger" | "log", rest)) => parse_policy_ledger_args(rest),
+        Some(("plan", rest)) => parse_policy_plan_args(rest),
+        Some(("apply", rest)) => parse_policy_apply_args(rest),
+        Some(("rollback", rest)) => parse_policy_rollback_args(rest),
         Some((other, _)) => Err(format!(
-            "unknown policy command: {other}\nUsage: Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]]"
+            "unknown policy command: {other}\nUsage: Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]|rollback [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]]"
         )),
     }
 }
@@ -1687,6 +1707,205 @@ fn parse_policy_ledger_args(args: &[String]) -> Result<PolicyCliCommand, String>
         }
     }
     Ok(PolicyCliCommand::Ledger { limit })
+}
+
+fn parse_policy_plan_args(args: &[String]) -> Result<PolicyCliCommand, String> {
+    let (limit, max_ticks) = parse_policy_limit_max_ticks(args, "policy plan")?;
+    Ok(PolicyCliCommand::Plan { limit, max_ticks })
+}
+
+fn parse_policy_apply_args(args: &[String]) -> Result<PolicyCliCommand, String> {
+    let mut limit = 20_usize;
+    let mut max_ticks = 1_usize;
+    let mut domain = None;
+    let mut proposal_id = None;
+    let mut dry_run = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "policy apply --limit requires a value".to_string())?;
+                limit = parse_positive_usize("--limit", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--limit=") => {
+                limit = parse_positive_usize("--limit", &value[8..])?;
+                index += 1;
+            }
+            "--max-ticks" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "policy apply --max-ticks requires a value".to_string())?;
+                max_ticks = parse_positive_usize("--max-ticks", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--max-ticks=") => {
+                max_ticks = parse_positive_usize("--max-ticks", &value[12..])?;
+                index += 1;
+            }
+            "--domain" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "policy apply --domain requires a value".to_string())?;
+                domain = Some(parse_policy_domain(value)?);
+                index += 2;
+            }
+            value if value.starts_with("--domain=") => {
+                domain = Some(parse_policy_domain(&value[9..])?);
+                index += 1;
+            }
+            "--proposal-id" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "policy apply --proposal-id requires a value".to_string())?;
+                proposal_id = Some(value.clone());
+                index += 2;
+            }
+            value if value.starts_with("--proposal-id=") => {
+                proposal_id = Some(value[14..].to_string());
+                index += 1;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown policy apply argument: {other}\nUsage: Himalaya policy apply [--dry-run] [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]"
+                ));
+            }
+        }
+    }
+    Ok(PolicyCliCommand::Apply {
+        limit,
+        max_ticks,
+        domain,
+        proposal_id,
+        dry_run,
+    })
+}
+
+fn parse_policy_rollback_args(args: &[String]) -> Result<PolicyCliCommand, String> {
+    let mut limit = 20_usize;
+    let mut max_ticks = 1_usize;
+    let mut domain = None;
+    let mut proposal_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "policy rollback --limit requires a value".to_string())?;
+                limit = parse_positive_usize("--limit", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--limit=") => {
+                limit = parse_positive_usize("--limit", &value[8..])?;
+                index += 1;
+            }
+            "--max-ticks" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "policy rollback --max-ticks requires a value".to_string())?;
+                max_ticks = parse_positive_usize("--max-ticks", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--max-ticks=") => {
+                max_ticks = parse_positive_usize("--max-ticks", &value[12..])?;
+                index += 1;
+            }
+            "--domain" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "policy rollback --domain requires a value".to_string())?;
+                domain = Some(parse_policy_domain(value)?);
+                index += 2;
+            }
+            value if value.starts_with("--domain=") => {
+                domain = Some(parse_policy_domain(&value[9..])?);
+                index += 1;
+            }
+            "--proposal-id" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "policy rollback --proposal-id requires a value".to_string())?;
+                proposal_id = Some(value.clone());
+                index += 2;
+            }
+            value if value.starts_with("--proposal-id=") => {
+                proposal_id = Some(value[14..].to_string());
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown policy rollback argument: {other}\nUsage: Himalaya policy rollback [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]"
+                ));
+            }
+        }
+    }
+    Ok(PolicyCliCommand::Rollback {
+        limit,
+        max_ticks,
+        domain,
+        proposal_id,
+    })
+}
+
+fn parse_policy_limit_max_ticks(
+    args: &[String],
+    usage_command: &str,
+) -> Result<(usize, usize), String> {
+    let mut limit = 20_usize;
+    let mut max_ticks = 1_usize;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("{usage_command} --limit requires a value"))?;
+                limit = parse_positive_usize("--limit", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--limit=") => {
+                limit = parse_positive_usize("--limit", &value[8..])?;
+                index += 1;
+            }
+            "--max-ticks" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("{usage_command} --max-ticks requires a value"))?;
+                max_ticks = parse_positive_usize("--max-ticks", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--max-ticks=") => {
+                max_ticks = parse_positive_usize("--max-ticks", &value[12..])?;
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown {usage_command} argument: {other}\nUsage: Himalaya {usage_command} [--limit N] [--max-ticks N]"
+                ));
+            }
+        }
+    }
+    Ok((limit, max_ticks))
+}
+
+fn parse_policy_domain(value: &str) -> Result<runtime::PolicyDomain, String> {
+    match value {
+        "routing" | "route" | "routes" => Ok(runtime::PolicyDomain::Routing),
+        "autonomous_run" | "autonomous-run" | "autonomous" => {
+            Ok(runtime::PolicyDomain::AutonomousRun)
+        }
+        "scheduler" => Ok(runtime::PolicyDomain::Scheduler),
+        "memory" => Ok(runtime::PolicyDomain::Memory),
+        "recovery" => Ok(runtime::PolicyDomain::Recovery),
+        other => Err(format!("unknown policy domain: {other}")),
+    }
 }
 
 fn parse_task_status(value: &str) -> Result<runtime::TaskStatus, String> {
@@ -9164,6 +9383,76 @@ fn run_policy_command(
                 output_format,
             )?;
         }
+        PolicyCliCommand::Plan { limit, max_ticks } => {
+            let input = build_policy_governance_input(limit, max_ticks, permission_mode)?;
+            let review = runtime::review_policy_governance(input);
+            let coordinator =
+                runtime::PolicyApplyCoordinator::new(load_route_policy_proposal_store()?);
+            let plan = coordinator.plan_apply(review, None, None, false);
+            let ledger = runtime::PolicyGovernanceLedger::new(policy_governance_dir()?);
+            let ledger_entry = ledger.record_apply_plan(&plan)?;
+            print_policy_output(
+                json!({
+                    "type": "policy_apply_plan",
+                    "plan": plan,
+                    "recorded": true,
+                    "ledger_entry": ledger_entry,
+                    "ledger_path": ledger.ledger_path(),
+                }),
+                output_format,
+            )?;
+        }
+        PolicyCliCommand::Apply {
+            limit,
+            max_ticks,
+            domain,
+            proposal_id,
+            dry_run,
+        } => {
+            let input = build_policy_governance_input(limit, max_ticks, permission_mode)?;
+            let review = runtime::review_policy_governance(input);
+            let coordinator =
+                runtime::PolicyApplyCoordinator::new(load_route_policy_proposal_store()?);
+            let plan = coordinator.plan_apply(review, domain, proposal_id.as_deref(), dry_run);
+            let apply = coordinator.apply(&plan)?;
+            let ledger = runtime::PolicyGovernanceLedger::new(policy_governance_dir()?);
+            let ledger_entry = ledger.record_apply_report(&apply)?;
+            print_policy_output(
+                json!({
+                    "type": "policy_apply",
+                    "apply": apply,
+                    "recorded": true,
+                    "ledger_entry": ledger_entry,
+                    "ledger_path": ledger.ledger_path(),
+                }),
+                output_format,
+            )?;
+        }
+        PolicyCliCommand::Rollback {
+            limit,
+            max_ticks,
+            domain,
+            proposal_id,
+        } => {
+            let input = build_policy_governance_input(limit, max_ticks, permission_mode)?;
+            let review = runtime::review_policy_governance(input);
+            let coordinator =
+                runtime::PolicyApplyCoordinator::new(load_route_policy_proposal_store()?);
+            let plan = coordinator.plan_rollback(review, domain, proposal_id.as_deref());
+            let rollback = coordinator.rollback(&plan)?;
+            let ledger = runtime::PolicyGovernanceLedger::new(policy_governance_dir()?);
+            let ledger_entry = ledger.record_rollback_report(&rollback)?;
+            print_policy_output(
+                json!({
+                    "type": "policy_rollback",
+                    "rollback": rollback,
+                    "recorded": true,
+                    "ledger_entry": ledger_entry,
+                    "ledger_path": ledger.ledger_path(),
+                }),
+                output_format,
+            )?;
+        }
     }
     Ok(())
 }
@@ -9215,6 +9504,9 @@ fn print_policy_output(
 fn render_policy_output_text(value: &Value) -> String {
     match value["type"].as_str() {
         Some("policy_ledger") => render_policy_ledger_text(value),
+        Some("policy_apply_plan") => render_policy_apply_plan_text(value),
+        Some("policy_apply") => render_governed_policy_apply_text(value),
+        Some("policy_rollback") => render_governed_policy_rollback_text(value),
         _ => render_policy_review_text(value),
     }
 }
@@ -9254,6 +9546,50 @@ fn render_policy_ledger_text(value: &Value) -> String {
         lines.push(format!("  - {id}: {status}, conflicts={conflicts}"));
     }
     lines.join("\n")
+}
+
+fn render_policy_apply_plan_text(value: &Value) -> String {
+    let plan = &value["plan"];
+    let status = plan["status"].as_str().unwrap_or("unknown");
+    let actions = plan["actions"].as_array().map_or(0, Vec::len);
+    let blockers = plan["blockers"].as_array().map_or(0, Vec::len);
+    let recorded = value["recorded"].as_bool().unwrap_or(false);
+    let mut lines = vec![format!(
+        "Policy apply plan\n  Status   {status}\n  Actions  {actions}\n  Blockers {blockers}\n  Recorded {recorded}"
+    )];
+    if let Some(actions) = plan["actions"].as_array() {
+        for action in actions {
+            let domain = action["domain"].as_str().unwrap_or("unknown");
+            let proposal = action["proposal_id"].as_str().unwrap_or("none");
+            let status = action["status"].as_str().unwrap_or("unknown");
+            let executable = action["executable"].as_bool().unwrap_or(false);
+            lines.push(format!(
+                "  - {domain}/{proposal}: {status}, executable={executable}"
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_governed_policy_apply_text(value: &Value) -> String {
+    let apply = &value["apply"];
+    let status = apply["status"].as_str().unwrap_or("unknown");
+    let dry_run = apply["dry_run"].as_bool().unwrap_or(false);
+    let applied = apply["applied"].as_bool().unwrap_or(false);
+    let blockers = apply["blockers"].as_array().map_or(0, Vec::len);
+    format!(
+        "Policy apply\n  Status   {status}\n  Dry run  {dry_run}\n  Applied  {applied}\n  Blockers {blockers}"
+    )
+}
+
+fn render_governed_policy_rollback_text(value: &Value) -> String {
+    let rollback = &value["rollback"];
+    let status = rollback["status"].as_str().unwrap_or("unknown");
+    let rolled_back = rollback["rolled_back"].as_bool().unwrap_or(false);
+    let blockers = rollback["blockers"].as_array().map_or(0, Vec::len);
+    format!(
+        "Policy rollback\n  Status      {status}\n  Rolled back {rolled_back}\n  Blockers    {blockers}"
+    )
 }
 
 fn run_worker_command(
@@ -14871,11 +15207,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]]"
+        "  Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing] [--proposal-id ID]|rollback [--domain routing] [--proposal-id ID]]"
     )?;
     writeln!(
         out,
-        "      Review cross-domain autonomous policy state and append the governance ledger"
+        "      Review, plan, apply, rollback, and audit governed autonomous policy state"
     )?;
     writeln!(
         out,
@@ -16455,6 +16791,51 @@ mod tests {
             ])
             .expect("policy ledger should parse"),
             PolicyCliCommand::Ledger { limit: 5 }
+        );
+        assert_eq!(
+            parse_policy_cli_command(&[
+                "plan".to_string(),
+                "--limit".to_string(),
+                "4".to_string(),
+                "--max-ticks=2".to_string()
+            ])
+            .expect("policy plan should parse"),
+            PolicyCliCommand::Plan {
+                limit: 4,
+                max_ticks: 2,
+            }
+        );
+        assert_eq!(
+            parse_policy_cli_command(&[
+                "apply".to_string(),
+                "--dry-run".to_string(),
+                "--domain".to_string(),
+                "routing".to_string(),
+                "--proposal-id=route-policy-1".to_string()
+            ])
+            .expect("policy apply should parse"),
+            PolicyCliCommand::Apply {
+                limit: 20,
+                max_ticks: 1,
+                domain: Some(runtime::PolicyDomain::Routing),
+                proposal_id: Some("route-policy-1".to_string()),
+                dry_run: true,
+            }
+        );
+        assert_eq!(
+            parse_policy_cli_command(&[
+                "rollback".to_string(),
+                "--domain=routing".to_string(),
+                "--proposal-id".to_string(),
+                "route-policy-1".to_string()
+            ])
+            .expect("policy rollback should parse"),
+            PolicyCliCommand::Rollback {
+                limit: 20,
+                max_ticks: 1,
+                domain: Some(runtime::PolicyDomain::Routing),
+                proposal_id: Some("route-policy-1".to_string()),
+            }
         );
         assert_eq!(
             parse_args(&[

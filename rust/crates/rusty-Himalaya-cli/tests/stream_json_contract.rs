@@ -74,6 +74,9 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "route_policy_rollback",
         "route_policy_list",
         "policy_review",
+        "policy_apply_plan",
+        "policy_apply",
+        "policy_rollback",
         "policy_ledger",
         "benchmark_suite",
         "benchmark_task",
@@ -954,6 +957,156 @@ fn policy_review_emits_stream_json_event() {
 }
 
 #[test]
+fn governed_policy_apply_emits_stream_json_events() {
+    let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-governed-policy-apply"));
+    workspace.create();
+    fs::create_dir_all(workspace.root.join(".Himalaya/routes"))
+        .expect("route feedback dir should exist");
+    fs::write(
+        workspace.root.join(".Himalaya/routes/feedback.json"),
+        serde_json::to_string(&json!({
+            "feedback": [
+                {
+                    "task_id": "task-1",
+                    "route": {
+                        "phase": "coding",
+                        "model": "sonnet",
+                        "provider": null,
+                        "reason": "test",
+                        "confidence": 0.8,
+                        "fallback_model": null
+                    },
+                    "succeeded": false,
+                    "verification_passed": false,
+                    "recovery_triggered": true,
+                    "timestamp": 1,
+                    "note": "failed"
+                },
+                {
+                    "task_id": "task-2",
+                    "route": {
+                        "phase": "coding",
+                        "model": "sonnet",
+                        "provider": null,
+                        "reason": "test",
+                        "confidence": 0.8,
+                        "fallback_model": null
+                    },
+                    "succeeded": false,
+                    "verification_passed": false,
+                    "recovery_triggered": true,
+                    "timestamp": 2,
+                    "note": "failed"
+                },
+                {
+                    "task_id": "task-3",
+                    "route": {
+                        "phase": "coding",
+                        "model": "opus",
+                        "provider": null,
+                        "reason": "fallback",
+                        "confidence": 0.9,
+                        "fallback_model": null
+                    },
+                    "succeeded": true,
+                    "verification_passed": true,
+                    "recovery_triggered": false,
+                    "timestamp": 3,
+                    "note": "ok"
+                }
+            ]
+        }))
+        .expect("feedback should serialize"),
+    )
+    .expect("feedback should write");
+
+    let proposal_events = run_stream_json_subcommand(
+        &workspace,
+        &[
+            "routes",
+            "propose",
+            "--min-samples",
+            "2",
+            "--threshold-percent",
+            "50",
+        ],
+    );
+    let proposal = proposal_events
+        .iter()
+        .find(|event| event["type"] == "route_policy_proposal")
+        .expect("route policy proposal event should be emitted");
+    let proposal_id = proposal["proposal"]["id"]
+        .as_str()
+        .expect("proposal id should exist")
+        .to_string();
+
+    let plan_events = run_stream_json_subcommand(&workspace, &["policy", "plan"]);
+    let plan = plan_events
+        .iter()
+        .find(|event| event["type"] == "policy_apply_plan")
+        .expect("policy apply plan event should be emitted");
+    assert_eq!(plan["recorded"], true);
+    assert_eq!(plan["plan"]["status"], "planned");
+    assert!(plan["plan"]["actions"].is_array());
+
+    let dry_run_events = run_stream_json_subcommand(
+        &workspace,
+        &[
+            "policy",
+            "apply",
+            "--dry-run",
+            "--domain",
+            "routing",
+            "--proposal-id",
+            &proposal_id,
+        ],
+    );
+    let dry_run = dry_run_events
+        .iter()
+        .find(|event| event["type"] == "policy_apply")
+        .expect("policy apply event should be emitted");
+    assert_eq!(dry_run["apply"]["status"], "dry_run_passed");
+    assert_eq!(dry_run["apply"]["applied"], false);
+    assert!(dry_run["apply"]["routing_report"].is_object());
+
+    let apply_events = run_stream_json_subcommand(
+        &workspace,
+        &[
+            "policy",
+            "apply",
+            "--domain",
+            "routing",
+            "--proposal-id",
+            &proposal_id,
+        ],
+    );
+    let apply = apply_events
+        .iter()
+        .find(|event| event["type"] == "policy_apply")
+        .expect("policy apply event should be emitted");
+    assert_eq!(apply["apply"]["status"], "applied");
+    assert_eq!(apply["apply"]["applied"], true);
+
+    let rollback_events = run_stream_json_subcommand(
+        &workspace,
+        &[
+            "policy",
+            "rollback",
+            "--domain",
+            "routing",
+            "--proposal-id",
+            &proposal_id,
+        ],
+    );
+    let rollback = rollback_events
+        .iter()
+        .find(|event| event["type"] == "policy_rollback")
+        .expect("policy rollback event should be emitted");
+    assert_eq!(rollback["rollback"]["status"], "rolled_back");
+    assert_eq!(rollback["rollback"]["rolled_back"], true);
+}
+
+#[test]
 fn repl_error_and_done_events_include_protocol_version() {
     let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-repl-error"));
     workspace.create();
@@ -1320,6 +1473,24 @@ fn run_stream_json_prompt(
     let output = command.output().expect("Himalaya should launch");
     assert_success(&output);
     parse_stream_json_stdout(&output.stdout)
+}
+
+fn run_stream_json_subcommand(workspace: &HarnessWorkspace, args: &[&str]) -> Vec<Value> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_Himalaya"));
+    command
+        .current_dir(&workspace.root)
+        .env_clear()
+        .env("Himalaya_CONFIG_HOME", &workspace.config_home)
+        .env("HOME", &workspace.home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args(["--output-format", "stream-json"])
+        .args(args);
+    let output = command.output().expect("Himalaya should launch");
+    assert_success(&output);
+    let events = parse_stream_json_stdout(&output.stdout);
+    assert_all_events_are_versioned(&events);
+    events
 }
 
 fn parse_stream_json_stdout(stdout: &[u8]) -> Vec<Value> {
@@ -1870,6 +2041,18 @@ fn assert_stream_event_schema(event: &Value) {
         "policy_review" => assert!(
             event["review"].is_object(),
             "policy_review requires review object: {event:?}"
+        ),
+        "policy_apply_plan" => assert!(
+            event["plan"].is_object(),
+            "policy_apply_plan requires plan object: {event:?}"
+        ),
+        "policy_apply" => assert!(
+            event["apply"].is_object(),
+            "policy_apply requires apply object: {event:?}"
+        ),
+        "policy_rollback" => assert!(
+            event["rollback"].is_object(),
+            "policy_rollback requires rollback object: {event:?}"
         ),
         "policy_ledger" => assert!(
             event["ledger"].is_object(),

@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AppliedRoutingPolicy, AutonomousEvaluationReport, AutonomousPolicyAction,
-    RoutingPolicyProposal, RoutingPolicyProposalStatus, RoutingPolicySafetyLevel,
+    RoutingPolicyApplyReport, RoutingPolicyProposal, RoutingPolicyProposalStatus,
+    RoutingPolicyProposalStore, RoutingPolicyRollbackReport, RoutingPolicySafetyLevel,
     SchedulerDaemonState, SchedulerDaemonStatus,
 };
 
@@ -28,9 +29,14 @@ pub enum PolicyDomain {
 #[serde(rename_all = "snake_case")]
 pub enum PolicyLedgerStatus {
     Observed,
+    Planned,
     Proposed,
     Approved,
+    DryRunPassed,
     Applied,
+    ApplyBlocked,
+    RollbackPlanned,
+    RollbackBlocked,
     Blocked,
     RolledBack,
 }
@@ -172,16 +178,36 @@ impl PolicyGovernanceLedger {
         &self,
         mut review: PolicyGovernanceReview,
     ) -> io::Result<PolicyGovernanceReview> {
-        fs::create_dir_all(&self.dir)?;
         review.ledger_path = self.ledger_path();
-        let line = serde_json::to_string(&review.ledger_entry)
+        self.record_entry(review.ledger_entry.clone())?;
+        Ok(review)
+    }
+
+    pub fn record_entry(&self, entry: PolicyLedgerEntry) -> io::Result<PolicyLedgerEntry> {
+        fs::create_dir_all(&self.dir)?;
+        let line = serde_json::to_string(&entry)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.ledger_path())?;
         writeln!(file, "{line}")?;
-        Ok(review)
+        Ok(entry)
+    }
+
+    pub fn record_apply_plan(&self, plan: &PolicyApplyPlan) -> io::Result<PolicyLedgerEntry> {
+        self.record_entry(policy_apply_plan_ledger_entry(plan))
+    }
+
+    pub fn record_apply_report(&self, report: &PolicyApplyReport) -> io::Result<PolicyLedgerEntry> {
+        self.record_entry(policy_apply_report_ledger_entry(report))
+    }
+
+    pub fn record_rollback_report(
+        &self,
+        report: &PolicyRollbackReport,
+    ) -> io::Result<PolicyLedgerEntry> {
+        self.record_entry(policy_rollback_report_ledger_entry(report))
     }
 
     pub fn load(&self, limit: usize) -> io::Result<PolicyLedgerLoad> {
@@ -232,6 +258,648 @@ pub fn load_policy_governance_ledger(dir: &Path, limit: usize) -> io::Result<Pol
         malformed_lines,
         warnings,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyApplyOperation {
+    Apply,
+    Rollback,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyApplyAction {
+    pub domain: PolicyDomain,
+    pub operation: PolicyApplyOperation,
+    pub action: String,
+    pub proposal_id: Option<String>,
+    pub status: PolicyLedgerStatus,
+    pub risk: PolicyRiskLevel,
+    pub executable: bool,
+    pub blockers: Vec<String>,
+    pub reason: String,
+    pub references: Vec<PolicyReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyApplyPlan {
+    pub version: u32,
+    pub id: String,
+    pub planned_at: u64,
+    pub operation: PolicyApplyOperation,
+    pub dry_run: bool,
+    pub status: PolicyLedgerStatus,
+    pub review_status: PolicyLedgerStatus,
+    pub domain_filter: Option<PolicyDomain>,
+    pub proposal_id: Option<String>,
+    pub actions: Vec<PolicyApplyAction>,
+    pub blockers: Vec<String>,
+    pub recommendations: Vec<String>,
+    pub review: PolicyGovernanceReview,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyApplyReport {
+    pub version: u32,
+    pub id: String,
+    pub executed_at: u64,
+    pub dry_run: bool,
+    pub status: PolicyLedgerStatus,
+    pub applied: bool,
+    pub plan: PolicyApplyPlan,
+    pub routing_report: Option<RoutingPolicyApplyReport>,
+    pub blockers: Vec<String>,
+    pub recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PolicyRollbackReport {
+    pub version: u32,
+    pub id: String,
+    pub executed_at: u64,
+    pub status: PolicyLedgerStatus,
+    pub rolled_back: bool,
+    pub plan: PolicyApplyPlan,
+    pub routing_report: Option<RoutingPolicyRollbackReport>,
+    pub blockers: Vec<String>,
+    pub recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicyApplyCoordinator {
+    routing_store: RoutingPolicyProposalStore,
+}
+
+impl PolicyApplyCoordinator {
+    #[must_use]
+    pub fn new(routing_store: RoutingPolicyProposalStore) -> Self {
+        Self { routing_store }
+    }
+
+    #[must_use]
+    pub fn plan_apply(
+        &self,
+        review: PolicyGovernanceReview,
+        domain_filter: Option<PolicyDomain>,
+        proposal_id: Option<&str>,
+        dry_run: bool,
+    ) -> PolicyApplyPlan {
+        build_policy_apply_plan(
+            review,
+            PolicyApplyOperation::Apply,
+            domain_filter,
+            proposal_id,
+            dry_run,
+        )
+    }
+
+    #[must_use]
+    pub fn plan_rollback(
+        &self,
+        review: PolicyGovernanceReview,
+        domain_filter: Option<PolicyDomain>,
+        proposal_id: Option<&str>,
+    ) -> PolicyApplyPlan {
+        build_policy_apply_plan(
+            review,
+            PolicyApplyOperation::Rollback,
+            domain_filter,
+            proposal_id,
+            false,
+        )
+    }
+
+    pub fn apply(&self, plan: &PolicyApplyPlan) -> io::Result<PolicyApplyReport> {
+        if plan.operation != PolicyApplyOperation::Apply {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "policy apply requires an apply plan",
+            ));
+        }
+        let mut blockers = plan.blockers.clone();
+        if !plan.dry_run
+            && (plan.domain_filter != Some(PolicyDomain::Routing) || plan.proposal_id.is_none())
+        {
+            blockers.push(
+                "governed policy apply requires explicit --domain routing and --proposal-id"
+                    .to_string(),
+            );
+        }
+        let executable_actions = executable_routing_actions(plan);
+        if executable_actions.is_empty() {
+            blockers.push("no executable routing policy apply action is available".to_string());
+        } else if executable_actions.len() > 1 {
+            blockers.push(
+                "multiple executable routing policy actions are available; specify --proposal-id"
+                    .to_string(),
+            );
+        }
+        if !blockers.is_empty() {
+            return Ok(PolicyApplyReport {
+                version: POLICY_GOVERNANCE_VERSION,
+                id: format!("policy-apply-{}", now_millis()),
+                executed_at: now_secs(),
+                dry_run: plan.dry_run,
+                status: PolicyLedgerStatus::ApplyBlocked,
+                applied: false,
+                plan: plan.clone(),
+                routing_report: None,
+                blockers,
+                recommendations: vec![
+                    "Resolve governance blockers before applying policy changes.".to_string(),
+                ],
+            });
+        }
+
+        let action = executable_actions[0];
+        let proposal_id = action.proposal_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "routing policy apply action is missing a proposal id",
+            )
+        })?;
+        let routing_report = self.routing_store.apply(proposal_id, plan.dry_run)?;
+        let mut blockers = routing_report.blockers.clone();
+        let (status, applied) = if !blockers.is_empty() {
+            (PolicyLedgerStatus::ApplyBlocked, false)
+        } else if plan.dry_run {
+            (PolicyLedgerStatus::DryRunPassed, false)
+        } else if routing_report.applied {
+            (PolicyLedgerStatus::Applied, true)
+        } else {
+            blockers.push("routing policy store did not apply the proposal".to_string());
+            (PolicyLedgerStatus::ApplyBlocked, false)
+        };
+        let mut recommendations = routing_report.recommendations.clone();
+        if status == PolicyLedgerStatus::DryRunPassed {
+            recommendations.push(
+                "Governance dry run passed; rerun with --domain routing --proposal-id to apply."
+                    .to_string(),
+            );
+        }
+        Ok(PolicyApplyReport {
+            version: POLICY_GOVERNANCE_VERSION,
+            id: format!("policy-apply-{}", now_millis()),
+            executed_at: now_secs(),
+            dry_run: plan.dry_run,
+            status,
+            applied,
+            plan: plan.clone(),
+            routing_report: Some(routing_report),
+            blockers,
+            recommendations,
+        })
+    }
+
+    pub fn rollback(&self, plan: &PolicyApplyPlan) -> io::Result<PolicyRollbackReport> {
+        if plan.operation != PolicyApplyOperation::Rollback {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "policy rollback requires a rollback plan",
+            ));
+        }
+        let mut blockers = plan.blockers.clone();
+        if plan.domain_filter != Some(PolicyDomain::Routing) || plan.proposal_id.is_none() {
+            blockers.push(
+                "governed policy rollback requires explicit --domain routing and --proposal-id"
+                    .to_string(),
+            );
+        }
+        let executable_actions = executable_routing_actions(plan);
+        if executable_actions.is_empty() {
+            blockers.push("no executable routing policy rollback action is available".to_string());
+        } else if executable_actions.len() > 1 {
+            blockers.push(
+                "multiple executable routing policy rollback actions are available; specify --proposal-id"
+                    .to_string(),
+            );
+        }
+        if !blockers.is_empty() {
+            return Ok(PolicyRollbackReport {
+                version: POLICY_GOVERNANCE_VERSION,
+                id: format!("policy-rollback-{}", now_millis()),
+                executed_at: now_secs(),
+                status: PolicyLedgerStatus::RollbackBlocked,
+                rolled_back: false,
+                plan: plan.clone(),
+                routing_report: None,
+                blockers,
+                recommendations: vec![
+                    "Resolve governance blockers before rolling back policy changes.".to_string(),
+                ],
+            });
+        }
+
+        let action = executable_actions[0];
+        let proposal_id = action.proposal_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "routing policy rollback action is missing a proposal id",
+            )
+        })?;
+        let routing_report = self.routing_store.rollback(proposal_id)?;
+        let status = if routing_report.rolled_back {
+            PolicyLedgerStatus::RolledBack
+        } else {
+            PolicyLedgerStatus::RollbackBlocked
+        };
+        let blockers = if routing_report.rolled_back {
+            Vec::new()
+        } else {
+            routing_report.recommendations.clone()
+        };
+        Ok(PolicyRollbackReport {
+            version: POLICY_GOVERNANCE_VERSION,
+            id: format!("policy-rollback-{}", now_millis()),
+            executed_at: now_secs(),
+            status,
+            rolled_back: routing_report.rolled_back,
+            plan: plan.clone(),
+            routing_report: Some(routing_report.clone()),
+            blockers,
+            recommendations: routing_report.recommendations,
+        })
+    }
+}
+
+pub fn policy_apply_plan_ledger_entry(plan: &PolicyApplyPlan) -> PolicyLedgerEntry {
+    policy_apply_ledger_entry(
+        plan.id.clone(),
+        plan.planned_at,
+        plan.status,
+        plan,
+        plan.blockers.clone(),
+        plan.recommendations.clone(),
+    )
+}
+
+pub fn policy_apply_report_ledger_entry(report: &PolicyApplyReport) -> PolicyLedgerEntry {
+    policy_apply_ledger_entry(
+        report.id.clone(),
+        report.executed_at,
+        report.status,
+        &report.plan,
+        report.blockers.clone(),
+        report.recommendations.clone(),
+    )
+}
+
+pub fn policy_rollback_report_ledger_entry(report: &PolicyRollbackReport) -> PolicyLedgerEntry {
+    policy_apply_ledger_entry(
+        report.id.clone(),
+        report.executed_at,
+        report.status,
+        &report.plan,
+        report.blockers.clone(),
+        report.recommendations.clone(),
+    )
+}
+
+fn build_policy_apply_plan(
+    review: PolicyGovernanceReview,
+    operation: PolicyApplyOperation,
+    domain_filter: Option<PolicyDomain>,
+    proposal_id: Option<&str>,
+    dry_run: bool,
+) -> PolicyApplyPlan {
+    let proposal_id = proposal_id.map(str::to_string);
+    let mut blockers = Vec::new();
+    if operation == PolicyApplyOperation::Apply {
+        blockers.extend(
+            review
+                .ledger_entry
+                .gates
+                .iter()
+                .filter(|gate| !gate.passed && gate.blocks_apply)
+                .map(|gate| {
+                    format!(
+                        "{:?}/{} gate failed: {}",
+                        gate.domain, gate.name, gate.reason
+                    )
+                }),
+        );
+        blockers.extend(
+            review
+                .ledger_entry
+                .conflicts
+                .iter()
+                .filter(|conflict| conflict.blocks_apply)
+                .map(|conflict| format!("blocking policy conflict: {}", conflict.reason)),
+        );
+    }
+
+    let mut actions = Vec::new();
+    for proposal in &review.ledger_entry.proposals {
+        if !domain_filter.map_or(true, |domain| domain == proposal.domain) {
+            continue;
+        }
+        if !proposal_id
+            .as_deref()
+            .map_or(true, |wanted| wanted == proposal.id)
+        {
+            continue;
+        }
+        actions.push(policy_apply_action_from_proposal(proposal, operation));
+    }
+
+    if operation == PolicyApplyOperation::Apply {
+        for decision in &review.ledger_entry.decisions {
+            if !matches!(
+                decision.status,
+                PolicyLedgerStatus::Proposed | PolicyLedgerStatus::Approved
+            ) {
+                continue;
+            }
+            if !domain_filter.map_or(true, |domain| domain == decision.domain) {
+                continue;
+            }
+            actions.push(policy_apply_action_from_decision(decision, operation));
+        }
+    }
+
+    if let Some(wanted) = &proposal_id {
+        if !actions
+            .iter()
+            .any(|action| action.proposal_id.as_deref() == Some(wanted.as_str()))
+        {
+            blockers.push(format!(
+                "policy proposal not found in governance review: {wanted}"
+            ));
+        }
+    }
+
+    let has_executable = actions
+        .iter()
+        .any(|action| action.executable && action.blockers.is_empty());
+    let status = if !blockers.is_empty() {
+        match operation {
+            PolicyApplyOperation::Apply => PolicyLedgerStatus::ApplyBlocked,
+            PolicyApplyOperation::Rollback => PolicyLedgerStatus::RollbackBlocked,
+        }
+    } else if has_executable || !actions.is_empty() {
+        match operation {
+            PolicyApplyOperation::Apply => PolicyLedgerStatus::Planned,
+            PolicyApplyOperation::Rollback => PolicyLedgerStatus::RollbackPlanned,
+        }
+    } else {
+        PolicyLedgerStatus::Observed
+    };
+
+    let mut recommendations = Vec::new();
+    if blockers.is_empty() {
+        match operation {
+            PolicyApplyOperation::Apply if has_executable && dry_run => recommendations.push(
+                "Governed dry run is ready; no policy overlay will be persisted.".to_string(),
+            ),
+            PolicyApplyOperation::Apply if has_executable => recommendations
+                .push("Governed routing policy apply is ready for execution.".to_string()),
+            PolicyApplyOperation::Rollback if has_executable => recommendations
+                .push("Governed routing policy rollback is ready for execution.".to_string()),
+            _ => {
+                recommendations.push("No executable governed policy action is pending.".to_string())
+            }
+        }
+    } else {
+        recommendations
+            .push("Resolve apply blockers before executing governed policy actions.".to_string());
+    }
+
+    PolicyApplyPlan {
+        version: POLICY_GOVERNANCE_VERSION,
+        id: format!("policy-plan-{}", now_millis()),
+        planned_at: now_secs(),
+        operation,
+        dry_run,
+        status,
+        review_status: review.ledger_entry.status,
+        domain_filter,
+        proposal_id,
+        actions,
+        blockers,
+        recommendations,
+        review,
+    }
+}
+
+fn policy_apply_action_from_proposal(
+    proposal: &PolicyProposal,
+    operation: PolicyApplyOperation,
+) -> PolicyApplyAction {
+    let mut blockers = Vec::new();
+    if operation == PolicyApplyOperation::Apply {
+        blockers.extend(
+            proposal
+                .gates
+                .iter()
+                .filter(|gate| !gate.passed && gate.blocks_apply)
+                .map(|gate| format!("{} gate failed: {}", gate.name, gate.reason)),
+        );
+    }
+
+    let (action, status, executable) = match operation {
+        PolicyApplyOperation::Apply => {
+            if !matches!(
+                proposal.status,
+                PolicyLedgerStatus::Proposed | PolicyLedgerStatus::Approved
+            ) {
+                blockers.push(format!(
+                    "proposal status {:?} cannot be applied",
+                    proposal.status
+                ));
+            }
+            let executable = proposal.domain == PolicyDomain::Routing;
+            (
+                proposal.action.clone(),
+                if blockers.is_empty() && executable {
+                    PolicyLedgerStatus::Planned
+                } else {
+                    PolicyLedgerStatus::ApplyBlocked
+                },
+                executable,
+            )
+        }
+        PolicyApplyOperation::Rollback => {
+            if proposal.status != PolicyLedgerStatus::Applied {
+                blockers.push(format!(
+                    "proposal status {:?} cannot be rolled back",
+                    proposal.status
+                ));
+            }
+            let executable = proposal.domain == PolicyDomain::Routing;
+            (
+                "rollback_routing_policy_overlay".to_string(),
+                if blockers.is_empty() && executable {
+                    PolicyLedgerStatus::RollbackPlanned
+                } else {
+                    PolicyLedgerStatus::RollbackBlocked
+                },
+                executable,
+            )
+        }
+    };
+
+    if proposal.domain != PolicyDomain::Routing {
+        blockers.push(format!(
+            "{:?} policy actions are governance-planned only; no executable adapter is registered",
+            proposal.domain
+        ));
+    }
+
+    PolicyApplyAction {
+        domain: proposal.domain,
+        operation,
+        action,
+        proposal_id: Some(proposal.id.clone()),
+        status,
+        risk: proposal.risk,
+        executable,
+        blockers,
+        reason: proposal.summary.clone(),
+        references: proposal.references.clone(),
+    }
+}
+
+fn policy_apply_action_from_decision(
+    decision: &PolicyDecision,
+    operation: PolicyApplyOperation,
+) -> PolicyApplyAction {
+    let status = match operation {
+        PolicyApplyOperation::Apply => PolicyLedgerStatus::ApplyBlocked,
+        PolicyApplyOperation::Rollback => PolicyLedgerStatus::RollbackBlocked,
+    };
+    PolicyApplyAction {
+        domain: decision.domain,
+        operation,
+        action: decision.action.clone(),
+        proposal_id: None,
+        status,
+        risk: decision.risk,
+        executable: false,
+        blockers: vec![format!(
+            "{:?} decision '{}' is governance-planned only; no executable adapter is registered",
+            decision.domain, decision.action
+        )],
+        reason: decision.reason.clone(),
+        references: Vec::new(),
+    }
+}
+
+fn executable_routing_actions(plan: &PolicyApplyPlan) -> Vec<&PolicyApplyAction> {
+    plan.actions
+        .iter()
+        .filter(|action| {
+            action.domain == PolicyDomain::Routing
+                && action.executable
+                && action.blockers.is_empty()
+        })
+        .collect()
+}
+
+fn policy_apply_ledger_entry(
+    id: String,
+    timestamp: u64,
+    status: PolicyLedgerStatus,
+    plan: &PolicyApplyPlan,
+    outcome_blockers: Vec<String>,
+    recommendations: Vec<String>,
+) -> PolicyLedgerEntry {
+    let proposals = plan
+        .actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| PolicyProposal {
+            id: action
+                .proposal_id
+                .clone()
+                .unwrap_or_else(|| format!("{}-action-{}", plan.id, index.saturating_add(1))),
+            domain: action.domain,
+            action: action.action.clone(),
+            status: action.status,
+            risk: action.risk,
+            summary: action.reason.clone(),
+            references: action.references.clone(),
+            gates: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let decisions = vec![PolicyDecision {
+        domain: plan.domain_filter.unwrap_or(PolicyDomain::Routing),
+        action: match plan.operation {
+            PolicyApplyOperation::Apply if plan.dry_run => "governed_policy_apply_dry_run",
+            PolicyApplyOperation::Apply => "governed_policy_apply",
+            PolicyApplyOperation::Rollback => "governed_policy_rollback",
+        }
+        .to_string(),
+        status,
+        risk: plan
+            .actions
+            .iter()
+            .map(|action| action.risk)
+            .max()
+            .unwrap_or(PolicyRiskLevel::Low),
+        reason: if outcome_blockers.is_empty() {
+            "governed policy coordinator recorded the action outcome".to_string()
+        } else {
+            outcome_blockers.join("; ")
+        },
+    }];
+    let mut domains = plan
+        .actions
+        .iter()
+        .map(|action| action.domain)
+        .collect::<Vec<_>>();
+    if let Some(domain) = plan.domain_filter {
+        domains.push(domain);
+    }
+    domains.extend(
+        plan.review
+            .ledger_entry
+            .conflicts
+            .iter()
+            .flat_map(|conflict| conflict.domains.clone()),
+    );
+    domains.sort();
+    domains.dedup();
+    let failed_gate_count = plan
+        .review
+        .ledger_entry
+        .gates
+        .iter()
+        .filter(|gate| !gate.passed)
+        .count();
+    let blocking_conflict_count = plan
+        .review
+        .ledger_entry
+        .conflicts
+        .iter()
+        .filter(|conflict| conflict.blocks_apply)
+        .count();
+    PolicyLedgerEntry {
+        version: POLICY_GOVERNANCE_VERSION,
+        id,
+        timestamp,
+        status,
+        domains,
+        proposals,
+        decisions,
+        gates: plan.review.ledger_entry.gates.clone(),
+        conflicts: plan.review.ledger_entry.conflicts.clone(),
+        recommendations,
+        summary: PolicyReviewSummary {
+            status,
+            proposal_count: plan.actions.len(),
+            decision_count: 1,
+            gate_count: plan.review.ledger_entry.gates.len(),
+            failed_gate_count,
+            conflict_count: plan.review.ledger_entry.conflicts.len(),
+            blocking_conflict_count,
+            active_routing_policy: plan.review.ledger_entry.summary.active_routing_policy,
+            routing_proposal_count: plan.review.ledger_entry.summary.routing_proposal_count,
+            scheduler_status: plan.review.ledger_entry.summary.scheduler_status,
+            autonomous_action: plan.review.ledger_entry.summary.autonomous_action,
+            autonomous_review_required: plan.review.ledger_entry.summary.autonomous_review_required,
+            memory_reuse_score: plan.review.ledger_entry.summary.memory_reuse_score,
+        },
+    }
 }
 
 pub fn review_policy_governance(input: PolicyGovernanceInput) -> PolicyGovernanceReview {
@@ -692,7 +1360,7 @@ mod tests {
     use crate::{
         AutonomousEvaluationCounters, AutonomousEvaluationScores, AutonomousRunHistorySummary,
         AutonomousRunStatusCounts, AutonomousTraceReplayReport, MoERoutingPolicy,
-        RoutingEvaluationReport, RoutingOptimizerReplayReport,
+        RoutingEvaluationReport, RoutingOptimizerReplayReport, RoutingPolicyProposalSnapshot,
     };
 
     fn autonomous_evaluation(review_required: bool) -> AutonomousEvaluationReport {
@@ -828,6 +1496,16 @@ mod tests {
         }
     }
 
+    fn write_routing_snapshot(dir: &Path, proposals: Vec<RoutingPolicyProposal>) {
+        fs::create_dir_all(dir).expect("routing policy dir should exist");
+        fs::write(
+            dir.join("policy-proposals.json"),
+            serde_json::to_string(&RoutingPolicyProposalSnapshot { proposals })
+                .expect("snapshot should serialize"),
+        )
+        .expect("snapshot should write");
+    }
+
     #[test]
     fn review_detects_autonomous_routing_conflict() {
         let review = review_policy_governance(PolicyGovernanceInput {
@@ -862,5 +1540,151 @@ mod tests {
         assert_eq!(load.entries.len(), 1);
         assert_eq!(load.entries[0].id, recorded.ledger_entry.id);
         assert_eq!(load.malformed_lines, 0);
+    }
+
+    #[test]
+    fn coordinator_blocks_apply_on_governance_conflict() {
+        let dir = std::env::temp_dir().join(format!("himalaya-policy-block-{}", now_millis()));
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: Some(autonomous_evaluation(true)),
+            routing_proposals: vec![routing_proposal("route-proposal-1")],
+            applied_routing_policy: None,
+            scheduler_state: None,
+        });
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir));
+        let plan = coordinator.plan_apply(
+            review,
+            Some(PolicyDomain::Routing),
+            Some("route-proposal-1"),
+            false,
+        );
+
+        let report = coordinator.apply(&plan).expect("blocked apply report");
+
+        assert_eq!(plan.status, PolicyLedgerStatus::ApplyBlocked);
+        assert_eq!(report.status, PolicyLedgerStatus::ApplyBlocked);
+        assert!(!report.applied);
+        assert!(report.routing_report.is_none());
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("blocking policy conflict")));
+    }
+
+    #[test]
+    fn coordinator_dry_run_delegates_to_routing_store() {
+        let dir = std::env::temp_dir().join(format!("himalaya-policy-dry-run-{}", now_millis()));
+        let proposal = routing_proposal("route-proposal-1");
+        write_routing_snapshot(&dir, vec![proposal.clone()]);
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: None,
+            routing_proposals: vec![proposal],
+            applied_routing_policy: None,
+            scheduler_state: None,
+        });
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir));
+        let plan = coordinator.plan_apply(
+            review,
+            Some(PolicyDomain::Routing),
+            Some("route-proposal-1"),
+            true,
+        );
+
+        let report = coordinator.apply(&plan).expect("dry run report");
+
+        assert_eq!(plan.status, PolicyLedgerStatus::Planned);
+        assert_eq!(report.status, PolicyLedgerStatus::DryRunPassed);
+        assert!(!report.applied);
+        let routing_report = report
+            .routing_report
+            .expect("routing dry run report should exist");
+        assert!(routing_report.dry_run);
+        assert!(routing_report.blockers.is_empty());
+        assert!(crate::load_applied_routing_policy(&dir)
+            .expect("applied policy lookup should succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn coordinator_requires_explicit_target_for_persistent_apply() {
+        let dir = std::env::temp_dir().join(format!("himalaya-policy-explicit-{}", now_millis()));
+        let proposal = routing_proposal("route-proposal-1");
+        write_routing_snapshot(&dir, vec![proposal.clone()]);
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: None,
+            routing_proposals: vec![proposal],
+            applied_routing_policy: None,
+            scheduler_state: None,
+        });
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir));
+        let plan = coordinator.plan_apply(review, None, None, false);
+
+        let report = coordinator.apply(&plan).expect("apply should be blocked");
+
+        assert_eq!(report.status, PolicyLedgerStatus::ApplyBlocked);
+        assert!(!report.applied);
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("requires explicit --domain routing")));
+        assert!(crate::load_applied_routing_policy(&dir)
+            .expect("applied policy lookup should succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn coordinator_applies_and_rolls_back_routing_policy() {
+        let dir = std::env::temp_dir().join(format!("himalaya-policy-apply-{}", now_millis()));
+        let proposal = routing_proposal("route-proposal-1");
+        write_routing_snapshot(&dir, vec![proposal.clone()]);
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir));
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: None,
+            routing_proposals: vec![proposal],
+            applied_routing_policy: None,
+            scheduler_state: None,
+        });
+        let plan = coordinator.plan_apply(
+            review,
+            Some(PolicyDomain::Routing),
+            Some("route-proposal-1"),
+            false,
+        );
+
+        let apply = coordinator.apply(&plan).expect("apply report");
+
+        assert_eq!(apply.status, PolicyLedgerStatus::Applied);
+        assert!(apply.applied);
+        assert!(crate::load_applied_routing_policy(&dir)
+            .expect("applied policy should load")
+            .is_some());
+
+        let applied_policy =
+            crate::load_applied_routing_policy(&dir).expect("applied policy should load");
+        let applied_proposals = RoutingPolicyProposalStore::new(&dir)
+            .list()
+            .expect("proposals should load");
+        let rollback_review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: None,
+            routing_proposals: applied_proposals,
+            applied_routing_policy: applied_policy,
+            scheduler_state: None,
+        });
+        let rollback_plan = coordinator.plan_rollback(
+            rollback_review,
+            Some(PolicyDomain::Routing),
+            Some("route-proposal-1"),
+        );
+
+        let rollback = coordinator
+            .rollback(&rollback_plan)
+            .expect("rollback report");
+
+        assert_eq!(rollback_plan.status, PolicyLedgerStatus::RollbackPlanned);
+        assert_eq!(rollback.status, PolicyLedgerStatus::RolledBack);
+        assert!(rollback.rolled_back);
+        assert!(crate::load_applied_routing_policy(&dir)
+            .expect("applied policy lookup should succeed")
+            .is_none());
     }
 }

@@ -194,6 +194,15 @@
           "$ref": "#/$defs/policyReviewEvent"
         },
         {
+          "$ref": "#/$defs/policyApplyPlanEvent"
+        },
+        {
+          "$ref": "#/$defs/policyApplyEvent"
+        },
+        {
+          "$ref": "#/$defs/policyRollbackEvent"
+        },
+        {
           "$ref": "#/$defs/policyLedgerEvent"
         },
         {
@@ -297,6 +306,9 @@
         "route_policy_rollback",
         "route_policy_list",
         "policy_review",
+        "policy_apply_plan",
+        "policy_apply",
+        "policy_rollback",
         "policy_ledger",
         "benchmark_suite",
         "benchmark_task",
@@ -1545,6 +1557,93 @@
             },
             "recorded": {
               "type": "boolean"
+            },
+            "ledger_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "policyApplyPlanEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "plan"
+          ],
+          "properties": {
+            "type": {
+              "const": "policy_apply_plan"
+            },
+            "plan": {
+              "type": "object"
+            },
+            "recorded": {
+              "type": "boolean"
+            },
+            "ledger_entry": {
+              "type": "object"
+            },
+            "ledger_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "policyApplyEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "apply"
+          ],
+          "properties": {
+            "type": {
+              "const": "policy_apply"
+            },
+            "apply": {
+              "type": "object"
+            },
+            "recorded": {
+              "type": "boolean"
+            },
+            "ledger_entry": {
+              "type": "object"
+            },
+            "ledger_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "policyRollbackEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "rollback"
+          ],
+          "properties": {
+            "type": {
+              "const": "policy_rollback"
+            },
+            "rollback": {
+              "type": "object"
+            },
+            "recorded": {
+              "type": "boolean"
+            },
+            "ledger_entry": {
+              "type": "object"
             },
             "ledger_path": {
               "type": "string"
