@@ -2,6 +2,8 @@
 
 P7-A adds a read-only integration report for the autonomous agent loop. The report is intentionally a diagnostic surface, not another state-mutating loop.
 
+For release-readiness criteria and final smoke tests, see [Autonomous Release Readiness](autonomous-release-readiness.md).
+
 ## Inputs
 
 `AutonomousIntegrationInput` is assembled from existing snapshots:

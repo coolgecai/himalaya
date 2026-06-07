@@ -4832,8 +4832,47 @@ fn maturity_matrix_value() -> Value {
         "slash_command_count": slash_commands.len(),
         "implemented_slash_command_count": implemented_commands,
         "stub_slash_command_count": slash_commands.len().saturating_sub(implemented_commands),
+        "release_readiness": release_readiness_value(),
         "tools": tools,
         "slash_commands": slash_commands,
+    })
+}
+
+fn release_readiness_value() -> Value {
+    json!({
+        "status": "converging",
+        "goal": "stabilize runtime correctness, normal user interaction, and clear autonomous diagnostics before adding new autonomous loops",
+        "stable_capabilities": [
+            "durable task registry and scheduler queue",
+            "worker lifecycle supervision and recovery diagnostics",
+            "task memory and route feedback stores",
+            "policy governance ledger, replay, plan, dry-run apply, and rollback",
+            "autonomous evaluation, trace replay, integration report, and health view",
+            "JSON and stream-json command contracts for daemon report/evaluate"
+        ],
+        "experimental_capabilities": [
+            "fully unattended long-horizon daemon execution",
+            "automatic governed policy apply without human review",
+            "cross-domain optimizer decisions beyond dry-run evidence",
+            "large-scale concurrent worker pools"
+        ],
+        "recommended_smoke_tests": [
+            "cargo fmt -- --check",
+            "cargo check -p runtime",
+            "cargo check -p rusty-Himalaya-cli",
+            "cargo test -p runtime autonomous_integration --no-fail-fast",
+            "cargo test -p rusty-Himalaya-cli --test output_format_contract --no-fail-fast",
+            "cargo test -p rusty-Himalaya-cli --test stream_json_contract --no-fail-fast",
+            "Himalaya --output-format json tasks daemon report --limit 20 --max-ticks 3",
+            "Himalaya --output-format json tasks daemon evaluate --limit 20 --max-ticks 3",
+            "Himalaya --output-format json tasks daemon replay --limit 20 --max-ticks 3"
+        ],
+        "release_gates": [
+            "no failed integration health blockers",
+            "text output gives next action before detailed counters",
+            "policy apply remains dry-run unless health is healthy",
+            "stream-json schema remains backward compatible"
+        ]
     })
 }
 
@@ -4873,6 +4912,21 @@ fn render_maturity_matrix_text(value: &Value) -> String {
             .into_iter()
             .map(|(level, count)| format!("  - {level}: {count}")),
     );
+    if let Some(readiness) = value["release_readiness"].as_object() {
+        lines.push("Release readiness:".to_string());
+        if let Some(status) = readiness.get("status").and_then(Value::as_str) {
+            lines.push(format!("  Status {status}"));
+        }
+        if let Some(gates) = readiness.get("release_gates").and_then(Value::as_array) {
+            lines.push("  Gates".to_string());
+            lines.extend(
+                gates
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|gate| format!("    - {gate}")),
+            );
+        }
+    }
     lines.push("Implemented slash commands:".to_string());
     if let Some(commands) = value["slash_commands"].as_array() {
         lines.extend(
@@ -15820,11 +15874,11 @@ mod tests {
         push_output_block, render_autonomous_daemon_report_text,
         render_autonomous_integration_text, render_autonomous_replay_text, render_config_report,
         render_diff_report, render_diff_report_for, render_governed_policy_apply_text,
-        render_memory_report, render_policy_apply_plan_text, render_policy_replay_text,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        render_maturity_matrix_text, render_memory_report, render_policy_apply_plan_text,
+        render_policy_replay_text, render_prompt_history_report, render_repl_help,
+        render_resume_usage, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, slash_command_status, status_context,
         stream_json_event, summarize_tool_payload_for_markdown, validate_no_args,
         write_mcp_server_fixture, BenchmarkCliCommand, CliAction, CliOutputFormat, CliToolExecutor,
@@ -17648,6 +17702,17 @@ mod tests {
         let matrix_value = maturity_matrix_value();
         assert_eq!(matrix_value["type"], "maturity_matrix");
         assert!(matrix_value["tool_count"].as_u64().unwrap_or_default() > 0);
+        assert_eq!(matrix_value["release_readiness"]["status"], "converging");
+        assert!(matrix_value["release_readiness"]["stable_capabilities"]
+            .as_array()
+            .is_some_and(
+                |capabilities| capabilities.iter().any(|capability| capability
+                    .as_str()
+                    .is_some_and(|value| value.contains("health view")))
+            ));
+        let matrix_text = render_maturity_matrix_text(&matrix_value);
+        assert!(matrix_text.contains("Release readiness:"));
+        assert!(matrix_text.contains("stream-json schema remains backward compatible"));
         assert!(
             matrix_value["implemented_slash_command_count"]
                 .as_u64()
