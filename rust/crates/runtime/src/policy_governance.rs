@@ -467,11 +467,37 @@ pub struct SchedulerPolicyDryRunReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryPolicyDryRunReport {
+    pub proposal_id: String,
+    pub dry_run: bool,
+    pub status: PolicyLedgerStatus,
+    pub task_count: usize,
+    pub task_memory_entries: usize,
+    pub memory_reuse_score: f32,
+    pub blockers: Vec<PolicyBlocker>,
+    pub recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryPolicyDryRunReport {
+    pub proposal_id: String,
+    pub dry_run: bool,
+    pub status: PolicyLedgerStatus,
+    pub recovery_triggered_tasks: usize,
+    pub recovered_tasks: usize,
+    pub recovery_quality_score: f32,
+    pub blockers: Vec<PolicyBlocker>,
+    pub recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "report", rename_all = "snake_case")]
 pub enum PolicyAdapterReport {
     RoutingApply(RoutingPolicyApplyReport),
     RoutingRollback(RoutingPolicyRollbackReport),
     SchedulerDryRun(SchedulerPolicyDryRunReport),
+    MemoryDryRun(MemoryPolicyDryRunReport),
+    RecoveryDryRun(RecoveryPolicyDryRunReport),
 }
 
 #[derive(Debug, Clone)]
@@ -525,6 +551,41 @@ trait PolicyAdapter {
         &self,
         validation: &PolicyAdapterValidation,
     ) -> io::Result<PolicyAdapterRollbackResult>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PolicyAdapterContext<'a> {
+    routing_store: &'a RoutingPolicyProposalStore,
+    scheduler_state: Option<&'a SchedulerDaemonState>,
+    autonomous_evaluation: Option<&'a AutonomousEvaluationReport>,
+}
+
+struct PolicyAdapterRegistry<'a> {
+    context: PolicyAdapterContext<'a>,
+}
+
+impl<'a> PolicyAdapterRegistry<'a> {
+    fn new(context: PolicyAdapterContext<'a>) -> Self {
+        Self { context }
+    }
+
+    fn adapter_for_domain(&self, domain: PolicyDomain) -> Option<Box<dyn PolicyAdapter + 'a>> {
+        match domain {
+            PolicyDomain::Routing => Some(Box::new(RoutingPolicyAdapter::new(
+                self.context.routing_store,
+            ))),
+            PolicyDomain::Scheduler => Some(Box::new(SchedulerPolicyAdapter::new(
+                self.context.scheduler_state,
+            ))),
+            PolicyDomain::Memory => Some(Box::new(MemoryPolicyAdapter::new(
+                self.context.autonomous_evaluation,
+            ))),
+            PolicyDomain::Recovery => Some(Box::new(RecoveryPolicyAdapter::new(
+                self.context.autonomous_evaluation,
+            ))),
+            PolicyDomain::AutonomousRun => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -724,15 +785,15 @@ impl PolicyAdapter for RoutingPolicyAdapter<'_> {
 }
 
 #[derive(Debug, Clone)]
-struct SchedulerPolicyAdapter {
-    scheduler_status: Option<SchedulerDaemonStatus>,
+struct SchedulerPolicyAdapter<'a> {
+    scheduler_state: Option<&'a SchedulerDaemonState>,
 }
 
-impl SchedulerPolicyAdapter {
+impl<'a> SchedulerPolicyAdapter<'a> {
     const NAME: &'static str = "scheduler_policy";
 
-    fn new(scheduler_status: Option<SchedulerDaemonStatus>) -> Self {
-        Self { scheduler_status }
+    fn new(scheduler_state: Option<&'a SchedulerDaemonState>) -> Self {
+        Self { scheduler_state }
     }
 
     fn descriptor_static() -> PolicyAdapterDescriptor {
@@ -749,7 +810,7 @@ impl SchedulerPolicyAdapter {
     }
 }
 
-impl PolicyAdapter for SchedulerPolicyAdapter {
+impl PolicyAdapter for SchedulerPolicyAdapter<'_> {
     fn descriptor(&self) -> PolicyAdapterDescriptor {
         Self::descriptor_static()
     }
@@ -789,6 +850,30 @@ impl PolicyAdapter for SchedulerPolicyAdapter {
                 Self::NAME,
             )]));
         }
+        let Some(state) = self.scheduler_state else {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::MissingProposal,
+                Some(PolicyDomain::Scheduler),
+                Some(proposal_id.to_string()),
+                PolicyRiskLevel::High,
+                "scheduler state is unavailable for policy dry-run validation",
+                Self::NAME,
+            )]));
+        };
+        let current = scheduler_policy_proposal(state);
+        if current.id != proposal_id || current.source_fingerprint != action.source_fingerprint {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::StalePlan,
+                Some(PolicyDomain::Scheduler),
+                Some(proposal_id.to_string()),
+                PolicyRiskLevel::High,
+                format!(
+                    "scheduler state changed since plan creation: planned={} current={}",
+                    action.source_fingerprint, current.source_fingerprint
+                ),
+                Self::NAME,
+            )]));
+        }
         Ok(Ok(PolicyAdapterValidation {
             proposal_id: proposal_id.to_string(),
             before_status: action.status,
@@ -823,7 +908,7 @@ impl PolicyAdapter for SchedulerPolicyAdapter {
                         proposal_id: validation.proposal_id.clone(),
                         dry_run,
                         status: PolicyLedgerStatus::ApplyBlocked,
-                        scheduler_status: self.scheduler_status,
+                        scheduler_status: self.scheduler_state.map(|state| state.status),
                         blockers: vec![blocker.clone()],
                         recommendations: vec![
                             "Keep scheduler policy changes in governance review until a persistent adapter is available."
@@ -846,7 +931,7 @@ impl PolicyAdapter for SchedulerPolicyAdapter {
             proposal_id: validation.proposal_id.clone(),
             dry_run,
             status: PolicyLedgerStatus::DryRunPassed,
-            scheduler_status: self.scheduler_status,
+            scheduler_status: self.scheduler_state.map(|state| state.status),
             blockers: Vec::new(),
             recommendations: recommendations.clone(),
         };
@@ -894,16 +979,439 @@ impl PolicyAdapter for SchedulerPolicyAdapter {
     }
 }
 
+#[derive(Debug, Clone)]
+struct MemoryPolicyAdapter<'a> {
+    evaluation: Option<&'a AutonomousEvaluationReport>,
+}
+
+impl<'a> MemoryPolicyAdapter<'a> {
+    const NAME: &'static str = "memory_policy";
+
+    fn new(evaluation: Option<&'a AutonomousEvaluationReport>) -> Self {
+        Self { evaluation }
+    }
+
+    fn descriptor_static() -> PolicyAdapterDescriptor {
+        PolicyAdapterDescriptor {
+            name: Self::NAME.to_string(),
+            domain: PolicyDomain::Memory,
+            supports_apply: true,
+            supports_persistent_apply: false,
+            supports_dry_run: true,
+            supports_rollback: false,
+            planned_only: false,
+            reason: "memory policy adapter supports dry-run simulation only".to_string(),
+        }
+    }
+}
+
+impl PolicyAdapter for MemoryPolicyAdapter<'_> {
+    fn descriptor(&self) -> PolicyAdapterDescriptor {
+        Self::descriptor_static()
+    }
+
+    fn validate(
+        &self,
+        action: &PolicyApplyAction,
+        operation: PolicyApplyOperation,
+    ) -> io::Result<Result<PolicyAdapterValidation, Vec<PolicyBlocker>>> {
+        let Some(proposal_id) = action.proposal_id.as_deref() else {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::MissingTarget,
+                Some(PolicyDomain::Memory),
+                None,
+                PolicyRiskLevel::High,
+                "memory policy action is missing a proposal id",
+                Self::NAME,
+            )]));
+        };
+        if operation != PolicyApplyOperation::Apply {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::UnsupportedDomain,
+                Some(PolicyDomain::Memory),
+                Some(proposal_id.to_string()),
+                PolicyRiskLevel::Medium,
+                "memory policy rollback is not executable",
+                Self::NAME,
+            )]));
+        }
+        if action.domain != PolicyDomain::Memory {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::UnsupportedDomain,
+                Some(action.domain),
+                Some(proposal_id.to_string()),
+                PolicyRiskLevel::High,
+                "memory adapter received a non-memory policy action",
+                Self::NAME,
+            )]));
+        }
+        let Some(evaluation) = self.evaluation else {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::MissingProposal,
+                Some(PolicyDomain::Memory),
+                Some(proposal_id.to_string()),
+                PolicyRiskLevel::High,
+                "autonomous evaluation is unavailable for memory policy simulation",
+                Self::NAME,
+            )]));
+        };
+        let current = memory_policy_proposal(evaluation);
+        if current.id != proposal_id || current.source_fingerprint != action.source_fingerprint {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::StalePlan,
+                Some(PolicyDomain::Memory),
+                Some(proposal_id.to_string()),
+                PolicyRiskLevel::High,
+                format!(
+                    "memory policy inputs changed since plan creation: planned={} current={}",
+                    action.source_fingerprint, current.source_fingerprint
+                ),
+                Self::NAME,
+            )]));
+        }
+        Ok(Ok(PolicyAdapterValidation {
+            proposal_id: proposal_id.to_string(),
+            before_status: action.status,
+        }))
+    }
+
+    fn apply(
+        &self,
+        validation: &PolicyAdapterValidation,
+        dry_run: bool,
+    ) -> io::Result<PolicyAdapterApplyResult> {
+        let Some(evaluation) = self.evaluation else {
+            let blocker = policy_blocker(
+                PolicyBlockerKind::MissingProposal,
+                Some(PolicyDomain::Memory),
+                Some(validation.proposal_id.clone()),
+                PolicyRiskLevel::High,
+                "autonomous evaluation is unavailable for memory policy simulation",
+                Self::NAME,
+            );
+            return Ok(memory_policy_blocked_result(validation, dry_run, blocker));
+        };
+        if !dry_run {
+            let blocker = policy_blocker(
+                PolicyBlockerKind::UnsupportedDomain,
+                Some(PolicyDomain::Memory),
+                Some(validation.proposal_id.clone()),
+                PolicyRiskLevel::High,
+                "memory policy adapter is dry-run only; persistent apply is not supported",
+                Self::NAME,
+            );
+            return Ok(memory_policy_blocked_result(validation, dry_run, blocker));
+        }
+        let recommendations = memory_policy_simulation_recommendations(evaluation);
+        let report = MemoryPolicyDryRunReport {
+            proposal_id: validation.proposal_id.clone(),
+            dry_run,
+            status: PolicyLedgerStatus::DryRunPassed,
+            task_count: evaluation.counters.tasks,
+            task_memory_entries: evaluation.counters.task_memory_entries,
+            memory_reuse_score: evaluation.scores.memory_reuse_score,
+            blockers: Vec::new(),
+            recommendations: recommendations.clone(),
+        };
+        Ok(PolicyAdapterApplyResult {
+            status: PolicyLedgerStatus::DryRunPassed,
+            applied: false,
+            executed: true,
+            after_status: Some(PolicyLedgerStatus::DryRunPassed),
+            adapter_report_id: Some(format!("memory_policy_dry_run:{}", validation.proposal_id)),
+            adapter_report: Some(PolicyAdapterReport::MemoryDryRun(report)),
+            routing_report: None,
+            blockers: Vec::new(),
+            recommendations,
+        })
+    }
+
+    fn rollback(
+        &self,
+        validation: &PolicyAdapterValidation,
+    ) -> io::Result<PolicyAdapterRollbackResult> {
+        let blocker = policy_blocker(
+            PolicyBlockerKind::UnsupportedDomain,
+            Some(PolicyDomain::Memory),
+            Some(validation.proposal_id.clone()),
+            PolicyRiskLevel::High,
+            "memory policy rollback is not supported",
+            Self::NAME,
+        );
+        Ok(PolicyAdapterRollbackResult {
+            status: PolicyLedgerStatus::RollbackBlocked,
+            rolled_back: false,
+            executed: false,
+            after_status: Some(PolicyLedgerStatus::RollbackBlocked),
+            adapter_report_id: None,
+            adapter_report: None,
+            routing_report: None,
+            blockers: vec![blocker],
+            recommendations: vec![
+                "Memory policy rollback remains governance-planned only.".to_string()
+            ],
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecoveryPolicyAdapter<'a> {
+    evaluation: Option<&'a AutonomousEvaluationReport>,
+}
+
+impl<'a> RecoveryPolicyAdapter<'a> {
+    const NAME: &'static str = "recovery_policy";
+
+    fn new(evaluation: Option<&'a AutonomousEvaluationReport>) -> Self {
+        Self { evaluation }
+    }
+
+    fn descriptor_static() -> PolicyAdapterDescriptor {
+        PolicyAdapterDescriptor {
+            name: Self::NAME.to_string(),
+            domain: PolicyDomain::Recovery,
+            supports_apply: true,
+            supports_persistent_apply: false,
+            supports_dry_run: true,
+            supports_rollback: false,
+            planned_only: false,
+            reason: "recovery policy adapter supports dry-run simulation only".to_string(),
+        }
+    }
+}
+
+impl PolicyAdapter for RecoveryPolicyAdapter<'_> {
+    fn descriptor(&self) -> PolicyAdapterDescriptor {
+        Self::descriptor_static()
+    }
+
+    fn validate(
+        &self,
+        action: &PolicyApplyAction,
+        operation: PolicyApplyOperation,
+    ) -> io::Result<Result<PolicyAdapterValidation, Vec<PolicyBlocker>>> {
+        let Some(proposal_id) = action.proposal_id.as_deref() else {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::MissingTarget,
+                Some(PolicyDomain::Recovery),
+                None,
+                PolicyRiskLevel::High,
+                "recovery policy action is missing a proposal id",
+                Self::NAME,
+            )]));
+        };
+        if operation != PolicyApplyOperation::Apply {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::UnsupportedDomain,
+                Some(PolicyDomain::Recovery),
+                Some(proposal_id.to_string()),
+                PolicyRiskLevel::Medium,
+                "recovery policy rollback is not executable",
+                Self::NAME,
+            )]));
+        }
+        if action.domain != PolicyDomain::Recovery {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::UnsupportedDomain,
+                Some(action.domain),
+                Some(proposal_id.to_string()),
+                PolicyRiskLevel::High,
+                "recovery adapter received a non-recovery policy action",
+                Self::NAME,
+            )]));
+        }
+        let Some(evaluation) = self.evaluation else {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::MissingProposal,
+                Some(PolicyDomain::Recovery),
+                Some(proposal_id.to_string()),
+                PolicyRiskLevel::High,
+                "autonomous evaluation is unavailable for recovery policy simulation",
+                Self::NAME,
+            )]));
+        };
+        let current = recovery_policy_proposal(evaluation);
+        if current.id != proposal_id || current.source_fingerprint != action.source_fingerprint {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::StalePlan,
+                Some(PolicyDomain::Recovery),
+                Some(proposal_id.to_string()),
+                PolicyRiskLevel::High,
+                format!(
+                    "recovery policy inputs changed since plan creation: planned={} current={}",
+                    action.source_fingerprint, current.source_fingerprint
+                ),
+                Self::NAME,
+            )]));
+        }
+        Ok(Ok(PolicyAdapterValidation {
+            proposal_id: proposal_id.to_string(),
+            before_status: action.status,
+        }))
+    }
+
+    fn apply(
+        &self,
+        validation: &PolicyAdapterValidation,
+        dry_run: bool,
+    ) -> io::Result<PolicyAdapterApplyResult> {
+        let Some(evaluation) = self.evaluation else {
+            let blocker = policy_blocker(
+                PolicyBlockerKind::MissingProposal,
+                Some(PolicyDomain::Recovery),
+                Some(validation.proposal_id.clone()),
+                PolicyRiskLevel::High,
+                "autonomous evaluation is unavailable for recovery policy simulation",
+                Self::NAME,
+            );
+            return Ok(recovery_policy_blocked_result(validation, dry_run, blocker));
+        };
+        if !dry_run {
+            let blocker = policy_blocker(
+                PolicyBlockerKind::UnsupportedDomain,
+                Some(PolicyDomain::Recovery),
+                Some(validation.proposal_id.clone()),
+                PolicyRiskLevel::High,
+                "recovery policy adapter is dry-run only; persistent apply is not supported",
+                Self::NAME,
+            );
+            return Ok(recovery_policy_blocked_result(validation, dry_run, blocker));
+        }
+        let recommendations = recovery_policy_simulation_recommendations(evaluation);
+        let report = RecoveryPolicyDryRunReport {
+            proposal_id: validation.proposal_id.clone(),
+            dry_run,
+            status: PolicyLedgerStatus::DryRunPassed,
+            recovery_triggered_tasks: evaluation.counters.recovery_triggered_tasks,
+            recovered_tasks: evaluation.counters.recovered_tasks,
+            recovery_quality_score: evaluation.scores.recovery_quality_score,
+            blockers: Vec::new(),
+            recommendations: recommendations.clone(),
+        };
+        Ok(PolicyAdapterApplyResult {
+            status: PolicyLedgerStatus::DryRunPassed,
+            applied: false,
+            executed: true,
+            after_status: Some(PolicyLedgerStatus::DryRunPassed),
+            adapter_report_id: Some(format!(
+                "recovery_policy_dry_run:{}",
+                validation.proposal_id
+            )),
+            adapter_report: Some(PolicyAdapterReport::RecoveryDryRun(report)),
+            routing_report: None,
+            blockers: Vec::new(),
+            recommendations,
+        })
+    }
+
+    fn rollback(
+        &self,
+        validation: &PolicyAdapterValidation,
+    ) -> io::Result<PolicyAdapterRollbackResult> {
+        let blocker = policy_blocker(
+            PolicyBlockerKind::UnsupportedDomain,
+            Some(PolicyDomain::Recovery),
+            Some(validation.proposal_id.clone()),
+            PolicyRiskLevel::High,
+            "recovery policy rollback is not supported",
+            Self::NAME,
+        );
+        Ok(PolicyAdapterRollbackResult {
+            status: PolicyLedgerStatus::RollbackBlocked,
+            rolled_back: false,
+            executed: false,
+            after_status: Some(PolicyLedgerStatus::RollbackBlocked),
+            adapter_report_id: None,
+            adapter_report: None,
+            routing_report: None,
+            blockers: vec![blocker],
+            recommendations: vec![
+                "Recovery policy rollback remains governance-planned only.".to_string()
+            ],
+        })
+    }
+}
+
 pub fn policy_adapter_descriptors(
-    scheduler_status: Option<SchedulerDaemonStatus>,
+    _scheduler_status: Option<SchedulerDaemonStatus>,
 ) -> Vec<PolicyAdapterDescriptor> {
     vec![
         RoutingPolicyAdapter::descriptor_static(),
-        SchedulerPolicyAdapter::new(scheduler_status).descriptor(),
+        SchedulerPolicyAdapter::descriptor_static(),
+        MemoryPolicyAdapter::descriptor_static(),
+        RecoveryPolicyAdapter::descriptor_static(),
         planned_only_adapter_descriptor(PolicyDomain::AutonomousRun),
-        planned_only_adapter_descriptor(PolicyDomain::Memory),
-        planned_only_adapter_descriptor(PolicyDomain::Recovery),
     ]
+}
+
+fn memory_policy_blocked_result(
+    validation: &PolicyAdapterValidation,
+    dry_run: bool,
+    blocker: PolicyBlocker,
+) -> PolicyAdapterApplyResult {
+    let recommendations = vec![
+        "Memory policy changes remain dry-run only until a persistent store is available."
+            .to_string(),
+    ];
+    let report = MemoryPolicyDryRunReport {
+        proposal_id: validation.proposal_id.clone(),
+        dry_run,
+        status: PolicyLedgerStatus::ApplyBlocked,
+        task_count: 0,
+        task_memory_entries: 0,
+        memory_reuse_score: 0.0,
+        blockers: vec![blocker.clone()],
+        recommendations: recommendations.clone(),
+    };
+    PolicyAdapterApplyResult {
+        status: PolicyLedgerStatus::ApplyBlocked,
+        applied: false,
+        executed: false,
+        after_status: Some(PolicyLedgerStatus::ApplyBlocked),
+        adapter_report_id: Some(format!(
+            "memory_policy_apply_blocked:{}",
+            validation.proposal_id
+        )),
+        adapter_report: Some(PolicyAdapterReport::MemoryDryRun(report)),
+        routing_report: None,
+        blockers: vec![blocker],
+        recommendations,
+    }
+}
+
+fn recovery_policy_blocked_result(
+    validation: &PolicyAdapterValidation,
+    dry_run: bool,
+    blocker: PolicyBlocker,
+) -> PolicyAdapterApplyResult {
+    let recommendations = vec![
+        "Recovery policy changes remain dry-run only until a persistent store is available."
+            .to_string(),
+    ];
+    let report = RecoveryPolicyDryRunReport {
+        proposal_id: validation.proposal_id.clone(),
+        dry_run,
+        status: PolicyLedgerStatus::ApplyBlocked,
+        recovery_triggered_tasks: 0,
+        recovered_tasks: 0,
+        recovery_quality_score: 0.0,
+        blockers: vec![blocker.clone()],
+        recommendations: recommendations.clone(),
+    };
+    PolicyAdapterApplyResult {
+        status: PolicyLedgerStatus::ApplyBlocked,
+        applied: false,
+        executed: false,
+        after_status: Some(PolicyLedgerStatus::ApplyBlocked),
+        adapter_report_id: Some(format!(
+            "recovery_policy_apply_blocked:{}",
+            validation.proposal_id
+        )),
+        adapter_report: Some(PolicyAdapterReport::RecoveryDryRun(report)),
+        routing_report: None,
+        blockers: vec![blocker],
+        recommendations,
+    }
 }
 
 fn planned_only_adapter_descriptor(domain: PolicyDomain) -> PolicyAdapterDescriptor {
@@ -931,12 +1439,33 @@ fn planned_only_adapter_descriptor(domain: PolicyDomain) -> PolicyAdapterDescrip
 #[derive(Debug, Clone)]
 pub struct PolicyApplyCoordinator {
     routing_store: RoutingPolicyProposalStore,
+    scheduler_state: Option<SchedulerDaemonState>,
+    autonomous_evaluation: Option<AutonomousEvaluationReport>,
 }
 
 impl PolicyApplyCoordinator {
     #[must_use]
     pub fn new(routing_store: RoutingPolicyProposalStore) -> Self {
-        Self { routing_store }
+        Self {
+            routing_store,
+            scheduler_state: None,
+            autonomous_evaluation: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_scheduler_state(mut self, scheduler_state: Option<SchedulerDaemonState>) -> Self {
+        self.scheduler_state = scheduler_state;
+        self
+    }
+
+    #[must_use]
+    pub fn with_autonomous_evaluation(
+        mut self,
+        autonomous_evaluation: Option<AutonomousEvaluationReport>,
+    ) -> Self {
+        self.autonomous_evaluation = autonomous_evaluation;
+        self
     }
 
     #[must_use]
@@ -1025,7 +1554,8 @@ impl PolicyApplyCoordinator {
         }
 
         let action = executable_actions[0];
-        let Some(adapter) = self.adapter_for_domain(action.domain, plan) else {
+        let registry = self.adapter_registry();
+        let Some(adapter) = registry.adapter_for_domain(action.domain) else {
             return Ok(blocked_apply_report(
                 plan,
                 vec![policy_blocker(
@@ -1136,7 +1666,8 @@ impl PolicyApplyCoordinator {
         }
 
         let action = executable_actions[0];
-        let Some(adapter) = self.adapter_for_domain(action.domain, plan) else {
+        let registry = self.adapter_registry();
+        let Some(adapter) = registry.adapter_for_domain(action.domain) else {
             return Ok(blocked_rollback_report(
                 plan,
                 vec![policy_blocker(
@@ -1192,18 +1723,12 @@ impl PolicyApplyCoordinator {
         })
     }
 
-    fn adapter_for_domain(
-        &self,
-        domain: PolicyDomain,
-        plan: &PolicyApplyPlan,
-    ) -> Option<Box<dyn PolicyAdapter + '_>> {
-        match domain {
-            PolicyDomain::Routing => Some(Box::new(RoutingPolicyAdapter::new(&self.routing_store))),
-            PolicyDomain::Scheduler => Some(Box::new(SchedulerPolicyAdapter::new(
-                plan.review.ledger_entry.summary.scheduler_status,
-            ))),
-            PolicyDomain::AutonomousRun | PolicyDomain::Memory | PolicyDomain::Recovery => None,
-        }
+    fn adapter_registry(&self) -> PolicyAdapterRegistry<'_> {
+        PolicyAdapterRegistry::new(PolicyAdapterContext {
+            routing_store: &self.routing_store,
+            scheduler_state: self.scheduler_state.as_ref(),
+            autonomous_evaluation: self.autonomous_evaluation.as_ref(),
+        })
     }
 }
 
@@ -1303,6 +1828,9 @@ fn build_policy_apply_plan(
 
     if operation == PolicyApplyOperation::Apply {
         for decision in &review.ledger_entry.decisions {
+            if proposal_id.is_some() {
+                continue;
+            }
             if !matches!(
                 decision.status,
                 PolicyLedgerStatus::Proposed | PolicyLedgerStatus::Approved
@@ -1550,6 +2078,8 @@ fn policy_operation_supports_domain(operation: PolicyApplyOperation, domain: Pol
         (operation, domain),
         (PolicyApplyOperation::Apply, PolicyDomain::Routing)
             | (PolicyApplyOperation::Apply, PolicyDomain::Scheduler)
+            | (PolicyApplyOperation::Apply, PolicyDomain::Memory)
+            | (PolicyApplyOperation::Apply, PolicyDomain::Recovery)
             | (PolicyApplyOperation::Rollback, PolicyDomain::Routing)
     )
 }
@@ -2028,6 +2558,12 @@ pub fn review_policy_governance(input: PolicyGovernanceInput) -> PolicyGovernanc
     }
 
     if let Some(evaluation) = &input.autonomous_evaluation {
+        let memory_proposal = memory_policy_proposal(evaluation);
+        gates.extend(memory_proposal.gates.clone());
+        proposals.push(memory_proposal);
+        let recovery_proposal = recovery_policy_proposal(evaluation);
+        gates.extend(recovery_proposal.gates.clone());
+        proposals.push(recovery_proposal);
         decisions.extend(autonomous_policy_decisions(evaluation));
         gates.extend(autonomous_policy_gates(evaluation));
         gates.extend(memory_policy_gates(evaluation));
@@ -2231,6 +2767,180 @@ fn scheduler_policy_proposal(state: &SchedulerDaemonState) -> PolicyProposal {
         }],
         gates,
     }
+}
+
+fn memory_policy_proposal(evaluation: &AutonomousEvaluationReport) -> PolicyProposal {
+    let needs_adjustment =
+        evaluation.scores.memory_reuse_score < 0.5 && evaluation.counters.tasks > 0;
+    let status = if needs_adjustment {
+        PolicyLedgerStatus::Proposed
+    } else {
+        PolicyLedgerStatus::Observed
+    };
+    let risk = if evaluation.scores.memory_reuse_score < 0.25 && evaluation.counters.tasks > 0 {
+        PolicyRiskLevel::High
+    } else if needs_adjustment {
+        PolicyRiskLevel::Medium
+    } else {
+        PolicyRiskLevel::Low
+    };
+    let gates = vec![PolicyGate {
+        domain: PolicyDomain::Memory,
+        name: "memory_adapter_dry_run_only".to_string(),
+        passed: true,
+        severity: PolicyRiskLevel::Medium,
+        blocks_apply: false,
+        reason: "memory policy adapter can simulate coverage changes without mutating task memory"
+            .to_string(),
+    }];
+    PolicyProposal {
+        id: "memory-policy-coverage".to_string(),
+        domain: PolicyDomain::Memory,
+        action: "dry_run_memory_policy_coverage".to_string(),
+        status,
+        risk,
+        summary: format!(
+            "memory reuse score {:.0}% across {} task(s) and {} memory entrie(s)",
+            evaluation.scores.memory_reuse_score * 100.0,
+            evaluation.counters.tasks,
+            evaluation.counters.task_memory_entries
+        ),
+        source_fingerprint: memory_policy_fingerprint(evaluation),
+        references: vec![PolicyReference {
+            label: "autonomous_evaluation_memory".to_string(),
+            path: None,
+            id: Some(format!("evaluated-at-{}", evaluation.evaluated_at)),
+        }],
+        gates,
+    }
+}
+
+fn recovery_policy_proposal(evaluation: &AutonomousEvaluationReport) -> PolicyProposal {
+    let triggered = evaluation.counters.recovery_triggered_tasks;
+    let recovered = evaluation.counters.recovered_tasks;
+    let needs_adjustment = triggered > 0 && recovered < triggered;
+    let status = if needs_adjustment {
+        PolicyLedgerStatus::Proposed
+    } else {
+        PolicyLedgerStatus::Observed
+    };
+    let risk = if triggered > 0 && recovered == 0 {
+        PolicyRiskLevel::High
+    } else if needs_adjustment {
+        PolicyRiskLevel::Medium
+    } else {
+        PolicyRiskLevel::Low
+    };
+    let gates = vec![PolicyGate {
+        domain: PolicyDomain::Recovery,
+        name: "recovery_adapter_dry_run_only".to_string(),
+        passed: true,
+        severity: PolicyRiskLevel::Medium,
+        blocks_apply: false,
+        reason:
+            "recovery policy adapter can simulate recovery tuning without mutating recovery recipes"
+                .to_string(),
+    }];
+    PolicyProposal {
+        id: "recovery-policy-quality".to_string(),
+        domain: PolicyDomain::Recovery,
+        action: "dry_run_recovery_policy_quality".to_string(),
+        status,
+        risk,
+        summary: format!(
+            "{} recovery-triggered task(s), {} recovered, quality score {:.0}%",
+            triggered,
+            recovered,
+            evaluation.scores.recovery_quality_score * 100.0
+        ),
+        source_fingerprint: recovery_policy_fingerprint(evaluation),
+        references: vec![PolicyReference {
+            label: "autonomous_evaluation_recovery".to_string(),
+            path: None,
+            id: Some(format!("evaluated-at-{}", evaluation.evaluated_at)),
+        }],
+        gates,
+    }
+}
+
+fn memory_policy_fingerprint(evaluation: &AutonomousEvaluationReport) -> String {
+    stable_hash_json(&json!({
+        "tasks": evaluation.counters.tasks,
+        "task_memory_entries": evaluation.counters.task_memory_entries,
+        "memory_reuse_score": evaluation.scores.memory_reuse_score,
+        "policy_lifecycle_events": evaluation.counters.policy_lifecycle_events,
+        "policy_replay_anomalies": evaluation.counters.policy_replay_anomalies,
+    }))
+}
+
+fn recovery_policy_fingerprint(evaluation: &AutonomousEvaluationReport) -> String {
+    stable_hash_json(&json!({
+        "recovery_triggered_tasks": evaluation.counters.recovery_triggered_tasks,
+        "recovered_tasks": evaluation.counters.recovered_tasks,
+        "recovery_quality_score": evaluation.scores.recovery_quality_score,
+        "blocked_tasks": evaluation.counters.blocked_tasks,
+        "failed_tasks": evaluation.counters.failed_tasks,
+    }))
+}
+
+fn memory_policy_simulation_recommendations(
+    evaluation: &AutonomousEvaluationReport,
+) -> Vec<String> {
+    let mut recommendations = Vec::new();
+    if evaluation.counters.tasks == 0 {
+        recommendations.push(
+            "No tasks are available; memory policy simulation has no coverage target.".to_string(),
+        );
+    }
+    if evaluation.scores.memory_reuse_score < 0.5 && evaluation.counters.tasks > 0 {
+        recommendations.push(
+            "Increase task memory coverage before using memory feedback for autonomous policy changes."
+                .to_string(),
+        );
+    }
+    if evaluation.counters.policy_replay_anomalies > 0 {
+        recommendations.push(
+            "Resolve policy replay anomalies before trusting memory-informed policy simulation."
+                .to_string(),
+        );
+    }
+    if recommendations.is_empty() {
+        recommendations
+            .push("Memory policy dry run passed; no task memory state was changed.".to_string());
+    }
+    recommendations
+}
+
+fn recovery_policy_simulation_recommendations(
+    evaluation: &AutonomousEvaluationReport,
+) -> Vec<String> {
+    let mut recommendations = Vec::new();
+    if evaluation.counters.recovery_triggered_tasks == 0 {
+        recommendations.push(
+            "No recovery-triggered tasks are available; keep recovery policy in observation mode."
+                .to_string(),
+        );
+    } else if evaluation.counters.recovered_tasks < evaluation.counters.recovery_triggered_tasks {
+        recommendations.push(
+            "Recovery dry run found unresolved recoveries; inspect failed recovery actions before persistent tuning."
+                .to_string(),
+        );
+    }
+    if evaluation.scores.recovery_quality_score < 0.5
+        && evaluation.counters.recovery_triggered_tasks > 0
+    {
+        recommendations.push(
+            "Recovery quality is low; prefer safe retries and model switches before human-gated actions."
+                .to_string(),
+        );
+    }
+    if recommendations.is_empty() {
+        recommendations.push(
+            "Recovery policy dry run passed; no recovery recipes or actions were changed."
+                .to_string(),
+        );
+    }
+    recommendations
 }
 
 fn autonomous_policy_decisions(evaluation: &AutonomousEvaluationReport) -> Vec<PolicyDecision> {
@@ -2438,6 +3148,22 @@ fn policy_recommendations(
     }) {
         recommendations.push(
             "Validate scheduler policy proposals with a governed dry run before changing daemon behavior."
+                .to_string(),
+        );
+    }
+    if proposals.iter().any(|proposal| {
+        proposal.domain == PolicyDomain::Memory && proposal.status == PolicyLedgerStatus::Proposed
+    }) {
+        recommendations.push(
+            "Validate memory policy coverage with a governed dry run before changing memory behavior."
+                .to_string(),
+        );
+    }
+    if proposals.iter().any(|proposal| {
+        proposal.domain == PolicyDomain::Recovery && proposal.status == PolicyLedgerStatus::Proposed
+    }) {
+        recommendations.push(
+            "Validate recovery policy quality with a governed dry run before changing recovery behavior."
                 .to_string(),
         );
     }
@@ -2814,10 +3540,18 @@ mod tests {
                 && adapter.supports_dry_run
                 && !adapter.supports_persistent_apply
         }));
-        assert!(plan
-            .adapters
-            .iter()
-            .any(|adapter| adapter.domain == PolicyDomain::Memory && adapter.planned_only));
+        assert!(plan.adapters.iter().any(|adapter| {
+            adapter.domain == PolicyDomain::Memory
+                && adapter.supports_dry_run
+                && !adapter.supports_persistent_apply
+                && !adapter.planned_only
+        }));
+        assert!(plan.adapters.iter().any(|adapter| {
+            adapter.domain == PolicyDomain::Recovery
+                && adapter.supports_dry_run
+                && !adapter.supports_persistent_apply
+                && !adapter.planned_only
+        }));
     }
 
     #[test]
@@ -2850,7 +3584,8 @@ mod tests {
             applied_routing_policy: None,
             scheduler_state: Some(scheduler_state(SchedulerDaemonStatus::Running, 3)),
         });
-        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir));
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir))
+            .with_scheduler_state(Some(scheduler_state(SchedulerDaemonStatus::Running, 3)));
         let plan = coordinator.plan_apply(
             review,
             Some(PolicyDomain::Scheduler),
@@ -2889,7 +3624,8 @@ mod tests {
             applied_routing_policy: None,
             scheduler_state: Some(scheduler_state(SchedulerDaemonStatus::Running, 3)),
         });
-        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir));
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir))
+            .with_scheduler_state(Some(scheduler_state(SchedulerDaemonStatus::Running, 3)));
         let plan = coordinator.plan_apply(
             review,
             Some(PolicyDomain::Scheduler),
@@ -2913,6 +3649,201 @@ mod tests {
             }
             other => panic!("expected scheduler dry run adapter report, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn coordinator_blocks_stale_scheduler_policy_plan() {
+        let dir =
+            std::env::temp_dir().join(format!("himalaya-policy-scheduler-stale-{}", now_millis()));
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: None,
+            routing_proposals: Vec::new(),
+            applied_routing_policy: None,
+            scheduler_state: Some(scheduler_state(SchedulerDaemonStatus::Running, 3)),
+        });
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir))
+            .with_scheduler_state(Some(scheduler_state(SchedulerDaemonStatus::Running, 4)));
+        let plan = coordinator.plan_apply(
+            review,
+            Some(PolicyDomain::Scheduler),
+            Some("scheduler-policy-3"),
+            true,
+        );
+
+        let report = coordinator.apply(&plan).expect("scheduler stale report");
+
+        assert_eq!(report.status, PolicyLedgerStatus::ApplyBlocked);
+        assert!(!report.applied);
+        assert!(report
+            .structured_blockers
+            .iter()
+            .any(|blocker| blocker.kind == PolicyBlockerKind::StalePlan));
+    }
+
+    #[test]
+    fn review_creates_memory_and_recovery_policy_proposals() {
+        let evaluation = autonomous_evaluation(false);
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: Some(evaluation),
+            routing_proposals: Vec::new(),
+            applied_routing_policy: None,
+            scheduler_state: None,
+        });
+
+        let memory = review
+            .ledger_entry
+            .proposals
+            .iter()
+            .find(|proposal| proposal.domain == PolicyDomain::Memory)
+            .expect("memory proposal should exist");
+        let recovery = review
+            .ledger_entry
+            .proposals
+            .iter()
+            .find(|proposal| proposal.domain == PolicyDomain::Recovery)
+            .expect("recovery proposal should exist");
+
+        assert_eq!(memory.id, "memory-policy-coverage");
+        assert_eq!(memory.status, PolicyLedgerStatus::Proposed);
+        assert_eq!(recovery.id, "recovery-policy-quality");
+        assert_eq!(recovery.status, PolicyLedgerStatus::Proposed);
+        assert!(!memory.source_fingerprint.is_empty());
+        assert!(!recovery.source_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn coordinator_dry_runs_memory_policy_adapter() {
+        let dir = std::env::temp_dir().join(format!("himalaya-policy-memory-{}", now_millis()));
+        let evaluation = autonomous_evaluation(false);
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: Some(evaluation.clone()),
+            routing_proposals: Vec::new(),
+            applied_routing_policy: None,
+            scheduler_state: None,
+        });
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir))
+            .with_autonomous_evaluation(Some(evaluation));
+        let plan = coordinator.plan_apply(
+            review,
+            Some(PolicyDomain::Memory),
+            Some("memory-policy-coverage"),
+            true,
+        );
+
+        let report = coordinator.apply(&plan).expect("memory dry run report");
+
+        assert_eq!(plan.status, PolicyLedgerStatus::Planned);
+        assert_eq!(report.status, PolicyLedgerStatus::DryRunPassed);
+        assert!(!report.applied);
+        assert_eq!(report.receipt.adapter.as_deref(), Some("memory_policy"));
+        match report.adapter_report {
+            Some(PolicyAdapterReport::MemoryDryRun(report)) => {
+                assert!(report.dry_run);
+                assert_eq!(report.task_count, 1);
+                assert_eq!(report.task_memory_entries, 0);
+                assert_eq!(report.memory_reuse_score, 0.0);
+            }
+            other => panic!("expected memory dry run adapter report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coordinator_blocks_memory_persistent_apply() {
+        let dir =
+            std::env::temp_dir().join(format!("himalaya-policy-memory-block-{}", now_millis()));
+        let evaluation = autonomous_evaluation(false);
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: Some(evaluation.clone()),
+            routing_proposals: Vec::new(),
+            applied_routing_policy: None,
+            scheduler_state: None,
+        });
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir))
+            .with_autonomous_evaluation(Some(evaluation));
+        let plan = coordinator.plan_apply(
+            review,
+            Some(PolicyDomain::Memory),
+            Some("memory-policy-coverage"),
+            false,
+        );
+
+        let report = coordinator.apply(&plan).expect("memory apply report");
+
+        assert_eq!(report.status, PolicyLedgerStatus::ApplyBlocked);
+        assert!(!report.applied);
+        assert_eq!(report.receipt.adapter.as_deref(), Some("memory_policy"));
+        assert!(report
+            .structured_blockers
+            .iter()
+            .any(|blocker| blocker.kind == PolicyBlockerKind::UnsupportedDomain));
+    }
+
+    #[test]
+    fn coordinator_dry_runs_recovery_policy_adapter() {
+        let dir = std::env::temp_dir().join(format!("himalaya-policy-recovery-{}", now_millis()));
+        let evaluation = autonomous_evaluation(false);
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: Some(evaluation.clone()),
+            routing_proposals: Vec::new(),
+            applied_routing_policy: None,
+            scheduler_state: None,
+        });
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir))
+            .with_autonomous_evaluation(Some(evaluation));
+        let plan = coordinator.plan_apply(
+            review,
+            Some(PolicyDomain::Recovery),
+            Some("recovery-policy-quality"),
+            true,
+        );
+
+        let report = coordinator.apply(&plan).expect("recovery dry run report");
+
+        assert_eq!(plan.status, PolicyLedgerStatus::Planned);
+        assert_eq!(report.status, PolicyLedgerStatus::DryRunPassed);
+        assert!(!report.applied);
+        assert_eq!(report.receipt.adapter.as_deref(), Some("recovery_policy"));
+        match report.adapter_report {
+            Some(PolicyAdapterReport::RecoveryDryRun(report)) => {
+                assert!(report.dry_run);
+                assert_eq!(report.recovery_triggered_tasks, 1);
+                assert_eq!(report.recovered_tasks, 0);
+                assert_eq!(report.recovery_quality_score, 0.0);
+            }
+            other => panic!("expected recovery dry run adapter report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coordinator_blocks_stale_memory_policy_plan() {
+        let dir =
+            std::env::temp_dir().join(format!("himalaya-policy-memory-stale-{}", now_millis()));
+        let evaluation = autonomous_evaluation(false);
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: Some(evaluation.clone()),
+            routing_proposals: Vec::new(),
+            applied_routing_policy: None,
+            scheduler_state: None,
+        });
+        let mut changed = evaluation;
+        changed.counters.task_memory_entries = 1;
+        changed.scores.memory_reuse_score = 1.0;
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir))
+            .with_autonomous_evaluation(Some(changed));
+        let plan = coordinator.plan_apply(
+            review,
+            Some(PolicyDomain::Memory),
+            Some("memory-policy-coverage"),
+            true,
+        );
+
+        let report = coordinator.apply(&plan).expect("memory stale report");
+
+        assert_eq!(report.status, PolicyLedgerStatus::ApplyBlocked);
+        assert!(report
+            .structured_blockers
+            .iter()
+            .any(|blocker| blocker.kind == PolicyBlockerKind::StalePlan));
     }
 
     #[test]

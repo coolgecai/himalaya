@@ -1050,6 +1050,21 @@ fn governed_policy_apply_emits_stream_json_events() {
     assert_eq!(plan["plan"]["status"], "planned");
     assert!(plan["plan"]["actions"].is_array());
     assert!(plan["plan"]["adapters"].is_array());
+    let adapters = plan["plan"]["adapters"]
+        .as_array()
+        .expect("policy plan adapters should be an array");
+    assert!(adapters.iter().any(|adapter| {
+        adapter["domain"] == "memory"
+            && adapter["supports_dry_run"] == true
+            && adapter["supports_persistent_apply"] == false
+            && adapter["planned_only"] == false
+    }));
+    assert!(adapters.iter().any(|adapter| {
+        adapter["domain"] == "recovery"
+            && adapter["supports_dry_run"] == true
+            && adapter["supports_persistent_apply"] == false
+            && adapter["planned_only"] == false
+    }));
 
     let dry_run_events = run_stream_json_subcommand(
         &workspace,

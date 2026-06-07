@@ -1635,7 +1635,7 @@ fn parse_policy_cli_command(args: &[String]) -> Result<PolicyCliCommand, String>
         Some(("apply", rest)) => parse_policy_apply_args(rest),
         Some(("rollback", rest)) => parse_policy_rollback_args(rest),
         Some((other, _)) => Err(format!(
-            "unknown policy command: {other}\nUsage: Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|replay [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing|scheduler] [--proposal-id ID] [--limit N] [--max-ticks N]|rollback [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]]"
+            "unknown policy command: {other}\nUsage: Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|replay [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing|scheduler|memory|recovery] [--proposal-id ID] [--limit N] [--max-ticks N]|rollback [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]]"
         )),
     }
 }
@@ -1803,7 +1803,7 @@ fn parse_policy_apply_args(args: &[String]) -> Result<PolicyCliCommand, String> 
             }
             other => {
                 return Err(format!(
-                    "unknown policy apply argument: {other}\nUsage: Himalaya policy apply [--dry-run] [--domain routing|scheduler] [--proposal-id ID] [--limit N] [--max-ticks N]"
+                    "unknown policy apply argument: {other}\nUsage: Himalaya policy apply [--dry-run] [--domain routing|scheduler|memory|recovery] [--proposal-id ID] [--limit N] [--max-ticks N]"
                 ));
             }
         }
@@ -9429,9 +9429,13 @@ fn run_policy_command(
         }
         PolicyCliCommand::Plan { limit, max_ticks } => {
             let input = build_policy_governance_input(limit, max_ticks, permission_mode)?;
+            let scheduler_state = input.scheduler_state.clone();
+            let autonomous_evaluation = input.autonomous_evaluation.clone();
             let review = runtime::review_policy_governance(input);
             let coordinator =
-                runtime::PolicyApplyCoordinator::new(load_route_policy_proposal_store()?);
+                runtime::PolicyApplyCoordinator::new(load_route_policy_proposal_store()?)
+                    .with_scheduler_state(scheduler_state)
+                    .with_autonomous_evaluation(autonomous_evaluation);
             let plan = coordinator.plan_apply(review, None, None, false);
             let ledger = runtime::PolicyGovernanceLedger::new(policy_governance_dir()?);
             let ledger_entry = ledger.record_apply_plan(&plan)?;
@@ -9454,9 +9458,13 @@ fn run_policy_command(
             dry_run,
         } => {
             let input = build_policy_governance_input(limit, max_ticks, permission_mode)?;
+            let scheduler_state = input.scheduler_state.clone();
+            let autonomous_evaluation = input.autonomous_evaluation.clone();
             let review = runtime::review_policy_governance(input);
             let coordinator =
-                runtime::PolicyApplyCoordinator::new(load_route_policy_proposal_store()?);
+                runtime::PolicyApplyCoordinator::new(load_route_policy_proposal_store()?)
+                    .with_scheduler_state(scheduler_state)
+                    .with_autonomous_evaluation(autonomous_evaluation);
             let plan = coordinator.plan_apply(review, domain, proposal_id.as_deref(), dry_run);
             let apply = coordinator.apply(&plan)?;
             let ledger = runtime::PolicyGovernanceLedger::new(policy_governance_dir()?);
@@ -9479,9 +9487,13 @@ fn run_policy_command(
             proposal_id,
         } => {
             let input = build_policy_governance_input(limit, max_ticks, permission_mode)?;
+            let scheduler_state = input.scheduler_state.clone();
+            let autonomous_evaluation = input.autonomous_evaluation.clone();
             let review = runtime::review_policy_governance(input);
             let coordinator =
-                runtime::PolicyApplyCoordinator::new(load_route_policy_proposal_store()?);
+                runtime::PolicyApplyCoordinator::new(load_route_policy_proposal_store()?)
+                    .with_scheduler_state(scheduler_state)
+                    .with_autonomous_evaluation(autonomous_evaluation);
             let plan = coordinator.plan_rollback(review, domain, proposal_id.as_deref());
             let rollback = coordinator.rollback(&plan)?;
             let ledger = runtime::PolicyGovernanceLedger::new(policy_governance_dir()?);
@@ -15306,7 +15318,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|replay [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing|scheduler] [--proposal-id ID]|rollback [--domain routing] [--proposal-id ID]]"
+        "  Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|replay [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing|scheduler|memory|recovery] [--proposal-id ID]|rollback [--domain routing] [--proposal-id ID]]"
     )?;
     writeln!(
         out,

@@ -1278,7 +1278,12 @@ fn route_feedback_summary_emits_metric_summaries() {
         ],
     );
     assert_eq!(replay["type"], "policy_replay");
-    assert_eq!(replay["replay"]["summary"]["lifecycle_count"], 1);
+    assert!(
+        replay["replay"]["summary"]["lifecycle_count"]
+            .as_u64()
+            .expect("lifecycle count")
+            >= 3
+    );
     assert!(
         replay["replay"]["summary"]["event_count"]
             .as_u64()
