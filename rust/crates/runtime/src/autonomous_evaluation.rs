@@ -6,8 +6,9 @@ use crate::task_registry::Task as RegistryTask;
 use crate::{
     recommend_autonomous_policy_for_summary, summarize_autonomous_run_reports,
     AutonomousPolicyAction, AutonomousPolicyRecommendation, AutonomousRunHistorySummary,
-    AutonomousRunLoad, AutonomousRunStatus, ModelRouteFeedback, PermissionMode, RouteFeedbackStore,
-    RouteFeedbackSummary, TaskMemoryStore, TaskMemorySummary, TaskStatus,
+    AutonomousRunLoad, AutonomousRunStatus, ModelRouteFeedback, PermissionMode,
+    PolicyLifecycleReplay, RouteFeedbackStore, RouteFeedbackSummary, TaskMemoryStore,
+    TaskMemorySummary, TaskStatus,
 };
 
 pub const AUTONOMOUS_EVALUATION_VERSION: u32 = 1;
@@ -22,6 +23,7 @@ pub struct AutonomousEvaluationInput {
     pub autonomous_runs: AutonomousRunLoad,
     pub permission_mode: PermissionMode,
     pub requested_max_ticks: usize,
+    pub policy_replay: Option<PolicyLifecycleReplay>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,6 +55,8 @@ pub struct AutonomousEvaluationCounters {
     pub productive_scheduler_ticks: usize,
     pub worker_dispatches: usize,
     pub worker_completions: usize,
+    pub policy_lifecycle_events: usize,
+    pub policy_replay_anomalies: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -112,6 +116,7 @@ pub fn evaluate_autonomous_loop(input: AutonomousEvaluationInput) -> AutonomousE
         &input.task_memory,
         input.route_feedback.feedback(),
         &input.autonomous_runs,
+        input.policy_replay.as_ref(),
     );
     let scores = evaluation_scores(&counters, &run_summary, input.route_feedback.feedback());
     let trace_replay = replay_autonomous_trace(
@@ -211,6 +216,7 @@ fn evaluation_counters(
     task_memory: &TaskMemoryStore,
     route_feedback: &[ModelRouteFeedback],
     run_load: &AutonomousRunLoad,
+    policy_replay: Option<&PolicyLifecycleReplay>,
 ) -> AutonomousEvaluationCounters {
     let route_failures = route_feedback
         .iter()
@@ -284,6 +290,8 @@ fn evaluation_counters(
         productive_scheduler_ticks,
         worker_dispatches,
         worker_completions,
+        policy_lifecycle_events: policy_replay.map_or(0, |replay| replay.summary.event_count),
+        policy_replay_anomalies: policy_replay.map_or(0, |replay| replay.summary.anomaly_count),
     }
 }
 
@@ -413,6 +421,17 @@ fn evaluation_recommendations(
             trace_replay.changed_decisions
         ));
     }
+    if counters.policy_replay_anomalies > 0 {
+        recommendations.push(format!(
+            "{} policy governance replay anomalie(s) were found; inspect policy ledger before applying new autonomous changes.",
+            counters.policy_replay_anomalies
+        ));
+    } else if counters.policy_lifecycle_events > 0 {
+        recommendations.push(format!(
+            "{} policy governance lifecycle event(s) were included in autonomous evaluation.",
+            counters.policy_lifecycle_events
+        ));
+    }
     if recommendations.is_empty() {
         recommendations.push(
             "Autonomous evaluation found no immediate policy or telemetry blockers.".to_string(),
@@ -467,7 +486,8 @@ mod tests {
     use super::*;
     use crate::{
         append_autonomous_run_report, AutonomousRunReport, ModelRouteDecision, ModelRoutePhase,
-        TaskRegistry,
+        PolicyDomain, PolicyLedgerStatus, PolicyLifecycle, PolicyLifecycleEvent,
+        PolicyLifecycleReplay, PolicyLifecycleReplaySummary, TaskRegistry,
     };
 
     fn run_report(
@@ -536,6 +556,7 @@ mod tests {
             autonomous_runs: run_load,
             permission_mode: PermissionMode::ReadOnly,
             requested_max_ticks: 3,
+            policy_replay: None,
         });
 
         assert_eq!(report.counters.tasks, 2);
@@ -593,5 +614,60 @@ mod tests {
             AutonomousPolicyAction::RequestReview
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evaluation_includes_policy_replay_counters() {
+        let registry = TaskRegistry::new();
+        let run_load = AutonomousRunLoad {
+            runs_path: PathBuf::from("runs.jsonl"),
+            reports: Vec::new(),
+            malformed_lines: 0,
+            warnings: Vec::new(),
+        };
+        let policy_replay = PolicyLifecycleReplay {
+            version: 1,
+            ledger_path: PathBuf::from("policy/ledger.jsonl"),
+            entries_considered: 1,
+            malformed_lines: 0,
+            lifecycles: vec![PolicyLifecycle {
+                domain: PolicyDomain::Routing,
+                proposal_id: "route-policy-1".to_string(),
+                current_status: PolicyLedgerStatus::Applied,
+                first_seen_at: 1,
+                last_seen_at: 2,
+                events: vec![PolicyLifecycleEvent {
+                    entry_id: "policy-apply-1".to_string(),
+                    timestamp: 2,
+                    status: PolicyLedgerStatus::Applied,
+                    action: "apply_routing_policy_overlay".to_string(),
+                    operation: None,
+                }],
+            }],
+            anomalies: Vec::new(),
+            summary: PolicyLifecycleReplaySummary {
+                lifecycle_count: 1,
+                event_count: 1,
+                anomaly_count: 0,
+                malformed_lines: 0,
+            },
+        };
+
+        let report = evaluate_autonomous_loop(AutonomousEvaluationInput {
+            tasks: registry.list(None),
+            task_memory: TaskMemoryStore::new(),
+            route_feedback: RouteFeedbackStore::new(),
+            autonomous_runs: run_load,
+            permission_mode: PermissionMode::ReadOnly,
+            requested_max_ticks: 3,
+            policy_replay: Some(policy_replay),
+        });
+
+        assert_eq!(report.counters.policy_lifecycle_events, 1);
+        assert_eq!(report.counters.policy_replay_anomalies, 0);
+        assert!(report
+            .recommendations
+            .iter()
+            .any(|recommendation| recommendation.contains("policy governance lifecycle event")));
     }
 }

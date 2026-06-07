@@ -331,6 +331,8 @@ pub struct PolicyApplyPlan {
     pub domain_filter: Option<PolicyDomain>,
     pub proposal_id: Option<String>,
     pub actions: Vec<PolicyApplyAction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adapters: Vec<PolicyAdapterDescriptor>,
     pub blockers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structured_blockers: Vec<PolicyBlocker>,
@@ -370,6 +372,7 @@ pub struct PolicyApplyReport {
     pub status: PolicyLedgerStatus,
     pub applied: bool,
     pub plan: PolicyApplyPlan,
+    pub adapter_report: Option<PolicyAdapterReport>,
     pub routing_report: Option<RoutingPolicyApplyReport>,
     pub blockers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -386,6 +389,7 @@ pub struct PolicyRollbackReport {
     pub status: PolicyLedgerStatus,
     pub rolled_back: bool,
     pub plan: PolicyApplyPlan,
+    pub adapter_report: Option<PolicyAdapterReport>,
     pub routing_report: Option<RoutingPolicyRollbackReport>,
     pub blockers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -440,10 +444,87 @@ pub struct PolicyLifecycleReplay {
     pub summary: PolicyLifecycleReplaySummary,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyAdapterDescriptor {
+    pub name: String,
+    pub domain: PolicyDomain,
+    pub supports_apply: bool,
+    pub supports_persistent_apply: bool,
+    pub supports_dry_run: bool,
+    pub supports_rollback: bool,
+    pub planned_only: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerPolicyDryRunReport {
+    pub proposal_id: String,
+    pub dry_run: bool,
+    pub status: PolicyLedgerStatus,
+    pub scheduler_status: Option<SchedulerDaemonStatus>,
+    pub blockers: Vec<PolicyBlocker>,
+    pub recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "report", rename_all = "snake_case")]
+pub enum PolicyAdapterReport {
+    RoutingApply(RoutingPolicyApplyReport),
+    RoutingRollback(RoutingPolicyRollbackReport),
+    SchedulerDryRun(SchedulerPolicyDryRunReport),
+}
+
 #[derive(Debug, Clone)]
-struct ValidatedPolicyAction {
+struct PolicyAdapterValidation {
     proposal_id: String,
     before_status: PolicyLedgerStatus,
+}
+
+#[derive(Debug, Clone)]
+struct PolicyAdapterApplyResult {
+    status: PolicyLedgerStatus,
+    applied: bool,
+    executed: bool,
+    after_status: Option<PolicyLedgerStatus>,
+    adapter_report_id: Option<String>,
+    adapter_report: Option<PolicyAdapterReport>,
+    routing_report: Option<RoutingPolicyApplyReport>,
+    blockers: Vec<PolicyBlocker>,
+    recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PolicyAdapterRollbackResult {
+    status: PolicyLedgerStatus,
+    rolled_back: bool,
+    executed: bool,
+    after_status: Option<PolicyLedgerStatus>,
+    adapter_report_id: Option<String>,
+    adapter_report: Option<PolicyAdapterReport>,
+    routing_report: Option<RoutingPolicyRollbackReport>,
+    blockers: Vec<PolicyBlocker>,
+    recommendations: Vec<String>,
+}
+
+trait PolicyAdapter {
+    fn descriptor(&self) -> PolicyAdapterDescriptor;
+
+    fn validate(
+        &self,
+        action: &PolicyApplyAction,
+        operation: PolicyApplyOperation,
+    ) -> io::Result<Result<PolicyAdapterValidation, Vec<PolicyBlocker>>>;
+
+    fn apply(
+        &self,
+        validation: &PolicyAdapterValidation,
+        dry_run: bool,
+    ) -> io::Result<PolicyAdapterApplyResult>;
+
+    fn rollback(
+        &self,
+        validation: &PolicyAdapterValidation,
+    ) -> io::Result<PolicyAdapterRollbackResult>;
 }
 
 #[derive(Debug, Clone)]
@@ -458,11 +539,31 @@ impl<'a> RoutingPolicyAdapter<'a> {
         Self { store }
     }
 
+    fn descriptor_static() -> PolicyAdapterDescriptor {
+        PolicyAdapterDescriptor {
+            name: Self::NAME.to_string(),
+            domain: PolicyDomain::Routing,
+            supports_apply: true,
+            supports_persistent_apply: true,
+            supports_dry_run: true,
+            supports_rollback: true,
+            planned_only: false,
+            reason: "routing policy adapter can apply and rollback MoE routing overlays"
+                .to_string(),
+        }
+    }
+}
+
+impl PolicyAdapter for RoutingPolicyAdapter<'_> {
+    fn descriptor(&self) -> PolicyAdapterDescriptor {
+        Self::descriptor_static()
+    }
+
     fn validate(
         &self,
         action: &PolicyApplyAction,
         operation: PolicyApplyOperation,
-    ) -> io::Result<Result<ValidatedPolicyAction, Vec<PolicyBlocker>>> {
+    ) -> io::Result<Result<PolicyAdapterValidation, Vec<PolicyBlocker>>> {
         let Some(proposal_id) = action.proposal_id.as_deref() else {
             return Ok(Err(vec![policy_blocker(
                 PolicyBlockerKind::MissingTarget,
@@ -511,18 +612,319 @@ impl<'a> RoutingPolicyAdapter<'a> {
                 Self::NAME,
             )]));
         }
-        Ok(Ok(ValidatedPolicyAction {
+        Ok(Ok(PolicyAdapterValidation {
             proposal_id: proposal_id.to_string(),
             before_status: map_routing_status(proposal.status),
         }))
     }
 
-    fn apply(&self, proposal_id: &str, dry_run: bool) -> io::Result<RoutingPolicyApplyReport> {
-        self.store.apply(proposal_id, dry_run)
+    fn apply(
+        &self,
+        validation: &PolicyAdapterValidation,
+        dry_run: bool,
+    ) -> io::Result<PolicyAdapterApplyResult> {
+        let routing_report = self.store.apply(&validation.proposal_id, dry_run)?;
+        let mut blockers = routing_report
+            .blockers
+            .iter()
+            .map(|blocker| {
+                policy_blocker(
+                    PolicyBlockerKind::AdapterRejected,
+                    Some(PolicyDomain::Routing),
+                    Some(validation.proposal_id.clone()),
+                    PolicyRiskLevel::High,
+                    blocker.clone(),
+                    Self::NAME,
+                )
+            })
+            .collect::<Vec<_>>();
+        let (status, applied) = if !blockers.is_empty() {
+            (PolicyLedgerStatus::ApplyBlocked, false)
+        } else if dry_run {
+            (PolicyLedgerStatus::DryRunPassed, false)
+        } else if routing_report.applied {
+            (PolicyLedgerStatus::Applied, true)
+        } else {
+            blockers.push(policy_blocker(
+                PolicyBlockerKind::AdapterRejected,
+                Some(PolicyDomain::Routing),
+                Some(validation.proposal_id.clone()),
+                PolicyRiskLevel::High,
+                "routing policy store did not apply the proposal",
+                Self::NAME,
+            ));
+            (PolicyLedgerStatus::ApplyBlocked, false)
+        };
+        let mut recommendations = routing_report.recommendations.clone();
+        if status == PolicyLedgerStatus::DryRunPassed {
+            recommendations.push(
+                "Governance dry run passed; rerun with --domain routing --proposal-id to apply."
+                    .to_string(),
+            );
+        }
+        Ok(PolicyAdapterApplyResult {
+            status,
+            applied,
+            executed: applied || dry_run && status == PolicyLedgerStatus::DryRunPassed,
+            after_status: Some(map_routing_status(routing_report.status)),
+            adapter_report_id: Some(format!(
+                "routing_policy_apply:{}",
+                routing_report.proposal_id
+            )),
+            adapter_report: Some(PolicyAdapterReport::RoutingApply(routing_report.clone())),
+            routing_report: Some(routing_report),
+            blockers,
+            recommendations,
+        })
     }
 
-    fn rollback(&self, proposal_id: &str) -> io::Result<RoutingPolicyRollbackReport> {
-        self.store.rollback(proposal_id)
+    fn rollback(
+        &self,
+        validation: &PolicyAdapterValidation,
+    ) -> io::Result<PolicyAdapterRollbackResult> {
+        let routing_report = self.store.rollback(&validation.proposal_id)?;
+        let status = if routing_report.rolled_back {
+            PolicyLedgerStatus::RolledBack
+        } else {
+            PolicyLedgerStatus::RollbackBlocked
+        };
+        let blockers = if routing_report.rolled_back {
+            Vec::new()
+        } else {
+            routing_report
+                .recommendations
+                .iter()
+                .map(|recommendation| {
+                    policy_blocker(
+                        PolicyBlockerKind::AdapterRejected,
+                        Some(PolicyDomain::Routing),
+                        Some(validation.proposal_id.clone()),
+                        PolicyRiskLevel::High,
+                        recommendation.clone(),
+                        Self::NAME,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        Ok(PolicyAdapterRollbackResult {
+            status,
+            rolled_back: routing_report.rolled_back,
+            executed: routing_report.rolled_back,
+            after_status: Some(map_routing_status(routing_report.status)),
+            adapter_report_id: Some(format!(
+                "routing_policy_rollback:{}",
+                routing_report.proposal_id
+            )),
+            adapter_report: Some(PolicyAdapterReport::RoutingRollback(routing_report.clone())),
+            routing_report: Some(routing_report.clone()),
+            blockers,
+            recommendations: routing_report.recommendations,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SchedulerPolicyAdapter {
+    scheduler_status: Option<SchedulerDaemonStatus>,
+}
+
+impl SchedulerPolicyAdapter {
+    const NAME: &'static str = "scheduler_policy";
+
+    fn new(scheduler_status: Option<SchedulerDaemonStatus>) -> Self {
+        Self { scheduler_status }
+    }
+
+    fn descriptor_static() -> PolicyAdapterDescriptor {
+        PolicyAdapterDescriptor {
+            name: Self::NAME.to_string(),
+            domain: PolicyDomain::Scheduler,
+            supports_apply: true,
+            supports_persistent_apply: false,
+            supports_dry_run: true,
+            supports_rollback: false,
+            planned_only: false,
+            reason: "scheduler policy adapter supports dry-run validation only".to_string(),
+        }
+    }
+}
+
+impl PolicyAdapter for SchedulerPolicyAdapter {
+    fn descriptor(&self) -> PolicyAdapterDescriptor {
+        Self::descriptor_static()
+    }
+
+    fn validate(
+        &self,
+        action: &PolicyApplyAction,
+        operation: PolicyApplyOperation,
+    ) -> io::Result<Result<PolicyAdapterValidation, Vec<PolicyBlocker>>> {
+        let Some(proposal_id) = action.proposal_id.as_deref() else {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::MissingTarget,
+                Some(PolicyDomain::Scheduler),
+                None,
+                PolicyRiskLevel::High,
+                "scheduler policy action is missing a proposal id",
+                Self::NAME,
+            )]));
+        };
+        if operation != PolicyApplyOperation::Apply {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::UnsupportedDomain,
+                Some(PolicyDomain::Scheduler),
+                Some(proposal_id.to_string()),
+                PolicyRiskLevel::Medium,
+                "scheduler policy rollback is not executable",
+                Self::NAME,
+            )]));
+        }
+        if action.domain != PolicyDomain::Scheduler {
+            return Ok(Err(vec![policy_blocker(
+                PolicyBlockerKind::UnsupportedDomain,
+                Some(action.domain),
+                Some(proposal_id.to_string()),
+                PolicyRiskLevel::High,
+                "scheduler adapter received a non-scheduler policy action",
+                Self::NAME,
+            )]));
+        }
+        Ok(Ok(PolicyAdapterValidation {
+            proposal_id: proposal_id.to_string(),
+            before_status: action.status,
+        }))
+    }
+
+    fn apply(
+        &self,
+        validation: &PolicyAdapterValidation,
+        dry_run: bool,
+    ) -> io::Result<PolicyAdapterApplyResult> {
+        if !dry_run {
+            let blocker = policy_blocker(
+                PolicyBlockerKind::UnsupportedDomain,
+                Some(PolicyDomain::Scheduler),
+                Some(validation.proposal_id.clone()),
+                PolicyRiskLevel::High,
+                "scheduler policy adapter is dry-run only; persistent apply is not supported",
+                Self::NAME,
+            );
+            return Ok(PolicyAdapterApplyResult {
+                status: PolicyLedgerStatus::ApplyBlocked,
+                applied: false,
+                executed: false,
+                after_status: Some(PolicyLedgerStatus::ApplyBlocked),
+                adapter_report_id: Some(format!(
+                    "scheduler_policy_apply_blocked:{}",
+                    validation.proposal_id
+                )),
+                adapter_report: Some(PolicyAdapterReport::SchedulerDryRun(
+                    SchedulerPolicyDryRunReport {
+                        proposal_id: validation.proposal_id.clone(),
+                        dry_run,
+                        status: PolicyLedgerStatus::ApplyBlocked,
+                        scheduler_status: self.scheduler_status,
+                        blockers: vec![blocker.clone()],
+                        recommendations: vec![
+                            "Keep scheduler policy changes in governance review until a persistent adapter is available."
+                                .to_string(),
+                        ],
+                    },
+                )),
+                routing_report: None,
+                blockers: vec![blocker],
+                recommendations: vec![
+                    "Scheduler policy dry-run adapter rejected persistent apply.".to_string(),
+                ],
+            });
+        }
+        let recommendations = vec![
+            "Scheduler policy dry run passed; no daemon state or scheduler configuration was changed."
+                .to_string(),
+        ];
+        let report = SchedulerPolicyDryRunReport {
+            proposal_id: validation.proposal_id.clone(),
+            dry_run,
+            status: PolicyLedgerStatus::DryRunPassed,
+            scheduler_status: self.scheduler_status,
+            blockers: Vec::new(),
+            recommendations: recommendations.clone(),
+        };
+        Ok(PolicyAdapterApplyResult {
+            status: PolicyLedgerStatus::DryRunPassed,
+            applied: false,
+            executed: true,
+            after_status: Some(PolicyLedgerStatus::DryRunPassed),
+            adapter_report_id: Some(format!(
+                "scheduler_policy_dry_run:{}",
+                validation.proposal_id
+            )),
+            adapter_report: Some(PolicyAdapterReport::SchedulerDryRun(report)),
+            routing_report: None,
+            blockers: Vec::new(),
+            recommendations,
+        })
+    }
+
+    fn rollback(
+        &self,
+        validation: &PolicyAdapterValidation,
+    ) -> io::Result<PolicyAdapterRollbackResult> {
+        let blocker = policy_blocker(
+            PolicyBlockerKind::UnsupportedDomain,
+            Some(PolicyDomain::Scheduler),
+            Some(validation.proposal_id.clone()),
+            PolicyRiskLevel::High,
+            "scheduler policy rollback is not supported",
+            Self::NAME,
+        );
+        Ok(PolicyAdapterRollbackResult {
+            status: PolicyLedgerStatus::RollbackBlocked,
+            rolled_back: false,
+            executed: false,
+            after_status: Some(PolicyLedgerStatus::RollbackBlocked),
+            adapter_report_id: None,
+            adapter_report: None,
+            routing_report: None,
+            blockers: vec![blocker],
+            recommendations: vec![
+                "Scheduler policy rollback remains governance-planned only.".to_string()
+            ],
+        })
+    }
+}
+
+pub fn policy_adapter_descriptors(
+    scheduler_status: Option<SchedulerDaemonStatus>,
+) -> Vec<PolicyAdapterDescriptor> {
+    vec![
+        RoutingPolicyAdapter::descriptor_static(),
+        SchedulerPolicyAdapter::new(scheduler_status).descriptor(),
+        planned_only_adapter_descriptor(PolicyDomain::AutonomousRun),
+        planned_only_adapter_descriptor(PolicyDomain::Memory),
+        planned_only_adapter_descriptor(PolicyDomain::Recovery),
+    ]
+}
+
+fn planned_only_adapter_descriptor(domain: PolicyDomain) -> PolicyAdapterDescriptor {
+    let name = match domain {
+        PolicyDomain::Routing => "routing_policy",
+        PolicyDomain::AutonomousRun => "autonomous_run_policy",
+        PolicyDomain::Scheduler => "scheduler_policy",
+        PolicyDomain::Memory => "memory_policy",
+        PolicyDomain::Recovery => "recovery_policy",
+    };
+    PolicyAdapterDescriptor {
+        name: name.to_string(),
+        domain,
+        supports_apply: false,
+        supports_persistent_apply: false,
+        supports_dry_run: false,
+        supports_rollback: false,
+        planned_only: true,
+        reason: format!(
+            "{domain:?} policy remains governance-planned until an adapter is registered"
+        ),
     }
 }
 
@@ -583,36 +985,33 @@ impl PolicyApplyCoordinator {
                 .iter()
                 .flat_map(|action| action.structured_blockers.clone()),
         );
-        if !plan.dry_run
-            && (plan.domain_filter != Some(PolicyDomain::Routing) || plan.proposal_id.is_none())
-        {
+        if !plan.dry_run && (plan.domain_filter.is_none() || plan.proposal_id.is_none()) {
             structured_blockers.push(policy_blocker(
                 PolicyBlockerKind::MissingTarget,
-                Some(PolicyDomain::Routing),
+                plan.domain_filter,
                 plan.proposal_id.clone(),
                 PolicyRiskLevel::High,
-                "governed policy apply requires explicit --domain routing and --proposal-id"
-                    .to_string(),
+                "governed policy apply requires explicit --domain and --proposal-id".to_string(),
                 "governance_apply",
             ));
         }
-        let executable_actions = executable_routing_actions(plan);
+        let executable_actions = executable_policy_actions(plan);
         if executable_actions.is_empty() {
             structured_blockers.push(policy_blocker(
                 PolicyBlockerKind::MissingTarget,
-                Some(PolicyDomain::Routing),
+                plan.domain_filter,
                 plan.proposal_id.clone(),
                 PolicyRiskLevel::High,
-                "no executable routing policy apply action is available",
+                "no executable policy apply action is available",
                 "governance_apply",
             ));
         } else if executable_actions.len() > 1 {
             structured_blockers.push(policy_blocker(
                 PolicyBlockerKind::AmbiguousTarget,
-                Some(PolicyDomain::Routing),
+                plan.domain_filter,
                 None,
                 PolicyRiskLevel::High,
-                "multiple executable routing policy actions are available; specify --proposal-id"
+                "multiple executable policy actions are available; specify --domain and --proposal-id"
                     .to_string(),
                 "governance_apply",
             ));
@@ -626,7 +1025,21 @@ impl PolicyApplyCoordinator {
         }
 
         let action = executable_actions[0];
-        let adapter = RoutingPolicyAdapter::new(&self.routing_store);
+        let Some(adapter) = self.adapter_for_domain(action.domain, plan) else {
+            return Ok(blocked_apply_report(
+                plan,
+                vec![policy_blocker(
+                    PolicyBlockerKind::UnsupportedDomain,
+                    Some(action.domain),
+                    action.proposal_id.clone(),
+                    PolicyRiskLevel::High,
+                    format!("{:?} policy adapter is not registered", action.domain),
+                    "policy_adapter_registry",
+                )],
+                "Register a policy adapter before applying this domain.",
+            ));
+        };
+        let descriptor = adapter.descriptor();
         let validated = match adapter.validate(action, PolicyApplyOperation::Apply)? {
             Ok(validated) => validated,
             Err(blockers) => {
@@ -637,75 +1050,35 @@ impl PolicyApplyCoordinator {
                 ));
             }
         };
-        let routing_report = adapter.apply(&validated.proposal_id, plan.dry_run)?;
-        let mut structured_blockers = routing_report
-            .blockers
-            .iter()
-            .map(|blocker| {
-                policy_blocker(
-                    PolicyBlockerKind::AdapterRejected,
-                    Some(PolicyDomain::Routing),
-                    Some(validated.proposal_id.clone()),
-                    PolicyRiskLevel::High,
-                    blocker.clone(),
-                    RoutingPolicyAdapter::NAME,
-                )
-            })
-            .collect::<Vec<_>>();
-        let (status, applied) = if !structured_blockers.is_empty() {
-            (PolicyLedgerStatus::ApplyBlocked, false)
-        } else if plan.dry_run {
-            (PolicyLedgerStatus::DryRunPassed, false)
-        } else if routing_report.applied {
-            (PolicyLedgerStatus::Applied, true)
-        } else {
-            structured_blockers.push(policy_blocker(
-                PolicyBlockerKind::AdapterRejected,
-                Some(PolicyDomain::Routing),
-                Some(validated.proposal_id.clone()),
-                PolicyRiskLevel::High,
-                "routing policy store did not apply the proposal",
-                RoutingPolicyAdapter::NAME,
-            ));
-            (PolicyLedgerStatus::ApplyBlocked, false)
-        };
-        let blockers = blocker_messages(&structured_blockers);
-        let mut recommendations = routing_report.recommendations.clone();
-        if status == PolicyLedgerStatus::DryRunPassed {
-            recommendations.push(
-                "Governance dry run passed; rerun with --domain routing --proposal-id to apply."
-                    .to_string(),
-            );
-        }
+        let adapter_result = adapter.apply(&validated, plan.dry_run)?;
+        let blockers = blocker_messages(&adapter_result.blockers);
         let report_id = format!("policy-apply-{}", now_millis());
         let receipt = policy_action_receipt(
             report_id.clone(),
             plan,
-            status,
-            applied || plan.dry_run && status == PolicyLedgerStatus::DryRunPassed,
+            adapter_result.status,
+            adapter_result.executed,
             Some(validated.before_status),
-            Some(map_routing_status(routing_report.status)),
-            Some(RoutingPolicyAdapter::NAME.to_string()),
-            Some(format!(
-                "routing_policy_apply:{}",
-                routing_report.proposal_id
-            )),
-            structured_blockers.clone(),
-            recommendations.clone(),
+            adapter_result.after_status,
+            Some(descriptor.name),
+            adapter_result.adapter_report_id.clone(),
+            adapter_result.blockers.clone(),
+            adapter_result.recommendations.clone(),
         );
         Ok(PolicyApplyReport {
             version: POLICY_GOVERNANCE_VERSION,
             id: report_id,
             executed_at: now_secs(),
             dry_run: plan.dry_run,
-            status,
-            applied,
+            status: adapter_result.status,
+            applied: adapter_result.applied,
             plan: plan.clone(),
-            routing_report: Some(routing_report),
+            adapter_report: adapter_result.adapter_report,
+            routing_report: adapter_result.routing_report,
             blockers,
-            structured_blockers,
+            structured_blockers: adapter_result.blockers,
             receipt,
-            recommendations,
+            recommendations: adapter_result.recommendations,
         })
     }
 
@@ -733,23 +1106,23 @@ impl PolicyApplyCoordinator {
                 "governance_rollback",
             ));
         }
-        let executable_actions = executable_routing_actions(plan);
+        let executable_actions = executable_policy_actions(plan);
         if executable_actions.is_empty() {
             structured_blockers.push(policy_blocker(
                 PolicyBlockerKind::MissingTarget,
-                Some(PolicyDomain::Routing),
+                plan.domain_filter,
                 plan.proposal_id.clone(),
                 PolicyRiskLevel::High,
-                "no executable routing policy rollback action is available",
+                "no executable policy rollback action is available",
                 "governance_rollback",
             ));
         } else if executable_actions.len() > 1 {
             structured_blockers.push(policy_blocker(
                 PolicyBlockerKind::AmbiguousTarget,
-                Some(PolicyDomain::Routing),
+                plan.domain_filter,
                 None,
                 PolicyRiskLevel::High,
-                "multiple executable routing policy rollback actions are available; specify --proposal-id"
+                "multiple executable policy rollback actions are available; specify --domain and --proposal-id"
                     .to_string(),
                 "governance_rollback",
             ));
@@ -763,7 +1136,21 @@ impl PolicyApplyCoordinator {
         }
 
         let action = executable_actions[0];
-        let adapter = RoutingPolicyAdapter::new(&self.routing_store);
+        let Some(adapter) = self.adapter_for_domain(action.domain, plan) else {
+            return Ok(blocked_rollback_report(
+                plan,
+                vec![policy_blocker(
+                    PolicyBlockerKind::UnsupportedDomain,
+                    Some(action.domain),
+                    action.proposal_id.clone(),
+                    PolicyRiskLevel::High,
+                    format!("{:?} policy adapter is not registered", action.domain),
+                    "policy_adapter_registry",
+                )],
+                "Register a policy adapter before rolling back this domain.",
+            ));
+        };
+        let descriptor = adapter.descriptor();
         let validated = match adapter.validate(action, PolicyApplyOperation::Rollback)? {
             Ok(validated) => validated,
             Err(blockers) => {
@@ -774,60 +1161,49 @@ impl PolicyApplyCoordinator {
                 ));
             }
         };
-        let routing_report = adapter.rollback(&validated.proposal_id)?;
-        let status = if routing_report.rolled_back {
-            PolicyLedgerStatus::RolledBack
-        } else {
-            PolicyLedgerStatus::RollbackBlocked
-        };
-        let structured_blockers = if routing_report.rolled_back {
-            Vec::new()
-        } else {
-            routing_report
-                .recommendations
-                .iter()
-                .map(|recommendation| {
-                    policy_blocker(
-                        PolicyBlockerKind::AdapterRejected,
-                        Some(PolicyDomain::Routing),
-                        Some(validated.proposal_id.clone()),
-                        PolicyRiskLevel::High,
-                        recommendation.clone(),
-                        RoutingPolicyAdapter::NAME,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let blockers = blocker_messages(&structured_blockers);
+        let adapter_result = adapter.rollback(&validated)?;
+        let blockers = blocker_messages(&adapter_result.blockers);
         let report_id = format!("policy-rollback-{}", now_millis());
         let receipt = policy_action_receipt(
             report_id.clone(),
             plan,
-            status,
-            routing_report.rolled_back,
+            adapter_result.status,
+            adapter_result.executed,
             Some(validated.before_status),
-            Some(map_routing_status(routing_report.status)),
-            Some(RoutingPolicyAdapter::NAME.to_string()),
-            Some(format!(
-                "routing_policy_rollback:{}",
-                routing_report.proposal_id
-            )),
-            structured_blockers.clone(),
-            routing_report.recommendations.clone(),
+            adapter_result.after_status,
+            Some(descriptor.name),
+            adapter_result.adapter_report_id.clone(),
+            adapter_result.blockers.clone(),
+            adapter_result.recommendations.clone(),
         );
         Ok(PolicyRollbackReport {
             version: POLICY_GOVERNANCE_VERSION,
             id: report_id,
             executed_at: now_secs(),
-            status,
-            rolled_back: routing_report.rolled_back,
+            status: adapter_result.status,
+            rolled_back: adapter_result.rolled_back,
             plan: plan.clone(),
-            routing_report: Some(routing_report.clone()),
+            adapter_report: adapter_result.adapter_report,
+            routing_report: adapter_result.routing_report,
             blockers,
-            structured_blockers,
+            structured_blockers: adapter_result.blockers,
             receipt,
-            recommendations: routing_report.recommendations,
+            recommendations: adapter_result.recommendations,
         })
+    }
+
+    fn adapter_for_domain(
+        &self,
+        domain: PolicyDomain,
+        plan: &PolicyApplyPlan,
+    ) -> Option<Box<dyn PolicyAdapter + '_>> {
+        match domain {
+            PolicyDomain::Routing => Some(Box::new(RoutingPolicyAdapter::new(&self.routing_store))),
+            PolicyDomain::Scheduler => Some(Box::new(SchedulerPolicyAdapter::new(
+                plan.review.ledger_entry.summary.scheduler_status,
+            ))),
+            PolicyDomain::AutonomousRun | PolicyDomain::Memory | PolicyDomain::Recovery => None,
+        }
     }
 }
 
@@ -872,6 +1248,7 @@ fn build_policy_apply_plan(
     dry_run: bool,
 ) -> PolicyApplyPlan {
     let proposal_id = proposal_id.map(str::to_string);
+    let adapters = policy_adapter_descriptors(review.ledger_entry.summary.scheduler_status);
     let mut structured_blockers = Vec::new();
     if operation == PolicyApplyOperation::Apply {
         structured_blockers.extend(
@@ -979,10 +1356,12 @@ fn build_policy_apply_plan(
             PolicyApplyOperation::Apply if has_executable && dry_run => recommendations.push(
                 "Governed dry run is ready; no policy overlay will be persisted.".to_string(),
             ),
-            PolicyApplyOperation::Apply if has_executable => recommendations
-                .push("Governed routing policy apply is ready for execution.".to_string()),
-            PolicyApplyOperation::Rollback if has_executable => recommendations
-                .push("Governed routing policy rollback is ready for execution.".to_string()),
+            PolicyApplyOperation::Apply if has_executable => {
+                recommendations.push("Governed policy apply is ready for execution.".to_string())
+            }
+            PolicyApplyOperation::Rollback if has_executable => {
+                recommendations.push("Governed policy rollback is ready for execution.".to_string())
+            }
             _ => {
                 recommendations.push("No executable governed policy action is pending.".to_string())
             }
@@ -1003,6 +1382,7 @@ fn build_policy_apply_plan(
         domain_filter,
         proposal_id,
         actions,
+        adapters,
         blockers,
         structured_blockers,
         fingerprint: String::new(),
@@ -1052,7 +1432,7 @@ fn policy_apply_action_from_proposal(
                     "proposal_status",
                 ));
             }
-            let executable = proposal.domain == PolicyDomain::Routing;
+            let executable = policy_operation_supports_domain(operation, proposal.domain);
             (
                 proposal.action.clone(),
                 if structured_blockers.is_empty() && executable {
@@ -1077,7 +1457,7 @@ fn policy_apply_action_from_proposal(
                     "proposal_status",
                 ));
             }
-            let executable = proposal.domain == PolicyDomain::Routing;
+            let executable = policy_operation_supports_domain(operation, proposal.domain);
             (
                 "rollback_routing_policy_overlay".to_string(),
                 if structured_blockers.is_empty() && executable {
@@ -1090,15 +1470,15 @@ fn policy_apply_action_from_proposal(
         }
     };
 
-    if proposal.domain != PolicyDomain::Routing {
+    if !executable {
         structured_blockers.push(policy_blocker(
             PolicyBlockerKind::UnsupportedDomain,
             Some(proposal.domain),
             Some(proposal.id.clone()),
             PolicyRiskLevel::Medium,
             format!(
-                "{:?} policy actions are governance-planned only; no executable adapter is registered",
-                proposal.domain
+                "{:?} policy action is governance-planned only for {:?}",
+                proposal.domain, operation
             ),
             "policy_adapter",
         ));
@@ -1165,14 +1545,19 @@ fn policy_apply_action_from_decision(
     }
 }
 
-fn executable_routing_actions(plan: &PolicyApplyPlan) -> Vec<&PolicyApplyAction> {
+fn policy_operation_supports_domain(operation: PolicyApplyOperation, domain: PolicyDomain) -> bool {
+    matches!(
+        (operation, domain),
+        (PolicyApplyOperation::Apply, PolicyDomain::Routing)
+            | (PolicyApplyOperation::Apply, PolicyDomain::Scheduler)
+            | (PolicyApplyOperation::Rollback, PolicyDomain::Routing)
+    )
+}
+
+fn executable_policy_actions(plan: &PolicyApplyPlan) -> Vec<&PolicyApplyAction> {
     plan.actions
         .iter()
-        .filter(|action| {
-            action.domain == PolicyDomain::Routing
-                && action.executable
-                && action.blockers.is_empty()
-        })
+        .filter(|action| action.executable && action.blockers.is_empty())
         .collect()
 }
 
@@ -1204,6 +1589,7 @@ fn blocked_apply_report(
         status: PolicyLedgerStatus::ApplyBlocked,
         applied: false,
         plan: plan.clone(),
+        adapter_report: None,
         routing_report: None,
         blockers,
         structured_blockers,
@@ -1239,6 +1625,7 @@ fn blocked_rollback_report(
         status: PolicyLedgerStatus::RollbackBlocked,
         rolled_back: false,
         plan: plan.clone(),
+        adapter_report: None,
         routing_report: None,
         blockers,
         structured_blockers,
@@ -1323,6 +1710,7 @@ fn policy_plan_fingerprint(plan: &PolicyApplyPlan) -> String {
                 "source_fingerprint": action.source_fingerprint,
             })
         }).collect::<Vec<_>>(),
+        "adapters": plan.adapters,
         "blockers": plan.structured_blockers,
     }))
 }
@@ -1647,6 +2035,9 @@ pub fn review_policy_governance(input: PolicyGovernanceInput) -> PolicyGovernanc
     }
 
     if let Some(state) = &input.scheduler_state {
+        let proposal = scheduler_policy_proposal(state);
+        gates.extend(proposal.gates.clone());
+        proposals.push(proposal);
         decisions.push(PolicyDecision {
             domain: PolicyDomain::Scheduler,
             action: "scheduler_state_observed".to_string(),
@@ -1777,6 +2168,66 @@ fn routing_policy_proposal(proposal: &RoutingPolicyProposal) -> PolicyProposal {
             label: "route_policy_proposal".to_string(),
             path: None,
             id: Some(proposal.id.clone()),
+        }],
+        gates,
+    }
+}
+
+fn scheduler_policy_proposal(state: &SchedulerDaemonState) -> PolicyProposal {
+    let needs_adjustment = state.status == SchedulerDaemonStatus::Blocked || state.tick_count >= 3;
+    let status = if needs_adjustment {
+        PolicyLedgerStatus::Proposed
+    } else {
+        PolicyLedgerStatus::Observed
+    };
+    let risk = match state.status {
+        SchedulerDaemonStatus::Blocked => PolicyRiskLevel::High,
+        SchedulerDaemonStatus::Running if state.tick_count >= 3 => PolicyRiskLevel::Medium,
+        SchedulerDaemonStatus::Running => PolicyRiskLevel::Low,
+        SchedulerDaemonStatus::Idle | SchedulerDaemonStatus::Stopped => PolicyRiskLevel::Low,
+    };
+    let summary = if state.status == SchedulerDaemonStatus::Blocked {
+        format!(
+            "scheduler daemon is blocked after {} tick(s): {}",
+            state.tick_count, state.message
+        )
+    } else if state.tick_count >= 3 {
+        format!(
+            "scheduler daemon has run {} tick(s); dry-run policy adaptation before persistent changes",
+            state.tick_count
+        )
+    } else {
+        format!("scheduler daemon status is {:?}", state.status)
+    };
+    let gates = vec![PolicyGate {
+        domain: PolicyDomain::Scheduler,
+        name: "scheduler_adapter_dry_run_only".to_string(),
+        passed: true,
+        severity: PolicyRiskLevel::Medium,
+        blocks_apply: false,
+        reason:
+            "scheduler policy adapter can validate proposed changes without mutating daemon state"
+                .to_string(),
+    }];
+    PolicyProposal {
+        id: format!("scheduler-policy-{}", state.tick_count),
+        domain: PolicyDomain::Scheduler,
+        action: "dry_run_scheduler_policy_adjustment".to_string(),
+        status,
+        risk,
+        summary,
+        source_fingerprint: stable_hash_json(&json!({
+            "version": state.version,
+            "status": state.status,
+            "tick_count": state.tick_count,
+            "updated_at": state.updated_at,
+            "message": state.message,
+            "last_tick": state.last_tick,
+        })),
+        references: vec![PolicyReference {
+            label: "scheduler_daemon_state".to_string(),
+            path: Some(state.lock_path.clone()),
+            id: Some(format!("tick-{}", state.tick_count)),
         }],
         gates,
     }
@@ -1981,6 +2432,15 @@ fn policy_recommendations(
                 .to_string(),
         );
     }
+    if proposals.iter().any(|proposal| {
+        proposal.domain == PolicyDomain::Scheduler
+            && proposal.status == PolicyLedgerStatus::Proposed
+    }) {
+        recommendations.push(
+            "Validate scheduler policy proposals with a governed dry run before changing daemon behavior."
+                .to_string(),
+        );
+    }
     if decisions.iter().any(|decision| {
         decision.domain == PolicyDomain::AutonomousRun
             && decision.status == PolicyLedgerStatus::Blocked
@@ -2095,6 +2555,8 @@ mod tests {
                 productive_scheduler_ticks: 0,
                 worker_dispatches: 0,
                 worker_completions: 0,
+                policy_lifecycle_events: 0,
+                policy_replay_anomalies: 0,
             },
             scores: AutonomousEvaluationScores {
                 task_completion_score: 0.0,
@@ -2204,6 +2666,20 @@ mod tests {
                 recommendations: Vec::new(),
             },
             audit: Vec::new(),
+        }
+    }
+
+    fn scheduler_state(status: SchedulerDaemonStatus, tick_count: u64) -> SchedulerDaemonState {
+        SchedulerDaemonState {
+            version: 1,
+            status,
+            pid: 0,
+            started_at: 1,
+            updated_at: tick_count.max(1),
+            tick_count,
+            lock_path: PathBuf::from("scheduler.lock"),
+            last_tick: None,
+            message: format!("test scheduler status {status:?}"),
         }
     }
 
@@ -2317,6 +2793,129 @@ mod tests {
     }
 
     #[test]
+    fn apply_plan_exposes_cross_domain_adapter_descriptors() {
+        let dir = std::env::temp_dir().join(format!("himalaya-policy-adapters-{}", now_millis()));
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: None,
+            routing_proposals: Vec::new(),
+            applied_routing_policy: None,
+            scheduler_state: Some(scheduler_state(SchedulerDaemonStatus::Running, 3)),
+        });
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir));
+        let plan = coordinator.plan_apply(review, None, None, true);
+
+        assert!(plan.adapters.iter().any(|adapter| {
+            adapter.domain == PolicyDomain::Routing
+                && adapter.supports_persistent_apply
+                && adapter.supports_rollback
+        }));
+        assert!(plan.adapters.iter().any(|adapter| {
+            adapter.domain == PolicyDomain::Scheduler
+                && adapter.supports_dry_run
+                && !adapter.supports_persistent_apply
+        }));
+        assert!(plan
+            .adapters
+            .iter()
+            .any(|adapter| adapter.domain == PolicyDomain::Memory && adapter.planned_only));
+    }
+
+    #[test]
+    fn review_creates_scheduler_policy_proposal() {
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: None,
+            routing_proposals: Vec::new(),
+            applied_routing_policy: None,
+            scheduler_state: Some(scheduler_state(SchedulerDaemonStatus::Running, 3)),
+        });
+
+        let proposal = review
+            .ledger_entry
+            .proposals
+            .iter()
+            .find(|proposal| proposal.domain == PolicyDomain::Scheduler)
+            .expect("scheduler proposal should exist");
+        assert_eq!(proposal.id, "scheduler-policy-3");
+        assert_eq!(proposal.status, PolicyLedgerStatus::Proposed);
+        assert_eq!(proposal.action, "dry_run_scheduler_policy_adjustment");
+        assert!(!proposal.source_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn coordinator_dry_runs_scheduler_policy_adapter() {
+        let dir = std::env::temp_dir().join(format!("himalaya-policy-scheduler-{}", now_millis()));
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: None,
+            routing_proposals: Vec::new(),
+            applied_routing_policy: None,
+            scheduler_state: Some(scheduler_state(SchedulerDaemonStatus::Running, 3)),
+        });
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir));
+        let plan = coordinator.plan_apply(
+            review,
+            Some(PolicyDomain::Scheduler),
+            Some("scheduler-policy-3"),
+            true,
+        );
+
+        let report = coordinator.apply(&plan).expect("scheduler dry run report");
+
+        assert_eq!(plan.status, PolicyLedgerStatus::Planned);
+        assert_eq!(report.status, PolicyLedgerStatus::DryRunPassed);
+        assert!(!report.applied);
+        assert!(report.routing_report.is_none());
+        assert_eq!(report.receipt.adapter.as_deref(), Some("scheduler_policy"));
+        match report.adapter_report {
+            Some(PolicyAdapterReport::SchedulerDryRun(report)) => {
+                assert!(report.dry_run);
+                assert_eq!(report.status, PolicyLedgerStatus::DryRunPassed);
+                assert_eq!(
+                    report.scheduler_status,
+                    Some(SchedulerDaemonStatus::Running)
+                );
+                assert!(report.blockers.is_empty());
+            }
+            other => panic!("expected scheduler dry run adapter report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coordinator_blocks_scheduler_persistent_apply() {
+        let dir =
+            std::env::temp_dir().join(format!("himalaya-policy-scheduler-block-{}", now_millis()));
+        let review = review_policy_governance(PolicyGovernanceInput {
+            autonomous_evaluation: None,
+            routing_proposals: Vec::new(),
+            applied_routing_policy: None,
+            scheduler_state: Some(scheduler_state(SchedulerDaemonStatus::Running, 3)),
+        });
+        let coordinator = PolicyApplyCoordinator::new(RoutingPolicyProposalStore::new(&dir));
+        let plan = coordinator.plan_apply(
+            review,
+            Some(PolicyDomain::Scheduler),
+            Some("scheduler-policy-3"),
+            false,
+        );
+
+        let report = coordinator.apply(&plan).expect("scheduler apply report");
+
+        assert_eq!(report.status, PolicyLedgerStatus::ApplyBlocked);
+        assert!(!report.applied);
+        assert_eq!(report.receipt.adapter.as_deref(), Some("scheduler_policy"));
+        assert!(report
+            .structured_blockers
+            .iter()
+            .any(|blocker| blocker.kind == PolicyBlockerKind::UnsupportedDomain));
+        match report.adapter_report {
+            Some(PolicyAdapterReport::SchedulerDryRun(report)) => {
+                assert!(!report.dry_run);
+                assert_eq!(report.status, PolicyLedgerStatus::ApplyBlocked);
+            }
+            other => panic!("expected scheduler dry run adapter report, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn coordinator_blocks_stale_policy_plan() {
         let dir = std::env::temp_dir().join(format!("himalaya-policy-stale-{}", now_millis()));
         let proposal = routing_proposal("route-proposal-1");
@@ -2372,7 +2971,7 @@ mod tests {
         assert!(report
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("requires explicit --domain routing")));
+            .any(|blocker| blocker.contains("requires explicit --domain and --proposal-id")));
         assert!(crate::load_applied_routing_policy(&dir)
             .expect("applied policy lookup should succeed")
             .is_none());

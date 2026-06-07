@@ -203,16 +203,17 @@ pub use policy_engine::{
     PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use policy_governance::{
-    load_policy_governance_ledger, policy_apply_plan_ledger_entry,
+    load_policy_governance_ledger, policy_adapter_descriptors, policy_apply_plan_ledger_entry,
     policy_apply_report_ledger_entry, policy_governance_ledger_path,
     policy_rollback_report_ledger_entry, replay_policy_lifecycle, review_policy_governance,
-    PolicyActionReceipt, PolicyApplyAction, PolicyApplyCoordinator, PolicyApplyOperation,
-    PolicyApplyPlan, PolicyApplyReport, PolicyBlocker, PolicyBlockerKind, PolicyConflict,
-    PolicyDecision, PolicyDomain, PolicyGate, PolicyGovernanceInput, PolicyGovernanceLedger,
-    PolicyGovernanceReview, PolicyLedgerEntry, PolicyLedgerLoad, PolicyLedgerStatus,
-    PolicyLedgerWarning, PolicyLifecycle, PolicyLifecycleEvent, PolicyLifecycleReplay,
-    PolicyLifecycleReplaySummary, PolicyProposal, PolicyReference, PolicyReplayAnomaly,
-    PolicyReviewSummary, PolicyRiskLevel, PolicyRollbackReport, POLICY_GOVERNANCE_LEDGER_FILE,
+    PolicyActionReceipt, PolicyAdapterDescriptor, PolicyAdapterReport, PolicyApplyAction,
+    PolicyApplyCoordinator, PolicyApplyOperation, PolicyApplyPlan, PolicyApplyReport,
+    PolicyBlocker, PolicyBlockerKind, PolicyConflict, PolicyDecision, PolicyDomain, PolicyGate,
+    PolicyGovernanceInput, PolicyGovernanceLedger, PolicyGovernanceReview, PolicyLedgerEntry,
+    PolicyLedgerLoad, PolicyLedgerStatus, PolicyLedgerWarning, PolicyLifecycle,
+    PolicyLifecycleEvent, PolicyLifecycleReplay, PolicyLifecycleReplaySummary, PolicyProposal,
+    PolicyReference, PolicyReplayAnomaly, PolicyReviewSummary, PolicyRiskLevel,
+    PolicyRollbackReport, SchedulerPolicyDryRunReport, POLICY_GOVERNANCE_LEDGER_FILE,
     POLICY_GOVERNANCE_VERSION,
 };
 pub use prompt::{

@@ -1635,7 +1635,7 @@ fn parse_policy_cli_command(args: &[String]) -> Result<PolicyCliCommand, String>
         Some(("apply", rest)) => parse_policy_apply_args(rest),
         Some(("rollback", rest)) => parse_policy_rollback_args(rest),
         Some((other, _)) => Err(format!(
-            "unknown policy command: {other}\nUsage: Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|replay [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]|rollback [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]]"
+            "unknown policy command: {other}\nUsage: Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|replay [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing|scheduler] [--proposal-id ID] [--limit N] [--max-ticks N]|rollback [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]]"
         )),
     }
 }
@@ -1803,7 +1803,7 @@ fn parse_policy_apply_args(args: &[String]) -> Result<PolicyCliCommand, String> 
             }
             other => {
                 return Err(format!(
-                    "unknown policy apply argument: {other}\nUsage: Himalaya policy apply [--dry-run] [--domain routing] [--proposal-id ID] [--limit N] [--max-ticks N]"
+                    "unknown policy apply argument: {other}\nUsage: Himalaya policy apply [--dry-run] [--domain routing|scheduler] [--proposal-id ID] [--limit N] [--max-ticks N]"
                 ));
             }
         }
@@ -4288,6 +4288,7 @@ fn build_autonomous_evaluation_input(
     let route_feedback = load_route_feedback_store()?;
     let autonomous_runs =
         runtime::load_autonomous_run_reports_with_diagnostics(&scheduler_state_dir()?, limit)?;
+    let policy_replay = runtime::replay_policy_lifecycle(&policy_governance_dir()?, limit).ok();
     Ok(runtime::AutonomousEvaluationInput {
         tasks,
         task_memory,
@@ -4295,6 +4296,7 @@ fn build_autonomous_evaluation_input(
         autonomous_runs,
         permission_mode,
         requested_max_ticks: max_ticks,
+        policy_replay,
     })
 }
 
@@ -15304,7 +15306,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|replay [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing] [--proposal-id ID]|rollback [--domain routing] [--proposal-id ID]]"
+        "  Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]|replay [--limit N]|plan [--limit N] [--max-ticks N]|apply [--dry-run] [--domain routing|scheduler] [--proposal-id ID]|rollback [--domain routing] [--proposal-id ID]]"
     )?;
     writeln!(
         out,

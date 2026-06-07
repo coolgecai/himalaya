@@ -1049,6 +1049,7 @@ fn governed_policy_apply_emits_stream_json_events() {
     assert_eq!(plan["recorded"], true);
     assert_eq!(plan["plan"]["status"], "planned");
     assert!(plan["plan"]["actions"].is_array());
+    assert!(plan["plan"]["adapters"].is_array());
 
     let dry_run_events = run_stream_json_subcommand(
         &workspace,
@@ -1068,6 +1069,7 @@ fn governed_policy_apply_emits_stream_json_events() {
         .expect("policy apply event should be emitted");
     assert_eq!(dry_run["apply"]["status"], "dry_run_passed");
     assert_eq!(dry_run["apply"]["applied"], false);
+    assert_eq!(dry_run["apply"]["adapter_report"]["kind"], "routing_apply");
     assert!(dry_run["apply"]["routing_report"].is_object());
     assert!(dry_run["apply"]["receipt"].is_object());
 
