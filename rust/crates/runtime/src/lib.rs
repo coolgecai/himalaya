@@ -46,6 +46,7 @@ pub mod recovery_recipes;
 mod remote;
 pub mod route_feedback_store;
 pub mod route_optimizer;
+pub mod route_policy_store;
 pub mod runtime_events;
 pub mod sandbox;
 mod session;
@@ -225,6 +226,14 @@ pub use route_optimizer::{
     evaluate_routing_feedback, replay_routing_optimizer, RoutingEvaluationReport,
     RoutingHealthEntry, RoutingHealthStatus, RoutingOptimizerReplayReport, RoutingPolicyCandidate,
     RoutingPolicyCandidateKind, RoutingReplayChange, ROUTING_OPTIMIZER_VERSION,
+};
+pub use route_policy_store::{
+    applied_routing_policy_path, build_routing_policy_proposal, load_applied_routing_policy,
+    load_routing_policy_proposals, routing_policy_proposals_path, AppliedRoutingPolicy,
+    RoutingPolicyApplyReport, RoutingPolicyProposal, RoutingPolicyProposalChange,
+    RoutingPolicyProposalSnapshot, RoutingPolicyProposalStatus, RoutingPolicyProposalStore,
+    RoutingPolicyRollbackReport, RoutingPolicySafetyGate, RoutingPolicySafetyLevel,
+    APPLIED_ROUTING_POLICY_FILE, ROUTING_POLICY_PROPOSALS_FILE, ROUTING_POLICY_PROPOSAL_VERSION,
 };
 pub use runtime_events::{
     append_runtime_event_log, read_runtime_event_log, RuntimeEvent, RuntimeEventEnvelope,

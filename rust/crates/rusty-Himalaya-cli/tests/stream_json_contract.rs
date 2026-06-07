@@ -69,6 +69,10 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "route_feedback_summary",
         "route_optimizer_report",
         "route_optimizer_replay",
+        "route_policy_proposal",
+        "route_policy_apply",
+        "route_policy_rollback",
+        "route_policy_list",
         "benchmark_suite",
         "benchmark_task",
         "benchmark_run",
@@ -817,6 +821,101 @@ fn stream_json_model_routing_config_switches_after_feedback() {
                 .as_str()
                 .is_some_and(|reason| reason.contains("adaptive route selected"))
     }));
+}
+
+#[test]
+fn route_policy_proposal_emits_stream_json_event() {
+    let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-route-policy-proposal"));
+    workspace.create();
+    fs::create_dir_all(workspace.root.join(".Himalaya/routes"))
+        .expect("route feedback dir should exist");
+    fs::write(
+        workspace.root.join(".Himalaya/routes/feedback.json"),
+        serde_json::to_string(&json!({
+            "feedback": [
+                {
+                    "task_id": "task-1",
+                    "route": {
+                        "phase": "coding",
+                        "model": "sonnet",
+                        "provider": null,
+                        "reason": "test",
+                        "confidence": 0.8,
+                        "fallback_model": null
+                    },
+                    "succeeded": false,
+                    "verification_passed": false,
+                    "recovery_triggered": true,
+                    "timestamp": 1,
+                    "note": "failed"
+                },
+                {
+                    "task_id": "task-2",
+                    "route": {
+                        "phase": "coding",
+                        "model": "sonnet",
+                        "provider": null,
+                        "reason": "test",
+                        "confidence": 0.8,
+                        "fallback_model": null
+                    },
+                    "succeeded": false,
+                    "verification_passed": false,
+                    "recovery_triggered": true,
+                    "timestamp": 2,
+                    "note": "failed"
+                },
+                {
+                    "task_id": "task-3",
+                    "route": {
+                        "phase": "coding",
+                        "model": "opus",
+                        "provider": null,
+                        "reason": "fallback",
+                        "confidence": 0.9,
+                        "fallback_model": null
+                    },
+                    "succeeded": true,
+                    "verification_passed": true,
+                    "recovery_triggered": false,
+                    "timestamp": 3,
+                    "note": "ok"
+                }
+            ]
+        }))
+        .expect("feedback should serialize"),
+    )
+    .expect("feedback should write");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_Himalaya"));
+    command
+        .current_dir(&workspace.root)
+        .env_clear()
+        .env("Himalaya_CONFIG_HOME", &workspace.config_home)
+        .env("HOME", &workspace.home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args([
+            "--output-format",
+            "stream-json",
+            "routes",
+            "propose",
+            "--min-samples",
+            "2",
+            "--threshold-percent",
+            "50",
+        ]);
+    let output = command.output().expect("Himalaya should launch");
+    assert_success(&output);
+
+    let events = parse_stream_json_stdout(&output.stdout);
+    assert_all_events_are_versioned(&events);
+    let event = events
+        .iter()
+        .find(|event| event["type"] == "route_policy_proposal")
+        .expect("route policy proposal event should be emitted");
+    assert!(event["proposal"].is_object());
+    assert!(event["proposal"]["changes"].is_array());
 }
 
 #[test]
@@ -1716,6 +1815,22 @@ fn assert_stream_event_schema(event: &Value) {
         "route_optimizer_replay" => assert!(
             event["replay"].is_object(),
             "route_optimizer_replay requires replay object: {event:?}"
+        ),
+        "route_policy_proposal" => assert!(
+            event["proposal"].is_object(),
+            "route_policy_proposal requires proposal object: {event:?}"
+        ),
+        "route_policy_apply" => assert!(
+            event["apply"].is_object(),
+            "route_policy_apply requires apply object: {event:?}"
+        ),
+        "route_policy_rollback" => assert!(
+            event["rollback"].is_object(),
+            "route_policy_rollback requires rollback object: {event:?}"
+        ),
+        "route_policy_list" => assert!(
+            event["proposals"].is_array(),
+            "route_policy_list requires proposals array: {event:?}"
         ),
         "benchmark_suite" => {
             assert_non_empty_string(&event["suite_id"]);

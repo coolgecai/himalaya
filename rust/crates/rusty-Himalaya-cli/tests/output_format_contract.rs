@@ -1079,6 +1079,80 @@ fn route_feedback_summary_emits_metric_summaries() {
     assert_eq!(replay["type"], "route_optimizer_replay");
     assert_eq!(replay["replay"]["feedback_count"], 4);
     assert!(replay["replay"]["changed_routes"].is_array());
+
+    let proposal = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "routes",
+            "propose",
+            "--min-samples",
+            "2",
+            "--threshold-percent",
+            "50",
+        ],
+    );
+    assert_eq!(proposal["type"], "route_policy_proposal");
+    assert_eq!(proposal["proposal"]["feedback_count"], 4);
+    assert!(proposal["proposal"]["changes"]
+        .as_array()
+        .expect("proposal changes")
+        .iter()
+        .any(|change| change["proposed_model"] == "opus"));
+    assert!(proposal["proposals_path"]
+        .as_str()
+        .expect("proposal path")
+        .ends_with("policy-proposals.json"));
+    let proposal_id = proposal["proposal"]["id"]
+        .as_str()
+        .expect("proposal id should exist")
+        .to_string();
+
+    let listed = assert_json_command(&root, &["--output-format", "json", "routes", "list"]);
+    assert_eq!(listed["type"], "route_policy_list");
+    assert_eq!(listed["proposals"].as_array().expect("proposals").len(), 1);
+
+    let dry_run = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "routes",
+            "apply",
+            &proposal_id,
+            "--dry-run",
+        ],
+    );
+    assert_eq!(dry_run["type"], "route_policy_apply");
+    assert_eq!(dry_run["apply"]["dry_run"], true);
+    assert_eq!(dry_run["apply"]["applied"], false);
+    assert!(dry_run["apply"]["blockers"]
+        .as_array()
+        .expect("dry-run blockers")
+        .is_empty());
+
+    let applied = assert_json_command(
+        &root,
+        &["--output-format", "json", "routes", "apply", &proposal_id],
+    );
+    assert_eq!(applied["type"], "route_policy_apply");
+    assert_eq!(applied["apply"]["applied"], true);
+    assert!(root.join(".Himalaya/routes/applied-policy.json").exists());
+
+    let rollback = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "routes",
+            "rollback",
+            &proposal_id,
+        ],
+    );
+    assert_eq!(rollback["type"], "route_policy_rollback");
+    assert_eq!(rollback["rollback"]["rolled_back"], true);
+    assert!(!root.join(".Himalaya/routes/applied-policy.json").exists());
 }
 
 #[test]

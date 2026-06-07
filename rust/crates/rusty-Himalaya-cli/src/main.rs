@@ -331,7 +331,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Routes {
             command,
             output_format,
-        } => run_route_command(command, output_format)?,
+            model,
+        } => run_route_command(command, output_format, &model)?,
         CliAction::Local {
             command,
             output_format,
@@ -506,6 +507,7 @@ enum CliAction {
     Routes {
         command: RouteCliCommand,
         output_format: CliOutputFormat,
+        model: String,
     },
     Local {
         command: LocalCliCommand,
@@ -782,6 +784,7 @@ enum CronCliCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RouteCliCommand {
     FeedbackSummary,
+    List,
     Optimize {
         min_samples: usize,
         threshold_percent: u8,
@@ -789,6 +792,17 @@ enum RouteCliCommand {
     Replay {
         min_samples: usize,
         threshold_percent: u8,
+    },
+    Propose {
+        min_samples: usize,
+        threshold_percent: u8,
+    },
+    Apply {
+        proposal_id: String,
+        dry_run: bool,
+    },
+    Rollback {
+        proposal_id: String,
     },
 }
 
@@ -1200,6 +1214,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "routes" | "route" => Ok(CliAction::Routes {
             command: parse_route_cli_command(&rest[1..])?,
             output_format,
+            model,
         }),
         "test" | "lint" | "build" | "review" | "diagnostics" | "workspace" | "cwd" => {
             Ok(CliAction::Local {
@@ -1412,7 +1427,10 @@ fn parse_benchmark_parallelism(value: &str) -> Result<usize, String> {
 }
 
 fn parse_route_cli_command(args: &[String]) -> Result<RouteCliCommand, String> {
-    match args.split_first().map(|(command, rest)| (command.as_str(), rest)) {
+    match args
+        .split_first()
+        .map(|(command, rest)| (command.as_str(), rest))
+    {
         None | Some(("feedback" | "feedback-summary" | "summary", [])) => {
             Ok(RouteCliCommand::FeedbackSummary)
         }
@@ -1420,24 +1438,44 @@ fn parse_route_cli_command(args: &[String]) -> Result<RouteCliCommand, String> {
             [subcommand] if matches!(subcommand.as_str(), "summary" | "summaries") => {
                 Ok(RouteCliCommand::FeedbackSummary)
             }
-            _ => Err(
-                "Usage: Himalaya routes [feedback summary|feedback-summary|summary|optimize [--min-samples N] [--threshold-percent N]|replay [--min-samples N] [--threshold-percent N]]".to_string(),
-            ),
+            _ => Err(route_usage().to_string()),
         },
-        Some(("optimize", rest)) => parse_route_optimizer_args(rest, "optimize")
-            .map(|(min_samples, threshold_percent)| RouteCliCommand::Optimize {
-                min_samples,
-                threshold_percent,
-            }),
-        Some(("replay", rest)) => parse_route_optimizer_args(rest, "replay")
-            .map(|(min_samples, threshold_percent)| RouteCliCommand::Replay {
-                min_samples,
-                threshold_percent,
-            }),
+        Some(("list", [])) => Ok(RouteCliCommand::List),
+        Some(("optimize", rest)) => {
+            parse_route_optimizer_args(rest, "optimize").map(|(min_samples, threshold_percent)| {
+                RouteCliCommand::Optimize {
+                    min_samples,
+                    threshold_percent,
+                }
+            })
+        }
+        Some(("replay", rest)) => {
+            parse_route_optimizer_args(rest, "replay").map(|(min_samples, threshold_percent)| {
+                RouteCliCommand::Replay {
+                    min_samples,
+                    threshold_percent,
+                }
+            })
+        }
+        Some(("propose", rest)) => {
+            parse_route_optimizer_args(rest, "propose").map(|(min_samples, threshold_percent)| {
+                RouteCliCommand::Propose {
+                    min_samples,
+                    threshold_percent,
+                }
+            })
+        }
+        Some(("apply", rest)) => parse_route_apply_args(rest),
+        Some(("rollback", rest)) => parse_route_rollback_args(rest),
         Some((other, _)) => Err(format!(
-            "unknown routes command: {other}\nUsage: Himalaya routes [feedback summary|feedback-summary|summary|optimize [--min-samples N] [--threshold-percent N]|replay [--min-samples N] [--threshold-percent N]]"
+            "unknown routes command: {other}\n{}",
+            route_usage()
         )),
     }
+}
+
+fn route_usage() -> &'static str {
+    "Usage: Himalaya routes [feedback summary|feedback-summary|summary|list|optimize [--min-samples N] [--threshold-percent N]|replay [--min-samples N] [--threshold-percent N]|propose [--min-samples N] [--threshold-percent N]|apply <proposal-id> [--dry-run]|rollback <proposal-id>]"
 }
 
 fn parse_route_optimizer_args(args: &[String], command: &str) -> Result<(usize, u8), String> {
@@ -1476,6 +1514,54 @@ fn parse_route_optimizer_args(args: &[String], command: &str) -> Result<(usize, 
         }
     }
     Ok((min_samples, threshold_percent))
+}
+
+fn parse_route_apply_args(args: &[String]) -> Result<RouteCliCommand, String> {
+    let mut proposal_id = None;
+    let mut dry_run = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
+            value if value.starts_with("--") => {
+                return Err(format!(
+                    "unknown routes apply argument: {value}\nUsage: Himalaya routes apply <proposal-id> [--dry-run]"
+                ));
+            }
+            value => {
+                if proposal_id.is_some() {
+                    return Err(
+                        "routes apply accepts one proposal id\nUsage: Himalaya routes apply <proposal-id> [--dry-run]"
+                            .to_string(),
+                    );
+                }
+                proposal_id = Some(value.to_string());
+                index += 1;
+            }
+        }
+    }
+    let proposal_id =
+        proposal_id.ok_or_else(|| "routes apply requires a proposal id".to_string())?;
+    Ok(RouteCliCommand::Apply {
+        proposal_id,
+        dry_run,
+    })
+}
+
+fn parse_route_rollback_args(args: &[String]) -> Result<RouteCliCommand, String> {
+    match args {
+        [proposal_id] => Ok(RouteCliCommand::Rollback {
+            proposal_id: proposal_id.clone(),
+        }),
+        [] => Err("routes rollback requires a proposal id".to_string()),
+        _ => Err(
+            "routes rollback accepts one proposal id\nUsage: Himalaya routes rollback <proposal-id>"
+                .to_string(),
+        ),
+    }
 }
 
 fn parse_percent_u8(name: &str, value: &str) -> Result<u8, String> {
@@ -8605,6 +8691,10 @@ fn render_route_output_text(value: &Value) -> String {
     match value["type"].as_str() {
         Some("route_optimizer_report") => render_route_optimizer_text(value),
         Some("route_optimizer_replay") => render_route_optimizer_replay_text(value),
+        Some("route_policy_proposal") => render_route_policy_proposal_text(value),
+        Some("route_policy_apply") => render_route_policy_apply_text(value),
+        Some("route_policy_rollback") => render_route_policy_rollback_text(value),
+        Some("route_policy_list") => render_route_policy_list_text(value),
         _ => render_route_feedback_summary_text(value),
     }
 }
@@ -8731,9 +8821,74 @@ fn render_route_optimizer_replay_text(value: &Value) -> String {
     lines.join("\n")
 }
 
+fn render_route_policy_proposal_text(value: &Value) -> String {
+    let proposal = &value["proposal"];
+    let id = proposal["id"].as_str().unwrap_or("unknown");
+    let status = proposal["status"].as_str().unwrap_or("unknown");
+    let changes = proposal["changes"].as_array().cloned().unwrap_or_default();
+    let blockers = proposal["gates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|gate| {
+            gate["passed"].as_bool() == Some(false) && gate["level"].as_str() == Some("blocker")
+        })
+        .count();
+    let mut lines = vec![format!(
+        "Route policy proposal\n  ID          {id}\n  Status      {status}\n  Changes     {}\n  Blockers    {blockers}",
+        changes.len()
+    )];
+    for change in changes {
+        let phase = change["phase"].as_str().unwrap_or("unknown");
+        let current = change["current_model"].as_str().unwrap_or("unknown");
+        let proposed = change["proposed_model"].as_str().unwrap_or("unknown");
+        lines.push(format!("  - {phase}: {current} -> {proposed}"));
+    }
+    lines.join("\n")
+}
+
+fn render_route_policy_apply_text(value: &Value) -> String {
+    let apply = &value["apply"];
+    let proposal_id = apply["proposal_id"].as_str().unwrap_or("unknown");
+    let dry_run = apply["dry_run"].as_bool().unwrap_or(false);
+    let applied = apply["applied"].as_bool().unwrap_or(false);
+    let blockers = apply["blockers"].as_array().cloned().unwrap_or_default();
+    let mut lines = vec![format!(
+        "Route policy apply\n  Proposal    {proposal_id}\n  Dry run     {dry_run}\n  Applied     {applied}\n  Blockers    {}",
+        blockers.len()
+    )];
+    for blocker in blockers.iter().filter_map(Value::as_str) {
+        lines.push(format!("  - {blocker}"));
+    }
+    lines.join("\n")
+}
+
+fn render_route_policy_rollback_text(value: &Value) -> String {
+    let rollback = &value["rollback"];
+    let proposal_id = rollback["proposal_id"].as_str().unwrap_or("unknown");
+    let rolled_back = rollback["rolled_back"].as_bool().unwrap_or(false);
+    format!("Route policy rollback\n  Proposal    {proposal_id}\n  Rolled back {rolled_back}")
+}
+
+fn render_route_policy_list_text(value: &Value) -> String {
+    let proposals = value["proposals"].as_array().cloned().unwrap_or_default();
+    let mut lines = vec![format!(
+        "Route policy proposals\n  Proposals  {}",
+        proposals.len()
+    )];
+    for proposal in proposals {
+        let id = proposal["id"].as_str().unwrap_or("unknown");
+        let status = proposal["status"].as_str().unwrap_or("unknown");
+        let changes = proposal["changes"].as_array().map_or(0, Vec::len);
+        lines.push(format!("  - {id}: {status}, changes={changes}"));
+    }
+    lines.join("\n")
+}
+
 fn run_route_command(
     command: RouteCliCommand,
     output_format: CliOutputFormat,
+    model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         RouteCliCommand::FeedbackSummary => {
@@ -8744,6 +8899,19 @@ fn run_route_command(
                     "feedback_count": store.feedback().len(),
                     "summaries": store.summaries(),
                     "feedback_path": route_feedback_dir()?.join("feedback.json"),
+                }),
+                output_format,
+            )?;
+        }
+        RouteCliCommand::List => {
+            let store = load_route_policy_proposal_store()?;
+            let proposals = store.list()?;
+            print_route_output(
+                json!({
+                    "type": "route_policy_list",
+                    "proposals": proposals,
+                    "proposals_path": store.proposals_path(),
+                    "applied_policy_path": store.applied_policy_path(),
                 }),
                 output_format,
             )?;
@@ -8772,7 +8940,7 @@ fn run_route_command(
             threshold_percent,
         } => {
             let store = load_route_feedback_store()?;
-            let policy = runtime::MoERoutingPolicy::balanced(DEFAULT_MODEL);
+            let policy = load_effective_model_routing_policy(model)?;
             let replay = runtime::replay_routing_optimizer(
                 policy,
                 &store,
@@ -8784,6 +8952,54 @@ fn run_route_command(
                     "type": "route_optimizer_replay",
                     "replay": replay,
                     "feedback_path": route_feedback_dir()?.join("feedback.json"),
+                }),
+                output_format,
+            )?;
+        }
+        RouteCliCommand::Propose {
+            min_samples,
+            threshold_percent,
+        } => {
+            let feedback = load_route_feedback_store()?;
+            let baseline_policy = load_effective_model_routing_policy(model)?;
+            let proposal_store = load_route_policy_proposal_store()?;
+            let proposal = proposal_store.propose(
+                baseline_policy,
+                &feedback,
+                min_samples,
+                f32::from(threshold_percent) / 100.0,
+            )?;
+            print_route_output(
+                json!({
+                    "type": "route_policy_proposal",
+                    "proposal": proposal,
+                    "proposals_path": proposal_store.proposals_path(),
+                    "applied_policy_path": proposal_store.applied_policy_path(),
+                }),
+                output_format,
+            )?;
+        }
+        RouteCliCommand::Apply {
+            proposal_id,
+            dry_run,
+        } => {
+            let proposal_store = load_route_policy_proposal_store()?;
+            let apply = proposal_store.apply(&proposal_id, dry_run)?;
+            print_route_output(
+                json!({
+                    "type": "route_policy_apply",
+                    "apply": apply,
+                }),
+                output_format,
+            )?;
+        }
+        RouteCliCommand::Rollback { proposal_id } => {
+            let proposal_store = load_route_policy_proposal_store()?;
+            let rollback = proposal_store.rollback(&proposal_id)?;
+            print_route_output(
+                json!({
+                    "type": "route_policy_rollback",
+                    "rollback": rollback,
                 }),
                 output_format,
             )?;
@@ -9120,6 +9336,26 @@ fn load_route_feedback_store() -> Result<runtime::RouteFeedbackStore, Box<dyn st
     Ok(runtime::RouteFeedbackStore::load_from_dir(
         &route_feedback_dir()?,
     )?)
+}
+
+fn load_route_policy_proposal_store(
+) -> Result<runtime::RoutingPolicyProposalStore, Box<dyn std::error::Error>> {
+    Ok(runtime::RoutingPolicyProposalStore::new(
+        route_feedback_dir()?,
+    ))
+}
+
+fn load_effective_model_routing_policy(
+    model: &str,
+) -> Result<runtime::MoERoutingPolicy, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let runtime_config = ConfigLoader::default_for(&cwd).load()?;
+    let configured = runtime_config
+        .feature_config()
+        .model_routing()
+        .to_policy(model);
+    let applied = runtime::load_applied_routing_policy(&route_feedback_dir()?)?;
+    Ok(applied.map_or(configured, |applied| applied.policy))
 }
 
 fn save_route_feedback_store(
@@ -12295,9 +12531,12 @@ fn build_runtime_with_plugin_state(
     if stream_json {
         runtime = runtime.with_runtime_event_reporter(CliRuntimeEventReporter);
     }
-    runtime = runtime.with_model_router(runtime::ModelRouter::new(
-        feature_config.model_routing().to_policy(&model),
-    ));
+    let route_policy_dir = workspace_root.join(".Himalaya").join("routes");
+    let mut model_routing_policy = feature_config.model_routing().to_policy(&model);
+    if let Ok(Some(applied)) = runtime::load_applied_routing_policy(&route_policy_dir) {
+        model_routing_policy = applied.policy;
+    }
+    runtime = runtime.with_model_router(runtime::ModelRouter::new(model_routing_policy));
     if let Ok(store) = load_route_feedback_store() {
         runtime = runtime.with_workspace_route_feedback(store.feedback().to_vec());
     }
@@ -14369,10 +14608,13 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Supervise local worker lifecycle state and durable scheduler ticks"
     )?;
-    writeln!(out, "  Himalaya routes [feedback summary|summary]")?;
     writeln!(
         out,
-        "      Summarize adaptive model route feedback by phase and model"
+        "  Himalaya routes [feedback summary|summary|list|optimize|replay|propose|apply <proposal-id> [--dry-run]|rollback <proposal-id>]"
+    )?;
+    writeln!(
+        out,
+        "      Summarize feedback, evaluate routing, and manage safe MoE policy proposals"
     )?;
     writeln!(
         out,
@@ -15880,11 +16122,45 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_route_cli_command(&["list".to_string()]).expect("routes list should parse"),
+            RouteCliCommand::List
+        );
+        assert_eq!(
+            parse_route_cli_command(
+                &["propose".to_string(), "--threshold-percent=70".to_string(),]
+            )
+            .expect("routes propose should parse"),
+            RouteCliCommand::Propose {
+                min_samples: 2,
+                threshold_percent: 70,
+            }
+        );
+        assert_eq!(
+            parse_route_cli_command(&[
+                "apply".to_string(),
+                "route-proposal-1".to_string(),
+                "--dry-run".to_string(),
+            ])
+            .expect("routes apply should parse"),
+            RouteCliCommand::Apply {
+                proposal_id: "route-proposal-1".to_string(),
+                dry_run: true,
+            }
+        );
+        assert_eq!(
+            parse_route_cli_command(&["rollback".to_string(), "route-proposal-1".to_string(),])
+                .expect("routes rollback should parse"),
+            RouteCliCommand::Rollback {
+                proposal_id: "route-proposal-1".to_string(),
+            }
+        );
+        assert_eq!(
             parse_args(&["routes".to_string(), "summary".to_string()])
                 .expect("routes summary should parse"),
             CliAction::Routes {
                 command: RouteCliCommand::FeedbackSummary,
                 output_format: CliOutputFormat::Text,
+                model: DEFAULT_MODEL.to_string(),
             }
         );
         assert_eq!(
