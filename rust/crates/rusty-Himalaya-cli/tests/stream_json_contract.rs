@@ -1437,6 +1437,33 @@ fn daemon_report_emits_policy_review_event() {
 }
 
 #[test]
+fn daemon_status_and_logs_emit_health_checkpoint() {
+    let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-daemon-health"));
+    workspace.create();
+
+    let status_events = run_stream_json_subcommand(&workspace, &["tasks", "daemon", "status"]);
+    let status = status_events
+        .iter()
+        .find(|event| event["type"] == "task_scheduler_daemon_status")
+        .expect("daemon status event should be emitted");
+    assert!(status["health"].is_object());
+    assert!(status["health"]["status"].is_string());
+    assert!(status["health"]["next_action"].is_string());
+    assert!(status["health"]["safe_to_iterate"].is_boolean());
+
+    let logs_events =
+        run_stream_json_subcommand(&workspace, &["tasks", "daemon", "logs", "--limit", "1"]);
+    let logs = logs_events
+        .iter()
+        .find(|event| event["type"] == "task_scheduler_daemon_logs")
+        .expect("daemon logs event should be emitted");
+    assert!(logs["health"].is_object());
+    assert!(logs["health"]["status"].is_string());
+    assert!(logs["health"]["next_action"].is_string());
+    assert!(logs["health"]["safe_to_iterate"].is_boolean());
+}
+
+#[test]
 fn autonomous_benchmark_emits_evaluation_event() {
     let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-autonomous-benchmark"));
     workspace.create();
@@ -1952,6 +1979,12 @@ fn assert_stream_event_schema(event: &Value) {
                     "task_scheduler_daemon_status policy_recommendation must be object when present: {event:?}"
                 );
             }
+            if event.get("health").is_some() {
+                assert!(
+                    event["health"].is_object(),
+                    "task_scheduler_daemon_status health must be object when present: {event:?}"
+                );
+            }
         }
         "task_scheduler_daemon_logs" => {
             assert!(
@@ -1978,6 +2011,12 @@ fn assert_stream_event_schema(event: &Value) {
                 assert!(
                     event["policy_recommendation"].is_object(),
                     "task_scheduler_daemon_logs policy_recommendation must be object when present: {event:?}"
+                );
+            }
+            if event.get("health").is_some() {
+                assert!(
+                    event["health"].is_object(),
+                    "task_scheduler_daemon_logs health must be object when present: {event:?}"
                 );
             }
         }

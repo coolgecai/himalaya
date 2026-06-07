@@ -530,10 +530,20 @@ fn task_scheduler_tick_persists_durable_status() {
     );
     assert_eq!(daemon_status["summary"]["considered_runs"], 1);
     assert_eq!(daemon_status["policy_recommendation"]["action"], "continue");
+    assert!(daemon_status["health"].is_object());
+    assert!(daemon_status["health"]["status"].is_string());
+    assert!(daemon_status["health"]["next_action"].is_string());
+    assert!(daemon_status["health"]["safe_to_iterate"].is_boolean());
     assert!(daemon_status["runs_path"]
         .as_str()
         .expect("runs path")
         .contains(".Himalaya/scheduler/runs.jsonl"));
+    let daemon_status_text = run_Himalaya(&root, &["tasks", "daemon", "status"], &[]);
+    assert!(daemon_status_text.status.success());
+    let daemon_status_stdout =
+        String::from_utf8(daemon_status_text.stdout).expect("daemon status text should be utf8");
+    assert!(daemon_status_stdout.contains("Health checkpoint"));
+    assert!(daemon_status_stdout.contains("Next action"));
 
     let daemon_logs = assert_json_command(
         &root,
@@ -568,6 +578,9 @@ fn task_scheduler_tick_persists_durable_status() {
         daemon_logs["policy_recommendation"]["recommended_max_ticks"],
         1
     );
+    assert!(daemon_logs["health"].is_object());
+    assert!(daemon_logs["health"]["status"].is_string());
+    assert!(daemon_logs["health"]["next_action"].is_string());
 
     let daemon_report = assert_json_command(
         &root,

@@ -65,6 +65,8 @@ This makes dry-run policy simulations visible without confusing them with persis
 
 Those same commands now include `health` in JSON and stream-json output. Text output prints the health status, headline, next action, and safe-to-iterate/apply-policy flags before lower-level counters.
 
+`Himalaya tasks daemon status` and `Himalaya tasks daemon logs` expose the same `health` view as a lightweight checkpoint. They do not include the full integration report, but their text output still shows the next operator action and whether iteration or governed policy apply is safe.
+
 ## Recommended Workflow
 
 Use the read-only diagnostics before running or applying anything:

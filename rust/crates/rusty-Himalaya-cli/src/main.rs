@@ -4611,6 +4611,38 @@ fn render_autonomous_daemon_report_text(
     lines.join("\n")
 }
 
+fn render_autonomous_health_checkpoint_text(health: &Value) -> String {
+    let status = health["status"].as_str().unwrap_or("unknown");
+    let next_action = health["next_action"]
+        .as_str()
+        .unwrap_or("Run daemon report for full diagnostics.");
+    let mut lines = vec![
+        "Health checkpoint".to_string(),
+        format!("  Status            {status}"),
+    ];
+    if let Some(headline) = health["headline"].as_str() {
+        lines.push(format!("  Summary           {headline}"));
+    }
+    lines.push(format!("  Next action       {next_action}"));
+    lines.push(format!(
+        "  Safety            iterate={} apply_policy={}",
+        health["safe_to_iterate"].as_bool().unwrap_or(false),
+        health["safe_to_apply_policy"].as_bool().unwrap_or(false)
+    ));
+    if let Some(blockers) = health["blockers"].as_array() {
+        for blocker in blockers.iter().filter_map(Value::as_str).take(3) {
+            lines.push(format!("  Blocker           {blocker}"));
+        }
+    }
+    if let Some(warnings) = health["warnings"].as_array() {
+        for warning in warnings.iter().filter_map(Value::as_str).take(3) {
+            lines.push(format!("  Warning           {warning}"));
+        }
+    }
+    lines.extend(render_autonomous_guidance_lines(Some(health), status));
+    lines.join("\n")
+}
+
 fn render_autonomous_guidance_lines(health: Option<&Value>, fallback_status: &str) -> Vec<String> {
     let status = health
         .and_then(|health| health["status"].as_str())
@@ -11407,6 +11439,9 @@ fn run_task_daemon_command(
             let state = daemon.load_state().ok();
             let latest_run = coordinator.latest_run().ok().flatten();
             let review = coordinator.review_policy(report_limit, 1)?;
+            let integration_review =
+                build_autonomous_integration_review(report_limit, 1, permission_mode)?;
+            let health = serde_json::to_value(&integration_review.health)?;
             match output_format {
                 CliOutputFormat::Text => {
                     if let Some(run) = &latest_run {
@@ -11428,6 +11463,8 @@ fn run_task_daemon_command(
                         review.recommendation.requested_max_ticks,
                         review.recommendation.recommended_max_ticks
                     );
+                    println!();
+                    println!("{}", render_autonomous_health_checkpoint_text(&health));
                 }
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_task_output(
@@ -11437,6 +11474,7 @@ fn run_task_daemon_command(
                             "latest_run":latest_run,
                             "summary":review.summary,
                             "policy_recommendation":review.recommendation,
+                            "health":health,
                             "state_path":daemon.state_path(),
                             "events_path":daemon.events_path(),
                             "runs_path":coordinator.runs_path(),
@@ -11476,6 +11514,9 @@ fn run_task_daemon_command(
             let events = events.into_iter().skip(start).collect::<Vec<_>>();
             let recent_runs = coordinator.load_runs(limit).unwrap_or_default();
             let review = coordinator.review_policy(limit, 1)?;
+            let integration_review =
+                build_autonomous_integration_review(limit, 1, permission_mode)?;
+            let health = serde_json::to_value(&integration_review.health)?;
             match output_format {
                 CliOutputFormat::Text => {
                     if events.is_empty() && recent_runs.is_empty() {
@@ -11499,6 +11540,8 @@ fn run_task_daemon_command(
                         review.recommendation.requested_max_ticks,
                         review.recommendation.recommended_max_ticks
                     );
+                    println!();
+                    println!("{}", render_autonomous_health_checkpoint_text(&health));
                 }
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_task_output(
@@ -11508,6 +11551,7 @@ fn run_task_daemon_command(
                             "runs":recent_runs,
                             "summary":review.summary,
                             "policy_recommendation":review.recommendation,
+                            "health":health,
                             "events_path":daemon.events_path(),
                             "runs_path":coordinator.runs_path(),
                         }),
@@ -15943,14 +15987,14 @@ mod tests {
         parse_history_count, parse_policy_cli_command, parse_route_cli_command,
         parse_task_cli_command, parse_worker_cli_command, permission_policy, print_help_to,
         push_output_block, render_autonomous_daemon_report_text,
-        render_autonomous_integration_text, render_autonomous_preflight_blocked_text,
-        render_autonomous_replay_text, render_config_report, render_diff_report,
-        render_diff_report_for, render_governed_policy_apply_text, render_maturity_matrix_text,
-        render_memory_report, render_policy_apply_plan_text, render_policy_replay_text,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        render_autonomous_health_checkpoint_text, render_autonomous_integration_text,
+        render_autonomous_preflight_blocked_text, render_autonomous_replay_text,
+        render_config_report, render_diff_report, render_diff_report_for,
+        render_governed_policy_apply_text, render_maturity_matrix_text, render_memory_report,
+        render_policy_apply_plan_text, render_policy_replay_text, render_prompt_history_report,
+        render_repl_help, render_resume_usage, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, slash_command_status, status_context,
         stream_json_event, summarize_tool_payload_for_markdown, validate_no_args,
         write_mcp_server_fixture, BenchmarkCliCommand, CliAction, CliOutputFormat, CliToolExecutor,
@@ -16192,6 +16236,31 @@ mod tests {
         assert!(text.contains("Safety            iterate=true apply_policy=false"));
         assert!(text.contains("Blocker           policy replay has unresolved anomalies"));
         assert!(text.contains("Review policy ledger anomalies before applying routing changes."));
+    }
+
+    #[test]
+    fn autonomous_health_checkpoint_text_surfaces_next_operator_step() {
+        let text = render_autonomous_health_checkpoint_text(&json!({
+            "status": "degraded",
+            "headline": "Autonomous loop is usable but missing complete evidence.",
+            "next_action": "Run daemon evaluate and replay before another apply.",
+            "safe_to_iterate": true,
+            "safe_to_apply_policy": false,
+            "warnings": [
+                "routing policy replay needs evidence"
+            ],
+            "blockers": []
+        }));
+
+        assert!(text.contains("Health checkpoint"));
+        assert!(text.contains("Status            degraded"));
+        assert!(
+            text.contains("Next action       Run daemon evaluate and replay before another apply.")
+        );
+        assert!(text.contains("Safety            iterate=true apply_policy=false"));
+        assert!(text.contains("Warning           routing policy replay needs evidence"));
+        assert!(text.contains("Guidance:"));
+        assert!(text.contains("Keep policy apply in dry-run mode until health is healthy."));
     }
 
     #[test]

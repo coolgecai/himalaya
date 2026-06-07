@@ -1951,6 +1951,9 @@
             "policy_recommendation": {
               "type": "object"
             },
+            "health": {
+              "type": "object"
+            },
             "runs_path": {
               "type": "string"
             }
@@ -1995,6 +1998,9 @@
               "type": "object"
             },
             "policy_recommendation": {
+              "type": "object"
+            },
+            "health": {
               "type": "object"
             },
             "runs_path": {
