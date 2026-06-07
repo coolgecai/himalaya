@@ -37,8 +37,8 @@ use api::{
 use autonomous_cli::{
     render_autonomous_benchmark_text, render_autonomous_daemon_report_text,
     render_autonomous_evaluation_text, render_autonomous_health_checkpoint_text,
-    render_autonomous_integration_text, render_autonomous_preflight_blocked_text,
-    render_autonomous_replay_text,
+    render_autonomous_integration_text, render_autonomous_policy_summary_text,
+    render_autonomous_preflight_blocked_text, render_autonomous_replay_text,
 };
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
@@ -11086,12 +11086,7 @@ fn run_task_daemon_command(
                         "daemon {}: {} ({} autonomous tick(s))",
                         run.status, run.message, run.tick_count
                     );
-                    println!(
-                        "policy {}: max_ticks {} -> {}",
-                        review.recommendation.action_label(),
-                        review.recommendation.requested_max_ticks,
-                        review.recommendation.recommended_max_ticks
-                    );
+                    println!("{}", render_autonomous_policy_summary_text(&review));
                 }
                 CliOutputFormat::Json | CliOutputFormat::StreamJson => {
                     print_task_output(
@@ -11134,12 +11129,7 @@ fn run_task_daemon_command(
                     } else {
                         println!("daemon has not run");
                     }
-                    println!(
-                        "policy {}: max_ticks {} -> {}",
-                        review.recommendation.action_label(),
-                        review.recommendation.requested_max_ticks,
-                        review.recommendation.recommended_max_ticks
-                    );
+                    println!("{}", render_autonomous_policy_summary_text(&review));
                     println!();
                     println!("{}", render_autonomous_health_checkpoint_text(&health));
                 }
@@ -11211,12 +11201,7 @@ fn run_task_daemon_command(
                             event.seq, event.event, event.status, event.message
                         );
                     }
-                    println!(
-                        "policy {}: max_ticks {} -> {}",
-                        review.recommendation.action_label(),
-                        review.recommendation.requested_max_ticks,
-                        review.recommendation.recommended_max_ticks
-                    );
+                    println!("{}", render_autonomous_policy_summary_text(&review));
                     println!();
                     println!("{}", render_autonomous_health_checkpoint_text(&health));
                 }
@@ -15685,8 +15670,8 @@ mod tests {
     };
     use crate::autonomous_cli::{
         render_autonomous_daemon_report_text, render_autonomous_health_checkpoint_text,
-        render_autonomous_integration_text, render_autonomous_preflight_blocked_text,
-        render_autonomous_replay_text,
+        render_autonomous_integration_text, render_autonomous_policy_summary_text,
+        render_autonomous_preflight_blocked_text, render_autonomous_replay_text,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -16011,10 +15996,16 @@ mod tests {
         let text = render_autonomous_daemon_report_text(&review, Path::new("runs.jsonl"));
 
         assert!(text.contains("Daemon report"));
-        assert!(text.contains("Runs             3"));
-        assert!(text.contains("Policy           reduce_ticks"));
-        assert!(text.contains("Max ticks        4 -> 2"));
-        assert!(text.contains("Reason           blocked rate is elevated"));
+        assert!(text.contains("Runs              3"));
+        assert!(text.contains("Policy            reduce_ticks"));
+        assert!(text.contains("Max ticks         4 -> 2"));
+        assert!(text.contains("Reason            blocked rate is elevated"));
+
+        let summary = render_autonomous_policy_summary_text(&review);
+        assert_eq!(
+            summary,
+            "  Policy            reduce_ticks: max_ticks 4 -> 2"
+        );
     }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {

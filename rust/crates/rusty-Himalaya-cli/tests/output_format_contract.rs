@@ -765,7 +765,7 @@ fn autonomous_diagnostics_user_path_surfaces_next_actions() {
             "Next action",
             "Safety",
             "Guidance:",
-            "policy",
+            "Policy",
         ],
     );
 
@@ -777,7 +777,7 @@ fn autonomous_diagnostics_user_path_surfaces_next_actions() {
             "Next action",
             "Safety",
             "Guidance:",
-            "policy",
+            "Policy",
         ],
     );
 

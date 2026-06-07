@@ -2,6 +2,63 @@ use std::path::Path;
 
 use serde_json::Value;
 
+const FIELD_WIDTH: usize = 18;
+
+const TITLE_PREFLIGHT_BLOCKED: &str = "Autonomous preflight blocked";
+const TITLE_EVALUATION: &str = "Autonomous evaluation";
+const TITLE_INTEGRATION: &str = "Autonomous integration";
+const TITLE_DAEMON_REPORT: &str = "Daemon report";
+const TITLE_HEALTH_CHECKPOINT: &str = "Health checkpoint";
+const TITLE_TRACE_REPLAY: &str = "Autonomous trace replay";
+
+const SECTION_DECISIONS: &str = "Decisions:";
+const SECTION_GUIDANCE: &str = "Guidance:";
+const SECTION_RECOMMENDATIONS: &str = "Recommendations:";
+const SECTION_REPLAY_STAGES: &str = "Replay stages:";
+
+const LABEL_AUTONOMOUS_SUCCESS: &str = "Autonomous success";
+const LABEL_BLOCKED_RATE: &str = "Blocked rate";
+const LABEL_BLOCKER: &str = "Blocker";
+const LABEL_CHANGED_DECISIONS: &str = "Changed decisions";
+const LABEL_CONSECUTIVE_BLOCK: &str = "Consecutive block";
+const LABEL_CURRENT_POLICY: &str = "Current policy";
+const LABEL_INVARIANTS: &str = "Invariants";
+const LABEL_MAX_TICKS: &str = "Max ticks";
+const LABEL_MEMORY_REUSE: &str = "Memory reuse";
+const LABEL_MEMORY_ROUTES: &str = "Memory/routes";
+const LABEL_NEXT_ACTION: &str = "Next action";
+const LABEL_OPERATION: &str = "Operation";
+const LABEL_POLICY: &str = "Policy";
+const LABEL_POLICY_REPLAY: &str = "Policy replay";
+const LABEL_REASON: &str = "Reason";
+const LABEL_ROUTE_FEEDBACK: &str = "Route feedback";
+const LABEL_ROUTING_ADAPTATION: &str = "Routing adaptation";
+const LABEL_RUNS: &str = "Runs";
+const LABEL_RUNS_PATH: &str = "Runs path";
+const LABEL_SAFETY: &str = "Safety";
+const LABEL_SCHEDULER: &str = "Scheduler";
+const LABEL_STATUS: &str = "Status";
+const LABEL_SUMMARY: &str = "Summary";
+const LABEL_TASKS: &str = "Tasks";
+const LABEL_TOTAL_SCORE: &str = "Total score";
+const LABEL_WARNING: &str = "Warning";
+const LABEL_WORKERS: &str = "Workers";
+
+fn field_line(label: &str, value: impl std::fmt::Display) -> String {
+    if label.len() >= FIELD_WIDTH {
+        format!("  {label} {value}")
+    } else {
+        format!("  {label:<FIELD_WIDTH$}{value}")
+    }
+}
+
+fn safety_line(safe_to_iterate: bool, safe_to_apply_policy: bool) -> String {
+    field_line(
+        LABEL_SAFETY,
+        format!("iterate={safe_to_iterate} apply_policy={safe_to_apply_policy}"),
+    )
+}
+
 pub(crate) fn render_autonomous_preflight_blocked_text(value: &Value) -> String {
     let operation = value["operation"].as_str().unwrap_or("operation");
     let status = value["status"].as_str().unwrap_or("unknown");
@@ -9,23 +66,22 @@ pub(crate) fn render_autonomous_preflight_blocked_text(value: &Value) -> String 
         .as_str()
         .unwrap_or("Inspect daemon report.");
     let mut lines = vec![
-        "Autonomous preflight blocked".to_string(),
-        format!("  Operation         {operation}"),
-        format!("  Status            {status}"),
-        format!("  Next action       {next_action}"),
-        format!(
-            "  Safety            iterate={} apply_policy={}",
+        TITLE_PREFLIGHT_BLOCKED.to_string(),
+        field_line(LABEL_OPERATION, operation),
+        field_line(LABEL_STATUS, status),
+        field_line(LABEL_NEXT_ACTION, next_action),
+        safety_line(
             value["safe_to_iterate"].as_bool().unwrap_or(false),
-            value["safe_to_apply_policy"].as_bool().unwrap_or(false)
+            value["safe_to_apply_policy"].as_bool().unwrap_or(false),
         ),
     ];
     if let Some(blockers) = value["health"]["blockers"].as_array() {
         for blocker in blockers.iter().filter_map(Value::as_str).take(5) {
-            lines.push(format!("  Blocker           {blocker}"));
+            lines.push(field_line(LABEL_BLOCKER, blocker));
         }
     }
     if let Some(recommendations) = value["recommendations"].as_array() {
-        lines.push("Recommendations:".to_string());
+        lines.push(SECTION_RECOMMENDATIONS.to_string());
         for recommendation in recommendations.iter().filter_map(Value::as_str).take(5) {
             lines.push(format!("  - {recommendation}"));
         }
@@ -51,30 +107,33 @@ pub(crate) fn render_autonomous_evaluation_text(value: &Value) -> String {
         * 100.0;
     let memory = scores["memory_reuse_score"].as_f64().unwrap_or_default() * 100.0;
     let mut lines = vec![
-        "Autonomous evaluation".to_string(),
-        format!("  Total score       {total:.0}%"),
-        format!("  Autonomous success {success:.0}%"),
-        format!("  Routing adaptation {routing:.0}%"),
-        format!("  Memory reuse       {memory:.0}%"),
-        format!(
-            "  Tasks             {} complete / {} total",
-            counters["completed_tasks"].as_u64().unwrap_or(0),
-            counters["tasks"].as_u64().unwrap_or(0)
+        TITLE_EVALUATION.to_string(),
+        field_line(LABEL_TOTAL_SCORE, format!("{total:.0}%")),
+        field_line(LABEL_AUTONOMOUS_SUCCESS, format!("{success:.0}%")),
+        field_line(LABEL_ROUTING_ADAPTATION, format!("{routing:.0}%")),
+        field_line(LABEL_MEMORY_REUSE, format!("{memory:.0}%")),
+        field_line(
+            LABEL_TASKS,
+            format!(
+                "{} complete / {} total",
+                counters["completed_tasks"].as_u64().unwrap_or(0),
+                counters["tasks"].as_u64().unwrap_or(0)
+            ),
         ),
-        format!(
-            "  Runs              {}",
-            counters["autonomous_runs"].as_u64().unwrap_or(0)
+        field_line(
+            LABEL_RUNS,
+            counters["autonomous_runs"].as_u64().unwrap_or(0),
         ),
-        format!(
-            "  Route feedback    {}",
-            counters["route_feedback_entries"].as_u64().unwrap_or(0)
+        field_line(
+            LABEL_ROUTE_FEEDBACK,
+            counters["route_feedback_entries"].as_u64().unwrap_or(0),
         ),
     ];
     if let Some(path) = value["runs_path"].as_str() {
-        lines.push(format!("  Runs path         {path}"));
+        lines.push(field_line(LABEL_RUNS_PATH, path));
     }
     if let Some(recommendations) = report["recommendations"].as_array() {
-        lines.push("Recommendations:".to_string());
+        lines.push(SECTION_RECOMMENDATIONS.to_string());
         for recommendation in recommendations.iter().filter_map(Value::as_str) {
             lines.push(format!("  - {recommendation}"));
         }
@@ -108,60 +167,77 @@ pub(crate) fn render_autonomous_integration_text(value: &Value) -> String {
                 .count()
         })
         .unwrap_or(0);
-    let mut lines = vec!["Autonomous integration".to_string()];
+    let mut lines = vec![TITLE_INTEGRATION.to_string()];
     if let Some(health) = health {
-        lines.push(format!("  Status            {status}"));
+        lines.push(field_line(LABEL_STATUS, status));
         if let Some(headline) = health["headline"].as_str() {
-            lines.push(format!("  Summary           {headline}"));
+            lines.push(field_line(LABEL_SUMMARY, headline));
         }
         if let Some(next_action) = health["next_action"].as_str() {
-            lines.push(format!("  Next action       {next_action}"));
+            lines.push(field_line(LABEL_NEXT_ACTION, next_action));
         }
-        lines.push(format!(
-            "  Safety            iterate={} apply_policy={}",
+        lines.push(safety_line(
             health["safe_to_iterate"].as_bool().unwrap_or(false),
-            health["safe_to_apply_policy"].as_bool().unwrap_or(false)
+            health["safe_to_apply_policy"].as_bool().unwrap_or(false),
         ));
         if let Some(blockers) = health["blockers"].as_array() {
             for blocker in blockers.iter().filter_map(Value::as_str).take(3) {
-                lines.push(format!("  Blocker           {blocker}"));
+                lines.push(field_line(LABEL_BLOCKER, blocker));
             }
         }
     } else {
-        lines.push(format!("  Status            {status}"));
+        lines.push(field_line(LABEL_STATUS, status));
     }
     lines.extend([
-        format!(
-            "  Tasks             {} total / {} runnable / {} blocked",
-            summary["task_count"].as_u64().unwrap_or(0),
-            summary["runnable_task_count"].as_u64().unwrap_or(0),
-            summary["blocked_task_count"].as_u64().unwrap_or(0)
+        field_line(
+            LABEL_TASKS,
+            format!(
+                "{} total / {} runnable / {} blocked",
+                summary["task_count"].as_u64().unwrap_or(0),
+                summary["runnable_task_count"].as_u64().unwrap_or(0),
+                summary["blocked_task_count"].as_u64().unwrap_or(0)
+            ),
         ),
-        format!(
-            "  Scheduler         {}, {} tick(s)",
-            summary["scheduler_status"].as_str().unwrap_or("unknown"),
-            summary["scheduler_tick_count"].as_u64().unwrap_or(0)
+        field_line(
+            LABEL_SCHEDULER,
+            format!(
+                "{}, {} tick(s)",
+                summary["scheduler_status"].as_str().unwrap_or("unknown"),
+                summary["scheduler_tick_count"].as_u64().unwrap_or(0)
+            ),
         ),
-        format!(
-            "  Workers           {} total / {} active / {} blocked",
-            summary["worker_count"].as_u64().unwrap_or(0),
-            summary["active_worker_count"].as_u64().unwrap_or(0),
-            summary["blocked_worker_count"].as_u64().unwrap_or(0)
+        field_line(
+            LABEL_WORKERS,
+            format!(
+                "{} total / {} active / {} blocked",
+                summary["worker_count"].as_u64().unwrap_or(0),
+                summary["active_worker_count"].as_u64().unwrap_or(0),
+                summary["blocked_worker_count"].as_u64().unwrap_or(0)
+            ),
         ),
-        format!(
-            "  Memory/routes     {} memory / {} route feedback",
-            summary["task_memory_entries"].as_u64().unwrap_or(0),
-            summary["route_feedback_entries"].as_u64().unwrap_or(0)
+        field_line(
+            LABEL_MEMORY_ROUTES,
+            format!(
+                "{} memory / {} route feedback",
+                summary["task_memory_entries"].as_u64().unwrap_or(0),
+                summary["route_feedback_entries"].as_u64().unwrap_or(0)
+            ),
         ),
-        format!(
-            "  Policy replay     {} lifecycle(s), {} anomalie(s)",
-            summary["policy_lifecycle_count"].as_u64().unwrap_or(0),
-            summary["policy_anomaly_count"].as_u64().unwrap_or(0)
+        field_line(
+            LABEL_POLICY_REPLAY,
+            format!(
+                "{} lifecycle(s), {} anomalie(s)",
+                summary["policy_lifecycle_count"].as_u64().unwrap_or(0),
+                summary["policy_anomaly_count"].as_u64().unwrap_or(0)
+            ),
         ),
-        format!("  Invariants        {failed} failed / {warnings} warning(s)"),
+        field_line(
+            LABEL_INVARIANTS,
+            format!("{failed} failed / {warnings} warning(s)"),
+        ),
     ]);
     if let Some(stages) = report["replay"]["stages"].as_array() {
-        lines.push("Replay stages:".to_string());
+        lines.push(SECTION_REPLAY_STAGES.to_string());
         for stage in stages.iter().take(8) {
             let name = stage["name"].as_str().unwrap_or("stage");
             let status = stage["status"].as_str().unwrap_or("unknown");
@@ -169,7 +245,7 @@ pub(crate) fn render_autonomous_integration_text(value: &Value) -> String {
         }
     }
     if let Some(recommendations) = report["recommendations"].as_array() {
-        lines.push("Recommendations:".to_string());
+        lines.push(SECTION_RECOMMENDATIONS.to_string());
         for recommendation in recommendations.iter().filter_map(Value::as_str).take(5) {
             lines.push(format!("  - {recommendation}"));
         }
@@ -182,20 +258,46 @@ pub(crate) fn render_autonomous_daemon_report_text(
     review: &runtime::AutonomousPolicyReview,
     runs_path: &Path,
 ) -> String {
-    let mut lines = vec![format!(
-        "Daemon report\n  Runs             {}\n  Blocked rate     {:.0}%\n  Consecutive block {}\n  Policy           {}\n  Max ticks        {} -> {}\n  Runs path        {}",
-        review.summary.considered_runs,
-        review.summary.blocked_rate * 100.0,
-        review.summary.consecutive_blocked_runs,
-        review.recommendation.action_label(),
-        review.recommendation.requested_max_ticks,
-        review.recommendation.recommended_max_ticks,
-        runs_path.display()
-    )];
+    let mut lines = vec![
+        TITLE_DAEMON_REPORT.to_string(),
+        field_line(LABEL_RUNS, review.summary.considered_runs),
+        field_line(
+            LABEL_BLOCKED_RATE,
+            format!("{:.0}%", review.summary.blocked_rate * 100.0),
+        ),
+        field_line(
+            LABEL_CONSECUTIVE_BLOCK,
+            review.summary.consecutive_blocked_runs,
+        ),
+        field_line(LABEL_POLICY, review.recommendation.action_label()),
+        field_line(
+            LABEL_MAX_TICKS,
+            format!(
+                "{} -> {}",
+                review.recommendation.requested_max_ticks,
+                review.recommendation.recommended_max_ticks
+            ),
+        ),
+        field_line(LABEL_RUNS_PATH, runs_path.display()),
+    ];
     for reason in &review.recommendation.reasons {
-        lines.push(format!("  Reason           {reason}"));
+        lines.push(field_line(LABEL_REASON, reason));
     }
     lines.join("\n")
+}
+
+pub(crate) fn render_autonomous_policy_summary_text(
+    review: &runtime::AutonomousPolicyReview,
+) -> String {
+    field_line(
+        LABEL_POLICY,
+        format!(
+            "{}: max_ticks {} -> {}",
+            review.recommendation.action_label(),
+            review.recommendation.requested_max_ticks,
+            review.recommendation.recommended_max_ticks
+        ),
+    )
 }
 
 pub(crate) fn render_autonomous_health_checkpoint_text(health: &Value) -> String {
@@ -204,26 +306,25 @@ pub(crate) fn render_autonomous_health_checkpoint_text(health: &Value) -> String
         .as_str()
         .unwrap_or("Run daemon report for full diagnostics.");
     let mut lines = vec![
-        "Health checkpoint".to_string(),
-        format!("  Status            {status}"),
+        TITLE_HEALTH_CHECKPOINT.to_string(),
+        field_line(LABEL_STATUS, status),
     ];
     if let Some(headline) = health["headline"].as_str() {
-        lines.push(format!("  Summary           {headline}"));
+        lines.push(field_line(LABEL_SUMMARY, headline));
     }
-    lines.push(format!("  Next action       {next_action}"));
-    lines.push(format!(
-        "  Safety            iterate={} apply_policy={}",
+    lines.push(field_line(LABEL_NEXT_ACTION, next_action));
+    lines.push(safety_line(
         health["safe_to_iterate"].as_bool().unwrap_or(false),
-        health["safe_to_apply_policy"].as_bool().unwrap_or(false)
+        health["safe_to_apply_policy"].as_bool().unwrap_or(false),
     ));
     if let Some(blockers) = health["blockers"].as_array() {
         for blocker in blockers.iter().filter_map(Value::as_str).take(3) {
-            lines.push(format!("  Blocker           {blocker}"));
+            lines.push(field_line(LABEL_BLOCKER, blocker));
         }
     }
     if let Some(warnings) = health["warnings"].as_array() {
         for warning in warnings.iter().filter_map(Value::as_str).take(3) {
-            lines.push(format!("  Warning           {warning}"));
+            lines.push(field_line(LABEL_WARNING, warning));
         }
     }
     lines.extend(render_autonomous_guidance_lines(Some(health), status));
@@ -240,7 +341,7 @@ fn render_autonomous_guidance_lines(health: Option<&Value>, fallback_status: &st
     let safe_to_apply_policy = health
         .and_then(|health| health["safe_to_apply_policy"].as_bool())
         .unwrap_or(status == "healthy");
-    let mut lines = vec!["Guidance:".to_string()];
+    let mut lines = vec![SECTION_GUIDANCE.to_string()];
     match status {
         "blocked" => {
             lines.push(
@@ -295,21 +396,24 @@ pub(crate) fn render_autonomous_replay_text(value: &Value) -> String {
         .as_u64()
         .unwrap_or(1);
     let mut lines = vec![
-        "Autonomous trace replay".to_string(),
-        format!("  Runs              {considered}"),
-        format!("  Changed decisions {changed}"),
-        format!("  Current policy    {action} ({recommended_ticks} tick(s))"),
-        format!(
-            "  Next action       {}",
+        TITLE_TRACE_REPLAY.to_string(),
+        field_line(LABEL_RUNS, considered),
+        field_line(LABEL_CHANGED_DECISIONS, changed),
+        field_line(
+            LABEL_CURRENT_POLICY,
+            format!("{action} ({recommended_ticks} tick(s))"),
+        ),
+        field_line(
+            LABEL_NEXT_ACTION,
             if changed > 0 {
                 "Review changed decisions before policy apply"
             } else {
                 "Keep current autonomous policy"
-            }
+            },
         ),
     ];
     if let Some(decisions) = replay["decisions"].as_array() {
-        lines.push("Decisions:".to_string());
+        lines.push(SECTION_DECISIONS.to_string());
         for decision in decisions.iter().take(10) {
             let run_id = decision["run_id"].as_str().unwrap_or("run");
             let observed = decision["observed_status"].as_str().unwrap_or("unknown");
@@ -325,7 +429,7 @@ pub(crate) fn render_autonomous_replay_text(value: &Value) -> String {
         }
     }
     if let Some(recommendations) = replay["recommendations"].as_array() {
-        lines.push("Recommendations:".to_string());
+        lines.push(SECTION_RECOMMENDATIONS.to_string());
         for recommendation in recommendations.iter().filter_map(Value::as_str) {
             lines.push(format!("  - {recommendation}"));
         }
