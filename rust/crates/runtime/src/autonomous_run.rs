@@ -97,7 +97,7 @@ pub struct AutonomousRunLoad {
     pub warnings: Vec<AutonomousRunReadWarning>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AutonomousRunStatusCounts {
     pub idle: usize,
     pub running: usize,
@@ -110,7 +110,7 @@ pub struct AutonomousRunFrequency {
     pub count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutonomousRunHistorySummary {
     pub runs_path: PathBuf,
     pub considered_runs: usize,
@@ -157,7 +157,7 @@ impl std::fmt::Display for AutonomousPolicyAction {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutonomousPolicyRecommendation {
     pub requested_max_ticks: usize,
     pub recommended_max_ticks: usize,
@@ -176,7 +176,7 @@ impl AutonomousPolicyRecommendation {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutonomousPolicyReview {
     pub summary: AutonomousRunHistorySummary,
     pub recommendation: AutonomousPolicyRecommendation,
@@ -449,6 +449,20 @@ pub fn summarize_autonomous_runs(
     Ok(summarize_autonomous_run_load(load))
 }
 
+#[must_use]
+pub fn summarize_autonomous_run_reports(
+    reports: Vec<AutonomousRunReport>,
+    runs_path: PathBuf,
+    malformed_lines: usize,
+) -> AutonomousRunHistorySummary {
+    summarize_autonomous_run_load(AutonomousRunLoad {
+        runs_path,
+        reports,
+        malformed_lines,
+        warnings: Vec::new(),
+    })
+}
+
 pub fn review_autonomous_policy(
     state_dir: &Path,
     limit: usize,
@@ -456,6 +470,15 @@ pub fn review_autonomous_policy(
     permission_mode: PermissionMode,
 ) -> io::Result<AutonomousPolicyReview> {
     AutonomousRunStore::new(state_dir).review(limit, requested_max_ticks, permission_mode)
+}
+
+#[must_use]
+pub fn recommend_autonomous_policy_for_summary(
+    summary: &AutonomousRunHistorySummary,
+    requested_max_ticks: usize,
+    permission_mode: PermissionMode,
+) -> AutonomousPolicyRecommendation {
+    recommend_autonomous_policy(summary, requested_max_ticks, permission_mode)
 }
 
 fn summarize_autonomous_run_load(load: AutonomousRunLoad) -> AutonomousRunHistorySummary {

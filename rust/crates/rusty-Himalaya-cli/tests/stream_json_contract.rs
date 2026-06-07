@@ -58,6 +58,8 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "task_scheduler_daemon_status",
         "task_scheduler_daemon_logs",
         "task_scheduler_daemon_report",
+        "task_scheduler_daemon_evaluation",
+        "task_scheduler_daemon_replay",
         "cron_list",
         "cron_create",
         "cron_delete",
@@ -68,6 +70,7 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "benchmark_suite",
         "benchmark_task",
         "benchmark_run",
+        "benchmark_autonomous",
         "worker_list",
         "worker_create",
         "worker_spawn",
@@ -1096,6 +1099,45 @@ fn daemon_report_emits_policy_review_event() {
     assert_non_empty_string(&report["runs_path"]);
 }
 
+#[test]
+fn autonomous_benchmark_emits_evaluation_event() {
+    let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-autonomous-benchmark"));
+    workspace.create();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_Himalaya"));
+    command
+        .current_dir(&workspace.root)
+        .env_clear()
+        .env("ANTHROPIC_API_KEY", "test-stream-json-key")
+        .env("Himalaya_CONFIG_HOME", &workspace.config_home)
+        .env("HOME", &workspace.home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args([
+            "--output-format",
+            "stream-json",
+            "benchmark",
+            "autonomous",
+            "--max-ticks",
+            "3",
+        ]);
+    let output = command.output().expect("Himalaya should launch");
+    assert_success(&output);
+
+    let events = parse_stream_json_stdout(&output.stdout);
+    assert_all_events_are_versioned(&events);
+    let report = events
+        .iter()
+        .find(|event| event["type"] == "benchmark_autonomous")
+        .expect("expected autonomous benchmark event");
+    assert_eq!(report["run"]["suite_id"], "autonomous-agent-loop-v1");
+    assert_eq!(report["run"]["evaluation"]["version"], 1);
+    assert_eq!(
+        report["run"]["evaluation"]["trace_replay"]["policy_recommendation"]["requested_max_ticks"],
+        3
+    );
+}
+
 fn run_stream_json_case(
     workspace: &HarnessWorkspace,
     base_url: &str,
@@ -1599,6 +1641,20 @@ fn assert_stream_event_schema(event: &Value) {
                 );
             }
         }
+        "task_scheduler_daemon_evaluation" => {
+            assert!(
+                event["evaluation"].is_object(),
+                "task_scheduler_daemon_evaluation requires evaluation object: {event:?}"
+            );
+            assert_non_empty_string(&event["runs_path"]);
+        }
+        "task_scheduler_daemon_replay" => {
+            assert!(
+                event["replay"].is_object(),
+                "task_scheduler_daemon_replay requires replay object: {event:?}"
+            );
+            assert_non_empty_string(&event["runs_path"]);
+        }
         "cron_list" => assert!(
             event["crons"].is_array(),
             "cron_list requires crons array: {event:?}"
@@ -1664,6 +1720,10 @@ fn assert_stream_event_schema(event: &Value) {
         "benchmark_run" => assert!(
             event["run"].is_object(),
             "benchmark_run requires run object: {event:?}"
+        ),
+        "benchmark_autonomous" => assert!(
+            event["run"].is_object(),
+            "benchmark_autonomous requires run object: {event:?}"
         ),
         "worker_list" => assert!(
             event["workers"].is_array(),

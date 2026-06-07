@@ -80,6 +80,34 @@ fn benchmark_commands_emit_suite_and_record_runs() {
             .expect("adaptive routing quality score")
             > 0.0
     );
+
+    let autonomous = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "benchmark",
+            "autonomous",
+            "--record",
+            "--limit",
+            "5",
+            "--max-ticks",
+            "3",
+        ],
+    );
+    assert_eq!(autonomous["type"], "benchmark_autonomous");
+    assert_eq!(autonomous["run"]["suite_id"], "autonomous-agent-loop-v1");
+    assert_eq!(autonomous["run"]["evaluation"]["version"], 1);
+    assert_eq!(autonomous["run"]["evaluation"]["counters"]["tasks"], 0);
+    assert_eq!(
+        autonomous["run"]["evaluation"]["trace_replay"]["policy_recommendation"]
+            ["requested_max_ticks"],
+        3
+    );
+    assert!(autonomous["record_path"]
+        .as_str()
+        .expect("autonomous benchmark record path")
+        .contains(".Himalaya/benchmarks/runs.jsonl"));
     assert!(root.join(".Himalaya/benchmarks/runs.jsonl").exists());
 }
 
@@ -525,6 +553,67 @@ fn task_scheduler_tick_persists_durable_status() {
             .len(),
         1
     );
+
+    let daemon_evaluation = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "daemon",
+            "evaluate",
+            "--limit",
+            "5",
+            "--max-ticks",
+            "3",
+        ],
+    );
+    assert_eq!(
+        daemon_evaluation["type"],
+        "task_scheduler_daemon_evaluation"
+    );
+    assert_eq!(daemon_evaluation["evaluation"]["version"], 1);
+    assert_eq!(daemon_evaluation["evaluation"]["counters"]["tasks"], 1);
+    assert_eq!(
+        daemon_evaluation["evaluation"]["counters"]["autonomous_runs"],
+        1
+    );
+    assert!(
+        daemon_evaluation["evaluation"]["scores"]["total_score"]
+            .as_f64()
+            .expect("total score")
+            >= 0.0
+    );
+    assert_eq!(
+        daemon_evaluation["evaluation"]["trace_replay"]["policy_recommendation"]
+            ["requested_max_ticks"],
+        3
+    );
+
+    let daemon_replay = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "tasks",
+            "daemon",
+            "replay",
+            "--limit",
+            "5",
+            "--max-ticks",
+            "3",
+        ],
+    );
+    assert_eq!(daemon_replay["type"], "task_scheduler_daemon_replay");
+    assert_eq!(daemon_replay["replay"]["considered_runs"], 1);
+    assert_eq!(
+        daemon_replay["replay"]["policy_recommendation"]["requested_max_ticks"],
+        3
+    );
+    assert!(daemon_replay["runs_path"]
+        .as_str()
+        .expect("daemon replay runs path")
+        .contains(".Himalaya/scheduler/runs.jsonl"));
 
     let daemon_stop = assert_json_command(
         &root,

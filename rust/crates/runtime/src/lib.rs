@@ -4,6 +4,7 @@
 //! MCP plumbing, tool-facing file operations, and the core conversation loop
 //! that drives interactive and one-shot turns.
 
+pub mod autonomous_evaluation;
 pub mod autonomous_run;
 mod bash;
 pub mod bash_validation;
@@ -70,10 +71,18 @@ pub mod verifier;
 pub mod worker_boot;
 pub mod worker_supervisor;
 
+pub use autonomous_evaluation::{
+    evaluate_autonomous_loop, replay_autonomous_trace, run_autonomous_benchmark,
+    AutonomousBenchmarkRun, AutonomousEvaluationCounters, AutonomousEvaluationInput,
+    AutonomousEvaluationReport, AutonomousEvaluationScores, AutonomousTraceReplayDecision,
+    AutonomousTraceReplayReport, AUTONOMOUS_BENCHMARK_SUITE_ID, AUTONOMOUS_BENCHMARK_VERSION,
+    AUTONOMOUS_EVALUATION_VERSION,
+};
 pub use autonomous_run::{
     append_autonomous_run_report, autonomous_runs_path, latest_autonomous_run_report,
     load_autonomous_run_reports, load_autonomous_run_reports_with_diagnostics,
-    review_autonomous_policy, summarize_autonomous_runs, AutonomousBlockedRecoveryAction,
+    recommend_autonomous_policy_for_summary, review_autonomous_policy,
+    summarize_autonomous_run_reports, summarize_autonomous_runs, AutonomousBlockedRecoveryAction,
     AutonomousPolicyAction, AutonomousPolicyRecommendation, AutonomousPolicyReview,
     AutonomousRecoveryPolicyAudit, AutonomousRunCoordinator, AutonomousRunFrequency,
     AutonomousRunHistorySummary, AutonomousRunLoad, AutonomousRunReadWarning, AutonomousRunReport,

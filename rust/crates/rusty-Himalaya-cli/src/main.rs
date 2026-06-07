@@ -608,6 +608,11 @@ enum BenchmarkCliCommand {
         record: bool,
         max_parallelism: usize,
     },
+    Autonomous {
+        record: bool,
+        limit: usize,
+        max_ticks: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -702,6 +707,8 @@ enum TaskDaemonCliCommand {
     Stop,
     Logs { limit: usize },
     Report { limit: usize, max_ticks: usize },
+    Evaluate { limit: usize, max_ticks: usize },
+    Replay { limit: usize, max_ticks: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1283,12 +1290,13 @@ fn parse_benchmark_cli_command(args: &[String]) -> Result<BenchmarkCliCommand, S
             task_id: task_id.clone(),
         }),
         Some(("run", rest)) => parse_benchmark_run_args(rest),
+        Some(("autonomous", rest)) => parse_benchmark_autonomous_args(rest),
         Some(("list" | "show", _)) => Err(
-            "Usage: Himalaya benchmark [list|show <task-id>|run [--record] [--max-parallelism N]]"
+            "Usage: Himalaya benchmark [list|show <task-id>|run [--record] [--max-parallelism N]|autonomous [--record] [--limit N] [--max-ticks N]]"
                 .to_string(),
         ),
         Some((other, _)) => Err(format!(
-            "unknown benchmark command: {other}\nUsage: Himalaya benchmark [list|show <task-id>|run [--record] [--max-parallelism N]]"
+            "unknown benchmark command: {other}\nUsage: Himalaya benchmark [list|show <task-id>|run [--record] [--max-parallelism N]|autonomous [--record] [--limit N] [--max-ticks N]]"
         )),
     }
 }
@@ -1324,6 +1332,57 @@ fn parse_benchmark_run_args(args: &[String]) -> Result<BenchmarkCliCommand, Stri
     Ok(BenchmarkCliCommand::Run {
         record,
         max_parallelism,
+    })
+}
+
+fn parse_benchmark_autonomous_args(args: &[String]) -> Result<BenchmarkCliCommand, String> {
+    let mut record = false;
+    let mut limit = 20_usize;
+    let mut max_ticks = 1_usize;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--record" => {
+                record = true;
+                index += 1;
+            }
+            "--limit" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "benchmark autonomous --limit requires a value".to_string())?;
+                limit = parse_positive_usize("--limit", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--limit=") => {
+                limit = parse_positive_usize("--limit", &value[8..])?;
+                index += 1;
+            }
+            "--max-ticks" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "benchmark autonomous --max-ticks requires a value".to_string()
+                })?;
+                max_ticks = parse_positive_usize("--max-ticks", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--max-ticks=") => {
+                max_ticks = parse_positive_usize("--max-ticks", &value[12..])?;
+                index += 1;
+            }
+            "--once" => {
+                max_ticks = 1;
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown benchmark autonomous argument: {other}\nUsage: Himalaya benchmark autonomous [--record] [--limit N] [--once|--max-ticks N]"
+                ));
+            }
+        }
+    }
+    Ok(BenchmarkCliCommand::Autonomous {
+        record,
+        limit,
+        max_ticks,
     })
 }
 
@@ -1466,7 +1525,7 @@ fn parse_task_cli_command(args: &[String]) -> Result<TaskCliCommand, String> {
             task_id: task_id.clone(),
         }),
         Some((other, _)) => Err(format!(
-            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|review <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler explain <task-id>|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|daemon report [--limit N] [--max-ticks N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
+            "unknown tasks command: {other}\nUsage: Himalaya tasks [list|show <task-id>|status <task-id>|report <task-id>|review <task-id>|packet create <packet.json>|packet run <packet.json>|packet status <task-id>|scheduler tick|scheduler queue|scheduler explain <task-id>|scheduler run [--once|--max-ticks N]|scheduler status|daemon start [--once|--max-ticks N]|daemon status|daemon stop|daemon logs [--limit N]|daemon report [--limit N] [--max-ticks N]|daemon evaluate [--limit N] [--max-ticks N]|daemon replay [--limit N] [--max-ticks N]|resume <task-id> [--from-node <node-id>] [prompt]|execute <task-id> [--from-node <node-id>]|retry <task-id> --node <node-id>|verify <task-id> [--node <node-id> <command>]|recover <task-id>|compact <task-id> [--keep-last N]|cancel <task-id>]"
         )),
     }
 }
@@ -1547,8 +1606,10 @@ fn parse_task_daemon_cli_command(args: &[String]) -> Result<TaskDaemonCliCommand
         Some(("stop", [])) => Ok(TaskDaemonCliCommand::Stop),
         Some(("logs", rest)) => parse_task_daemon_logs_args(rest),
         Some(("report", rest)) => parse_task_daemon_report_args(rest),
+        Some(("evaluate" | "eval", rest)) => parse_task_daemon_evaluate_args(rest),
+        Some(("replay", rest)) => parse_task_daemon_replay_args(rest),
         Some((other, _)) => Err(format!(
-            "unknown tasks daemon command: {other}\nUsage: Himalaya tasks daemon [start [--once|--max-ticks N]|status|stop|logs [--limit N]|report [--limit N] [--max-ticks N]]"
+            "unknown tasks daemon command: {other}\nUsage: Himalaya tasks daemon [start [--once|--max-ticks N]|status|stop|logs [--limit N]|report [--limit N] [--max-ticks N]|evaluate [--limit N] [--max-ticks N]|replay [--limit N] [--max-ticks N]]"
         )),
     }
 }
@@ -1627,6 +1688,61 @@ fn parse_task_daemon_report_args(args: &[String]) -> Result<TaskDaemonCliCommand
         }
     }
     Ok(TaskDaemonCliCommand::Report { limit, max_ticks })
+}
+
+fn parse_task_daemon_evaluate_args(args: &[String]) -> Result<TaskDaemonCliCommand, String> {
+    let (limit, max_ticks) = parse_task_daemon_review_window_args(args, "evaluate")?;
+    Ok(TaskDaemonCliCommand::Evaluate { limit, max_ticks })
+}
+
+fn parse_task_daemon_replay_args(args: &[String]) -> Result<TaskDaemonCliCommand, String> {
+    let (limit, max_ticks) = parse_task_daemon_review_window_args(args, "replay")?;
+    Ok(TaskDaemonCliCommand::Replay { limit, max_ticks })
+}
+
+fn parse_task_daemon_review_window_args(
+    args: &[String],
+    command: &str,
+) -> Result<(usize, usize), String> {
+    let mut limit = 20_usize;
+    let mut max_ticks = 1_usize;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("tasks daemon {command} --limit requires a value"))?;
+                limit = parse_positive_usize("--limit", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--limit=") => {
+                limit = parse_positive_usize("--limit", &value[8..])?;
+                index += 1;
+            }
+            "--max-ticks" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    format!("tasks daemon {command} --max-ticks requires a value")
+                })?;
+                max_ticks = parse_positive_usize("--max-ticks", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--max-ticks=") => {
+                max_ticks = parse_positive_usize("--max-ticks", &value[12..])?;
+                index += 1;
+            }
+            "--once" => {
+                max_ticks = 1;
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown tasks daemon {command} argument: {other}\nUsage: Himalaya tasks daemon {command} [--limit N] [--once|--max-ticks N]"
+                ));
+            }
+        }
+    }
+    Ok((limit, max_ticks))
 }
 
 fn parse_positive_usize(name: &str, value: &str) -> Result<usize, String> {
@@ -3610,13 +3726,164 @@ fn record_benchmark_run(
     Ok(path)
 }
 
+fn record_autonomous_benchmark_run(
+    run: &runtime::AutonomousBenchmarkRun,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = benchmark_record_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("runs.jsonl");
+    let recorded_at = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let line = serde_json::to_string(&json!({
+        "recorded_at": recorded_at,
+        "kind": "autonomous_benchmark",
+        "run": run,
+    }))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(file, "{line}")?;
+    Ok(path)
+}
+
+fn build_autonomous_evaluation_input(
+    limit: usize,
+    max_ticks: usize,
+    permission_mode: PermissionMode,
+) -> Result<runtime::AutonomousEvaluationInput, Box<dyn std::error::Error>> {
+    let registry = load_task_registry()?;
+    let tasks = registry.list(None);
+    let loaded_memory =
+        load_task_memory_store().unwrap_or_else(|_| runtime::TaskMemoryStore::new());
+    let task_memory = if loaded_memory.entries().is_empty() && !tasks.is_empty() {
+        runtime::TaskMemoryStore::from_tasks(&tasks)
+    } else {
+        loaded_memory
+    };
+    let route_feedback = load_route_feedback_store()?;
+    let autonomous_runs =
+        runtime::load_autonomous_run_reports_with_diagnostics(&scheduler_state_dir()?, limit)?;
+    Ok(runtime::AutonomousEvaluationInput {
+        tasks,
+        task_memory,
+        route_feedback,
+        autonomous_runs,
+        permission_mode,
+        requested_max_ticks: max_ticks,
+    })
+}
+
 fn render_benchmark_value_text(value: &Value) -> String {
     match value["type"].as_str() {
         Some("benchmark_suite") => render_benchmark_list_text(value),
         Some("benchmark_task") => render_benchmark_task_text(value),
         Some("benchmark_run") => render_benchmark_run_text(value),
+        Some("benchmark_autonomous") => render_autonomous_benchmark_text(value),
         _ => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
     }
+}
+
+fn render_autonomous_evaluation_text(value: &Value) -> String {
+    let report = value
+        .get("evaluation")
+        .or_else(|| value.get("report"))
+        .unwrap_or(value);
+    let scores = &report["scores"];
+    let counters = &report["counters"];
+    let total = scores["total_score"].as_f64().unwrap_or_default() * 100.0;
+    let success = scores["autonomous_success_score"]
+        .as_f64()
+        .unwrap_or_default()
+        * 100.0;
+    let routing = scores["routing_adaptation_score"]
+        .as_f64()
+        .unwrap_or_default()
+        * 100.0;
+    let memory = scores["memory_reuse_score"].as_f64().unwrap_or_default() * 100.0;
+    let mut lines = vec![
+        "Autonomous evaluation".to_string(),
+        format!("  Total score       {total:.0}%"),
+        format!("  Autonomous success {success:.0}%"),
+        format!("  Routing adaptation {routing:.0}%"),
+        format!("  Memory reuse       {memory:.0}%"),
+        format!(
+            "  Tasks             {} complete / {} total",
+            counters["completed_tasks"].as_u64().unwrap_or(0),
+            counters["tasks"].as_u64().unwrap_or(0)
+        ),
+        format!(
+            "  Runs              {}",
+            counters["autonomous_runs"].as_u64().unwrap_or(0)
+        ),
+        format!(
+            "  Route feedback    {}",
+            counters["route_feedback_entries"].as_u64().unwrap_or(0)
+        ),
+    ];
+    if let Some(path) = value["runs_path"].as_str() {
+        lines.push(format!("  Runs path         {path}"));
+    }
+    if let Some(recommendations) = report["recommendations"].as_array() {
+        lines.push("Recommendations:".to_string());
+        for recommendation in recommendations.iter().filter_map(Value::as_str) {
+            lines.push(format!("  - {recommendation}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_autonomous_replay_text(value: &Value) -> String {
+    let replay = value
+        .get("trace_replay")
+        .or_else(|| value.get("replay"))
+        .unwrap_or(value);
+    let considered = replay["considered_runs"].as_u64().unwrap_or(0);
+    let changed = replay["changed_decisions"].as_u64().unwrap_or(0);
+    let action = replay["policy_recommendation"]["action"]
+        .as_str()
+        .unwrap_or("continue");
+    let recommended_ticks = replay["policy_recommendation"]["recommended_max_ticks"]
+        .as_u64()
+        .unwrap_or(1);
+    let mut lines = vec![
+        "Autonomous trace replay".to_string(),
+        format!("  Runs              {considered}"),
+        format!("  Changed decisions {changed}"),
+        format!("  Current policy    {action} ({recommended_ticks} tick(s))"),
+    ];
+    if let Some(decisions) = replay["decisions"].as_array() {
+        lines.push("Decisions:".to_string());
+        for decision in decisions.iter().take(10) {
+            let run_id = decision["run_id"].as_str().unwrap_or("run");
+            let observed = decision["observed_status"].as_str().unwrap_or("unknown");
+            let replay_action = decision["replay_action"].as_str().unwrap_or("continue");
+            let marker = if decision["changed"].as_bool().unwrap_or(false) {
+                "!"
+            } else {
+                " "
+            };
+            lines.push(format!(
+                "  {marker} {run_id}: observed {observed}, replay {replay_action}"
+            ));
+        }
+    }
+    if let Some(recommendations) = replay["recommendations"].as_array() {
+        lines.push("Recommendations:".to_string());
+        for recommendation in recommendations.iter().filter_map(Value::as_str) {
+            lines.push(format!("  - {recommendation}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_autonomous_benchmark_text(value: &Value) -> String {
+    let mut text = render_autonomous_evaluation_text(&value["run"]);
+    if let Some(record_path) = value["record_path"].as_str() {
+        text.push_str(&format!("\nRecord: {record_path}"));
+    }
+    text
 }
 
 fn benchmark_command_value(
@@ -3657,6 +3924,30 @@ fn benchmark_command_value(
                 "type": "benchmark_run",
                 "run": run,
                 "record_path": record_path,
+            }))
+        }
+        BenchmarkCliCommand::Autonomous {
+            record,
+            limit,
+            max_ticks,
+        } => {
+            let input =
+                build_autonomous_evaluation_input(limit, max_ticks, PermissionMode::ReadOnly)?;
+            let run = runtime::run_autonomous_benchmark(input);
+            let record_path = if record {
+                Some(
+                    record_autonomous_benchmark_run(&run)?
+                        .to_string_lossy()
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            Ok(json!({
+                "type": "benchmark_autonomous",
+                "run": run,
+                "record_path": record_path,
+                "runs_path": scheduler_state_dir()?.join("runs.jsonl"),
             }))
         }
     }
@@ -9663,6 +9954,47 @@ fn run_task_daemon_command(
                 }
             }
         }
+        TaskDaemonCliCommand::Evaluate { limit, max_ticks } => {
+            let state = daemon.load_state().ok();
+            let latest_run = coordinator.latest_run().ok().flatten();
+            let input = build_autonomous_evaluation_input(limit, max_ticks, permission_mode)?;
+            let evaluation = runtime::evaluate_autonomous_loop(input);
+            let value = json!({
+                "type":"task_scheduler_daemon_evaluation",
+                "state":state,
+                "latest_run":latest_run,
+                "evaluation":evaluation,
+                "state_path":daemon.state_path(),
+                "events_path":daemon.events_path(),
+                "runs_path":coordinator.runs_path(),
+            });
+            match output_format {
+                CliOutputFormat::Text => println!("{}", render_autonomous_evaluation_text(&value)),
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(value, output_format)?;
+                }
+            }
+        }
+        TaskDaemonCliCommand::Replay { limit, max_ticks } => {
+            let run_load = runtime::load_autonomous_run_reports_with_diagnostics(
+                &scheduler_state_dir()?,
+                limit,
+            )?;
+            let replay = runtime::replay_autonomous_trace(&run_load, permission_mode, max_ticks);
+            let value = json!({
+                "type":"task_scheduler_daemon_replay",
+                "replay":replay,
+                "malformed_lines":run_load.malformed_lines,
+                "warnings":run_load.warnings,
+                "runs_path":coordinator.runs_path(),
+            });
+            match output_format {
+                CliOutputFormat::Text => println!("{}", render_autonomous_replay_text(&value)),
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                    print_task_output(value, output_format)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -15244,10 +15576,55 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_task_cli_command(&[
+                "daemon".to_string(),
+                "evaluate".to_string(),
+                "--limit".to_string(),
+                "8".to_string(),
+                "--max-ticks=4".to_string(),
+            ])
+            .expect("tasks daemon evaluate should parse"),
+            TaskCliCommand::Daemon {
+                command: TaskDaemonCliCommand::Evaluate {
+                    limit: 8,
+                    max_ticks: 4
+                },
+            }
+        );
+        assert_eq!(
+            parse_task_cli_command(&[
+                "daemon".to_string(),
+                "replay".to_string(),
+                "--limit=9".to_string(),
+            ])
+            .expect("tasks daemon replay should parse"),
+            TaskCliCommand::Daemon {
+                command: TaskDaemonCliCommand::Replay {
+                    limit: 9,
+                    max_ticks: 1
+                },
+            }
+        );
+        assert_eq!(
             parse_task_cli_command(&["daemon".to_string(), "stop".to_string()])
                 .expect("tasks daemon stop should parse"),
             TaskCliCommand::Daemon {
                 command: TaskDaemonCliCommand::Stop,
+            }
+        );
+        assert_eq!(
+            parse_benchmark_cli_command(&[
+                "autonomous".to_string(),
+                "--record".to_string(),
+                "--limit=6".to_string(),
+                "--max-ticks".to_string(),
+                "2".to_string(),
+            ])
+            .expect("benchmark autonomous should parse"),
+            BenchmarkCliCommand::Autonomous {
+                record: true,
+                limit: 6,
+                max_ticks: 2,
             }
         );
         assert_eq!(

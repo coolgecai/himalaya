@@ -161,6 +161,12 @@
           "$ref": "#/$defs/taskSchedulerDaemonReportEvent"
         },
         {
+          "$ref": "#/$defs/taskSchedulerDaemonEvaluationEvent"
+        },
+        {
+          "$ref": "#/$defs/taskSchedulerDaemonReplayEvent"
+        },
+        {
           "$ref": "#/$defs/cronEvent"
         },
         {
@@ -174,6 +180,9 @@
         },
         {
           "$ref": "#/$defs/benchmarkRunEvent"
+        },
+        {
+          "$ref": "#/$defs/benchmarkAutonomousEvent"
         },
         {
           "$ref": "#/$defs/workerListEvent"
@@ -248,6 +257,8 @@
         "task_scheduler_daemon_status",
         "task_scheduler_daemon_logs",
         "task_scheduler_daemon_report",
+        "task_scheduler_daemon_evaluation",
+        "task_scheduler_daemon_replay",
         "cron_list",
         "cron_create",
         "cron_delete",
@@ -258,6 +269,7 @@
         "benchmark_suite",
         "benchmark_task",
         "benchmark_run",
+        "benchmark_autonomous",
         "worker_list",
         "worker_create",
         "worker_spawn",
@@ -1413,6 +1425,35 @@
         }
       ]
     },
+    "benchmarkAutonomousEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "run"
+          ],
+          "properties": {
+            "type": {
+              "const": "benchmark_autonomous"
+            },
+            "run": {
+              "type": "object"
+            },
+            "record_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "runs_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
     "workerListEvent": {
       "allOf": [
         {
@@ -1685,6 +1726,78 @@
             },
             "events_path": {
               "type": "string"
+            },
+            "runs_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "taskSchedulerDaemonEvaluationEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "evaluation",
+            "runs_path"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_scheduler_daemon_evaluation"
+            },
+            "state": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "latest_run": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "evaluation": {
+              "type": "object"
+            },
+            "state_path": {
+              "type": "string"
+            },
+            "events_path": {
+              "type": "string"
+            },
+            "runs_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "taskSchedulerDaemonReplayEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "replay",
+            "runs_path"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_scheduler_daemon_replay"
+            },
+            "replay": {
+              "type": "object"
+            },
+            "malformed_lines": {
+              "type": "integer"
+            },
+            "warnings": {
+              "type": "array"
             },
             "runs_path": {
               "type": "string"
