@@ -4928,13 +4928,21 @@ fn release_readiness_value() -> Value {
             "task memory and route feedback stores",
             "policy governance ledger, replay, plan, dry-run apply, and rollback",
             "autonomous evaluation, trace replay, integration report, and health view",
-            "JSON and stream-json command contracts for daemon report/evaluate"
+            "daemon status/logs health checkpoints",
+            "mutating autonomous operation preflight gates",
+            "JSON and stream-json command contracts for daemon status/logs/report/evaluate"
         ],
         "experimental_capabilities": [
             "fully unattended long-horizon daemon execution",
             "automatic governed policy apply without human review",
             "cross-domain optimizer decisions beyond dry-run evidence",
             "large-scale concurrent worker pools"
+        ],
+        "operator_workflow": [
+            "inspect `Himalaya tasks daemon status` for a lightweight health checkpoint",
+            "run report/evaluate/replay before starting a bounded daemon loop",
+            "use `Himalaya policy apply --dry-run` before any persistent governed apply",
+            "treat `autonomous_preflight_blocked` as a recovery instruction, not a command failure"
         ],
         "recommended_smoke_tests": [
             "cargo fmt -- --check",
@@ -4943,14 +4951,17 @@ fn release_readiness_value() -> Value {
             "cargo test -p runtime autonomous_integration --no-fail-fast",
             "cargo test -p rusty-Himalaya-cli --test output_format_contract --no-fail-fast",
             "cargo test -p rusty-Himalaya-cli --test stream_json_contract --no-fail-fast",
+            "Himalaya --output-format json tasks daemon status",
+            "Himalaya --output-format json tasks daemon logs --limit 1",
             "Himalaya --output-format json tasks daemon report --limit 20 --max-ticks 3",
             "Himalaya --output-format json tasks daemon evaluate --limit 20 --max-ticks 3",
             "Himalaya --output-format json tasks daemon replay --limit 20 --max-ticks 3"
         ],
         "release_gates": [
             "no failed integration health blockers",
-            "text output gives next action before detailed counters",
-            "policy apply remains dry-run unless health is healthy",
+            "daemon status/logs/report/evaluate text gives next action before detailed counters",
+            "tasks daemon start is preflight-blocked unless health allows iteration",
+            "policy apply is dry-run or preflight-blocked unless health is healthy",
             "stream-json schema remains backward compatible"
         ]
     })
@@ -5004,6 +5015,15 @@ fn render_maturity_matrix_text(value: &Value) -> String {
                     .iter()
                     .filter_map(Value::as_str)
                     .map(|gate| format!("    - {gate}")),
+            );
+        }
+        if let Some(workflow) = readiness.get("operator_workflow").and_then(Value::as_array) {
+            lines.push("  Operator workflow".to_string());
+            lines.extend(
+                workflow
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|step| format!("    - {step}")),
             );
         }
     }
@@ -15938,12 +15958,17 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  Himalaya mcp show my-server")?;
     writeln!(out, "  Himalaya /skills")?;
     writeln!(out, "  Himalaya doctor")?;
+    writeln!(out, "  Himalaya tasks daemon status")?;
     writeln!(
         out,
         "  Himalaya tasks daemon report --limit 20 --max-ticks 3"
     )?;
     writeln!(out, "  Himalaya tasks daemon evaluate --limit 20")?;
     writeln!(out, "  Himalaya tasks daemon replay --limit 20")?;
+    writeln!(
+        out,
+        "  Himalaya policy apply --dry-run --domain routing --proposal-id <id>"
+    )?;
     writeln!(out, "  Himalaya login")?;
     writeln!(out, "  Himalaya init")?;
     writeln!(out, "  Himalaya export")?;
@@ -17880,8 +17905,22 @@ mod tests {
                     .as_str()
                     .is_some_and(|value| value.contains("health view")))
             ));
+        assert!(matrix_value["release_readiness"]["stable_capabilities"]
+            .as_array()
+            .is_some_and(
+                |capabilities| capabilities.iter().any(|capability| capability
+                    .as_str()
+                    .is_some_and(|value| value.contains("preflight gates")))
+            ));
+        assert!(matrix_value["release_readiness"]["operator_workflow"]
+            .as_array()
+            .is_some_and(|steps| steps.iter().any(|step| step
+                .as_str()
+                .is_some_and(|value| value.contains("autonomous_preflight_blocked")))));
         let matrix_text = render_maturity_matrix_text(&matrix_value);
         assert!(matrix_text.contains("Release readiness:"));
+        assert!(matrix_text.contains("Operator workflow"));
+        assert!(matrix_text.contains("tasks daemon start is preflight-blocked"));
         assert!(matrix_text.contains("stream-json schema remains backward compatible"));
         assert!(
             matrix_value["implemented_slash_command_count"]
@@ -19384,9 +19423,11 @@ UU conflicted.rs",
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
         assert!(help.contains("Himalaya --resume latest"));
         assert!(help.contains("Himalaya --resume latest /status /diff /export notes.txt"));
+        assert!(help.contains("Himalaya tasks daemon status"));
         assert!(help.contains("Himalaya tasks daemon report --limit 20 --max-ticks 3"));
         assert!(help.contains("Himalaya tasks daemon evaluate --limit 20"));
         assert!(help.contains("Himalaya tasks daemon replay --limit 20"));
+        assert!(help.contains("Himalaya policy apply --dry-run --domain routing"));
     }
 
     #[test]

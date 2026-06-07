@@ -10,7 +10,9 @@ P8-A is a release-readiness audit for the autonomous runtime work completed thro
 - routing proposal, dry-run apply, governed apply, and rollback plumbing
 - policy governance ledger, lifecycle replay, adapter review, and apply coordination
 - autonomous evaluation, trace replay, integration report, and health view
-- text, JSON, and stream-json output contracts for daemon report and evaluation
+- daemon status/logs health checkpoints
+- preflight gates for mutating autonomous operations
+- text, JSON, and stream-json output contracts for daemon status, logs, report, and evaluation
 
 ## Experimental Capabilities
 
@@ -35,16 +37,21 @@ cargo test -p rusty-Himalaya-cli --test stream_json_contract --no-fail-fast
 Then run the read-only autonomous diagnostics in a real workspace:
 
 ```bash
+Himalaya --output-format json tasks daemon status
+Himalaya --output-format json tasks daemon logs --limit 1
 Himalaya --output-format json tasks daemon report --limit 20 --max-ticks 3
 Himalaya --output-format json tasks daemon evaluate --limit 20 --max-ticks 3
 Himalaya --output-format json tasks daemon replay --limit 20 --max-ticks 3
 ```
 
+Use `Himalaya policy apply --dry-run` before any persistent governed policy apply. If a command returns `autonomous_preflight_blocked`, follow its `next_action` and re-run the read-only diagnostics before trying another mutating command.
+
 ## Release Gates
 
 - no failed integration health blockers
-- text output gives next action before detailed counters
-- policy apply remains dry-run unless health is healthy
+- daemon status/logs/report/evaluate text output gives next action before detailed counters
+- tasks daemon start is preflight-blocked unless health allows iteration
+- policy apply remains dry-run or preflight-blocked unless health is healthy
 - stream-json schema remains backward compatible
 - docs clearly separate stable and experimental autonomous behavior
 
