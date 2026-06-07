@@ -45,6 +45,7 @@ pub mod recovery_orchestrator;
 pub mod recovery_recipes;
 mod remote;
 pub mod route_feedback_store;
+pub mod route_optimizer;
 pub mod runtime_events;
 pub mod sandbox;
 mod session;
@@ -220,6 +221,11 @@ pub use remote::{
     DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
 };
 pub use route_feedback_store::{RouteFeedbackSnapshot, RouteFeedbackStore, RouteFeedbackSummary};
+pub use route_optimizer::{
+    evaluate_routing_feedback, replay_routing_optimizer, RoutingEvaluationReport,
+    RoutingHealthEntry, RoutingHealthStatus, RoutingOptimizerReplayReport, RoutingPolicyCandidate,
+    RoutingPolicyCandidateKind, RoutingReplayChange, ROUTING_OPTIMIZER_VERSION,
+};
 pub use runtime_events::{
     append_runtime_event_log, read_runtime_event_log, RuntimeEvent, RuntimeEventEnvelope,
     RuntimeEventLog, RuntimeEventReporter, RuntimeEventSeverity,

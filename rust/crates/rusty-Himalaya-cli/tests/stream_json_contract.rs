@@ -67,6 +67,8 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "cron_fire_failed",
         "cron_run",
         "route_feedback_summary",
+        "route_optimizer_report",
+        "route_optimizer_replay",
         "benchmark_suite",
         "benchmark_task",
         "benchmark_run",
@@ -1120,6 +1122,7 @@ fn autonomous_benchmark_emits_evaluation_event() {
             "autonomous",
             "--max-ticks",
             "3",
+            "--optimize-routes",
         ]);
     let output = command.output().expect("Himalaya should launch");
     assert_success(&output);
@@ -1136,6 +1139,7 @@ fn autonomous_benchmark_emits_evaluation_event() {
         report["run"]["evaluation"]["trace_replay"]["policy_recommendation"]["requested_max_ticks"],
         3
     );
+    assert!(report["route_optimizer"]["report"].is_object());
 }
 
 fn run_stream_json_case(
@@ -1705,6 +1709,14 @@ fn assert_stream_event_schema(event: &Value) {
                 "route_feedback_summary requires feedback_count: {event:?}"
             );
         }
+        "route_optimizer_report" => assert!(
+            event["report"].is_object(),
+            "route_optimizer_report requires report object: {event:?}"
+        ),
+        "route_optimizer_replay" => assert!(
+            event["replay"].is_object(),
+            "route_optimizer_replay requires replay object: {event:?}"
+        ),
         "benchmark_suite" => {
             assert_non_empty_string(&event["suite_id"]);
             assert_non_empty_string(&event["version"]);

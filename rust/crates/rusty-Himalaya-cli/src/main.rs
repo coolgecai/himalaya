@@ -612,6 +612,7 @@ enum BenchmarkCliCommand {
         record: bool,
         limit: usize,
         max_ticks: usize,
+        optimize_routes: bool,
     },
 }
 
@@ -781,6 +782,14 @@ enum CronCliCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RouteCliCommand {
     FeedbackSummary,
+    Optimize {
+        min_samples: usize,
+        threshold_percent: u8,
+    },
+    Replay {
+        min_samples: usize,
+        threshold_percent: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1339,6 +1348,7 @@ fn parse_benchmark_autonomous_args(args: &[String]) -> Result<BenchmarkCliComman
     let mut record = false;
     let mut limit = 20_usize;
     let mut max_ticks = 1_usize;
+    let mut optimize_routes = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1372,9 +1382,13 @@ fn parse_benchmark_autonomous_args(args: &[String]) -> Result<BenchmarkCliComman
                 max_ticks = 1;
                 index += 1;
             }
+            "--optimize-routes" => {
+                optimize_routes = true;
+                index += 1;
+            }
             other => {
                 return Err(format!(
-                    "unknown benchmark autonomous argument: {other}\nUsage: Himalaya benchmark autonomous [--record] [--limit N] [--once|--max-ticks N]"
+                    "unknown benchmark autonomous argument: {other}\nUsage: Himalaya benchmark autonomous [--record] [--limit N] [--once|--max-ticks N] [--optimize-routes]"
                 ));
             }
         }
@@ -1383,6 +1397,7 @@ fn parse_benchmark_autonomous_args(args: &[String]) -> Result<BenchmarkCliComman
         record,
         limit,
         max_ticks,
+        optimize_routes,
     })
 }
 
@@ -1406,13 +1421,71 @@ fn parse_route_cli_command(args: &[String]) -> Result<RouteCliCommand, String> {
                 Ok(RouteCliCommand::FeedbackSummary)
             }
             _ => Err(
-                "Usage: Himalaya routes [feedback summary|feedback-summary|summary]".to_string(),
+                "Usage: Himalaya routes [feedback summary|feedback-summary|summary|optimize [--min-samples N] [--threshold-percent N]|replay [--min-samples N] [--threshold-percent N]]".to_string(),
             ),
         },
+        Some(("optimize", rest)) => parse_route_optimizer_args(rest, "optimize")
+            .map(|(min_samples, threshold_percent)| RouteCliCommand::Optimize {
+                min_samples,
+                threshold_percent,
+            }),
+        Some(("replay", rest)) => parse_route_optimizer_args(rest, "replay")
+            .map(|(min_samples, threshold_percent)| RouteCliCommand::Replay {
+                min_samples,
+                threshold_percent,
+            }),
         Some((other, _)) => Err(format!(
-            "unknown routes command: {other}\nUsage: Himalaya routes [feedback summary|feedback-summary|summary]"
+            "unknown routes command: {other}\nUsage: Himalaya routes [feedback summary|feedback-summary|summary|optimize [--min-samples N] [--threshold-percent N]|replay [--min-samples N] [--threshold-percent N]]"
         )),
     }
+}
+
+fn parse_route_optimizer_args(args: &[String], command: &str) -> Result<(usize, u8), String> {
+    let mut min_samples = 2_usize;
+    let mut threshold_percent = 50_u8;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--min-samples" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("routes {command} --min-samples requires a value"))?;
+                min_samples = parse_positive_usize("--min-samples", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--min-samples=") => {
+                min_samples = parse_positive_usize("--min-samples", &value[14..])?;
+                index += 1;
+            }
+            "--threshold-percent" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    format!("routes {command} --threshold-percent requires a value")
+                })?;
+                threshold_percent = parse_percent_u8("--threshold-percent", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--threshold-percent=") => {
+                threshold_percent = parse_percent_u8("--threshold-percent", &value[20..])?;
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown routes {command} argument: {other}\nUsage: Himalaya routes {command} [--min-samples N] [--threshold-percent N]"
+                ));
+            }
+        }
+    }
+    Ok((min_samples, threshold_percent))
+}
+
+fn parse_percent_u8(name: &str, value: &str) -> Result<u8, String> {
+    let parsed = value
+        .parse::<u8>()
+        .map_err(|_| format!("invalid {name} value: {value}"))?;
+    if parsed > 100 {
+        return Err(format!("{name} must be between 0 and 100"));
+    }
+    Ok(parsed)
 }
 
 fn parse_task_status(value: &str) -> Result<runtime::TaskStatus, String> {
@@ -3880,6 +3953,17 @@ fn render_autonomous_replay_text(value: &Value) -> String {
 
 fn render_autonomous_benchmark_text(value: &Value) -> String {
     let mut text = render_autonomous_evaluation_text(&value["run"]);
+    if value["route_optimizer"].is_object() {
+        let candidates = value["route_optimizer"]["report"]["candidates"]
+            .as_array()
+            .map_or(0, Vec::len);
+        let changed = value["route_optimizer"]["replay"]["changed_routes"]
+            .as_array()
+            .map_or(0, Vec::len);
+        text.push_str(&format!(
+            "\nRoute optimizer: {candidates} candidate(s), {changed} replay change(s)"
+        ));
+    }
     if let Some(record_path) = value["record_path"].as_str() {
         text.push_str(&format!("\nRecord: {record_path}"));
     }
@@ -3930,10 +4014,25 @@ fn benchmark_command_value(
             record,
             limit,
             max_ticks,
+            optimize_routes,
         } => {
             let input =
                 build_autonomous_evaluation_input(limit, max_ticks, PermissionMode::ReadOnly)?;
             let run = runtime::run_autonomous_benchmark(input);
+            let route_optimizer = if optimize_routes {
+                let store = load_route_feedback_store()?;
+                Some(json!({
+                    "report": runtime::evaluate_routing_feedback(&store, 2, 0.5),
+                    "replay": runtime::replay_routing_optimizer(
+                        runtime::MoERoutingPolicy::balanced(model),
+                        &store,
+                        2,
+                        0.5,
+                    ),
+                }))
+            } else {
+                None
+            };
             let record_path = if record {
                 Some(
                     record_autonomous_benchmark_run(&run)?
@@ -3946,6 +4045,7 @@ fn benchmark_command_value(
             Ok(json!({
                 "type": "benchmark_autonomous",
                 "run": run,
+                "route_optimizer": route_optimizer,
                 "record_path": record_path,
                 "runs_path": scheduler_state_dir()?.join("runs.jsonl"),
             }))
@@ -8496,9 +8596,17 @@ fn print_route_output(
     match output_format {
         CliOutputFormat::StreamJson => print_stream_json_event(value),
         CliOutputFormat::Json => print_task_json(value)?,
-        CliOutputFormat::Text => println!("{}", render_route_feedback_summary_text(&value)),
+        CliOutputFormat::Text => println!("{}", render_route_output_text(&value)),
     }
     Ok(())
+}
+
+fn render_route_output_text(value: &Value) -> String {
+    match value["type"].as_str() {
+        Some("route_optimizer_report") => render_route_optimizer_text(value),
+        Some("route_optimizer_replay") => render_route_optimizer_replay_text(value),
+        _ => render_route_feedback_summary_text(value),
+    }
 }
 
 fn render_route_feedback_summary_text(value: &Value) -> String {
@@ -8551,6 +8659,78 @@ fn render_route_feedback_summary_text(value: &Value) -> String {
     )
 }
 
+fn render_route_optimizer_text(value: &Value) -> String {
+    let report = &value["report"];
+    let feedback_count = report["feedback_count"].as_u64().unwrap_or(0);
+    let candidates = report["candidates"].as_array().cloned().unwrap_or_default();
+    let mut lines = vec![format!(
+        "Route optimizer\n  Feedback entries  {feedback_count}\n  Candidates        {}",
+        candidates.len()
+    )];
+    if let Some(health) = report["health"].as_array() {
+        lines.push("Health:".to_string());
+        for entry in health {
+            let phase = entry["phase"].as_str().unwrap_or("unknown");
+            let model = entry["model"].as_str().unwrap_or("unknown");
+            let health = entry["health"].as_str().unwrap_or("unknown");
+            let success = entry["success_rate"].as_f64().unwrap_or(0.0) * 100.0;
+            lines.push(format!(
+                "  - {phase}/{model}: {health} ({success:.0}% success)"
+            ));
+        }
+    }
+    if !candidates.is_empty() {
+        lines.push("Candidates:".to_string());
+        for candidate in candidates {
+            let phase = candidate["phase"].as_str().unwrap_or("unknown");
+            let model = candidate["model"].as_str().unwrap_or("unknown");
+            let kind = candidate["kind"].as_str().unwrap_or("observe_more");
+            let fallback = candidate["fallback_model"].as_str().unwrap_or("none");
+            lines.push(format!("  - {phase}/{model}: {kind}, fallback={fallback}"));
+        }
+    }
+    if let Some(recommendations) = report["recommendations"].as_array() {
+        lines.push("Recommendations:".to_string());
+        for recommendation in recommendations.iter().filter_map(Value::as_str) {
+            lines.push(format!("  - {recommendation}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_route_optimizer_replay_text(value: &Value) -> String {
+    let replay = &value["replay"];
+    let feedback_count = replay["feedback_count"].as_u64().unwrap_or(0);
+    let changed_routes = replay["changed_routes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let success_delta = replay["estimated_success_delta"]
+        .as_f64()
+        .unwrap_or_default()
+        * 100.0;
+    let mut lines = vec![format!(
+        "Route optimizer replay\n  Feedback entries  {feedback_count}\n  Changed routes    {}\n  Est. success delta {success_delta:.0}%",
+        changed_routes.len()
+    )];
+    if !changed_routes.is_empty() {
+        lines.push("Changes:".to_string());
+        for change in changed_routes {
+            let phase = change["phase"].as_str().unwrap_or("unknown");
+            let current = change["current_model"].as_str().unwrap_or("unknown");
+            let candidate = change["candidate_model"].as_str().unwrap_or("unknown");
+            lines.push(format!("  - {phase}: {current} -> {candidate}"));
+        }
+    }
+    if let Some(recommendations) = replay["recommendations"].as_array() {
+        lines.push("Recommendations:".to_string());
+        for recommendation in recommendations.iter().filter_map(Value::as_str) {
+            lines.push(format!("  - {recommendation}"));
+        }
+    }
+    lines.join("\n")
+}
+
 fn run_route_command(
     command: RouteCliCommand,
     output_format: CliOutputFormat,
@@ -8563,6 +8743,46 @@ fn run_route_command(
                     "type": "route_feedback_summary",
                     "feedback_count": store.feedback().len(),
                     "summaries": store.summaries(),
+                    "feedback_path": route_feedback_dir()?.join("feedback.json"),
+                }),
+                output_format,
+            )?;
+        }
+        RouteCliCommand::Optimize {
+            min_samples,
+            threshold_percent,
+        } => {
+            let store = load_route_feedback_store()?;
+            let report = runtime::evaluate_routing_feedback(
+                &store,
+                min_samples,
+                f32::from(threshold_percent) / 100.0,
+            );
+            print_route_output(
+                json!({
+                    "type": "route_optimizer_report",
+                    "report": report,
+                    "feedback_path": route_feedback_dir()?.join("feedback.json"),
+                }),
+                output_format,
+            )?;
+        }
+        RouteCliCommand::Replay {
+            min_samples,
+            threshold_percent,
+        } => {
+            let store = load_route_feedback_store()?;
+            let policy = runtime::MoERoutingPolicy::balanced(DEFAULT_MODEL);
+            let replay = runtime::replay_routing_optimizer(
+                policy,
+                &store,
+                min_samples,
+                f32::from(threshold_percent) / 100.0,
+            );
+            print_route_output(
+                json!({
+                    "type": "route_optimizer_replay",
+                    "replay": replay,
                     "feedback_path": route_feedback_dir()?.join("feedback.json"),
                 }),
                 output_format,
@@ -15619,18 +15839,45 @@ mod tests {
                 "--limit=6".to_string(),
                 "--max-ticks".to_string(),
                 "2".to_string(),
+                "--optimize-routes".to_string(),
             ])
             .expect("benchmark autonomous should parse"),
             BenchmarkCliCommand::Autonomous {
                 record: true,
                 limit: 6,
                 max_ticks: 2,
+                optimize_routes: true,
             }
         );
         assert_eq!(
             parse_route_cli_command(&["feedback".to_string(), "summary".to_string()])
                 .expect("routes feedback summary should parse"),
             RouteCliCommand::FeedbackSummary
+        );
+        assert_eq!(
+            parse_route_cli_command(&[
+                "optimize".to_string(),
+                "--min-samples=3".to_string(),
+                "--threshold-percent".to_string(),
+                "60".to_string(),
+            ])
+            .expect("routes optimize should parse"),
+            RouteCliCommand::Optimize {
+                min_samples: 3,
+                threshold_percent: 60,
+            }
+        );
+        assert_eq!(
+            parse_route_cli_command(&[
+                "replay".to_string(),
+                "--min-samples".to_string(),
+                "4".to_string(),
+            ])
+            .expect("routes replay should parse"),
+            RouteCliCommand::Replay {
+                min_samples: 4,
+                threshold_percent: 50,
+            }
         );
         assert_eq!(
             parse_args(&["routes".to_string(), "summary".to_string()])

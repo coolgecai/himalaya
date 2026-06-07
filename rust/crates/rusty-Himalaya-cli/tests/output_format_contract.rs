@@ -93,6 +93,7 @@ fn benchmark_commands_emit_suite_and_record_runs() {
             "5",
             "--max-ticks",
             "3",
+            "--optimize-routes",
         ],
     );
     assert_eq!(autonomous["type"], "benchmark_autonomous");
@@ -104,6 +105,8 @@ fn benchmark_commands_emit_suite_and_record_runs() {
             ["requested_max_ticks"],
         3
     );
+    assert!(autonomous["route_optimizer"]["report"].is_object());
+    assert_eq!(autonomous["route_optimizer"]["report"]["feedback_count"], 0);
     assert!(autonomous["record_path"]
         .as_str()
         .expect("autonomous benchmark record path")
@@ -971,6 +974,26 @@ fn route_feedback_summary_emits_metric_summaries() {
       "recovery_triggered": true,
       "timestamp": 2,
       "note": "failed"
+    },
+    {
+      "task_id": "task-4",
+      "route": {
+        "phase": "coding",
+        "model": "opus",
+        "provider": null,
+        "reason": "test fallback",
+        "confidence": 0.9,
+        "fallback_model": null
+      },
+      "succeeded": true,
+      "latency_ms": 1200,
+      "input_tokens": 1800,
+      "output_tokens": 700,
+      "cost_usd": 0.04,
+      "verification_passed": true,
+      "recovery_triggered": false,
+      "timestamp": 4,
+      "note": "ok"
     }
   ]
 }
@@ -984,7 +1007,7 @@ fn route_feedback_summary_emits_metric_summaries() {
     );
 
     assert_eq!(summary["type"], "route_feedback_summary");
-    assert_eq!(summary["feedback_count"], 3);
+    assert_eq!(summary["feedback_count"], 4);
     let route = &summary["summaries"][0];
     assert_eq!(route["phase"], "coding");
     assert_eq!(route["model"], "sonnet");
@@ -994,7 +1017,11 @@ fn route_feedback_summary_emits_metric_summaries() {
     assert_eq!(route["avg_latency_ms"], 2000.0);
     assert_eq!(route["avg_tokens"], 3000.0);
     assert_eq!(route["avg_cost_usd"], 0.02);
-    assert_eq!(summary["summaries"][1]["phase"], "verification");
+    assert!(summary["summaries"]
+        .as_array()
+        .expect("summary array")
+        .iter()
+        .any(|entry| entry["phase"] == "verification"));
 
     let output = run_Himalaya(&root, &["routes", "feedback", "summary"], &[]);
     assert!(output.status.success());
@@ -1007,6 +1034,51 @@ fn route_feedback_summary_emits_metric_summaries() {
     assert!(stdout.contains("2000ms"));
     assert!(stdout.contains("3000"));
     assert!(stdout.contains("$0.0200"));
+
+    let optimizer = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "routes",
+            "optimize",
+            "--min-samples",
+            "2",
+            "--threshold-percent",
+            "50",
+        ],
+    );
+    assert_eq!(optimizer["type"], "route_optimizer_report");
+    assert_eq!(optimizer["report"]["feedback_count"], 4);
+    assert!(optimizer["report"]["health"]
+        .as_array()
+        .expect("health array")
+        .iter()
+        .any(|entry| entry["model"] == "sonnet" && entry["health"] == "needs_fallback"));
+    assert!(optimizer["report"]["candidates"]
+        .as_array()
+        .expect("candidates array")
+        .iter()
+        .any(|candidate| candidate["model"] == "sonnet"
+            && candidate["kind"] == "recommend_fallback"
+            && candidate["fallback_model"] == "opus"));
+
+    let replay = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "routes",
+            "replay",
+            "--min-samples",
+            "2",
+            "--threshold-percent",
+            "50",
+        ],
+    );
+    assert_eq!(replay["type"], "route_optimizer_replay");
+    assert_eq!(replay["replay"]["feedback_count"], 4);
+    assert!(replay["replay"]["changed_routes"].is_array());
 }
 
 #[test]

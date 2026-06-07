@@ -173,6 +173,12 @@
           "$ref": "#/$defs/routeFeedbackSummaryEvent"
         },
         {
+          "$ref": "#/$defs/routeOptimizerReportEvent"
+        },
+        {
+          "$ref": "#/$defs/routeOptimizerReplayEvent"
+        },
+        {
           "$ref": "#/$defs/benchmarkSuiteEvent"
         },
         {
@@ -266,6 +272,8 @@
         "cron_fire_failed",
         "cron_run",
         "route_feedback_summary",
+        "route_optimizer_report",
+        "route_optimizer_replay",
         "benchmark_suite",
         "benchmark_task",
         "benchmark_run",
@@ -1357,6 +1365,52 @@
         }
       ]
     },
+    "routeOptimizerReportEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "report"
+          ],
+          "properties": {
+            "type": {
+              "const": "route_optimizer_report"
+            },
+            "report": {
+              "type": "object"
+            },
+            "feedback_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "routeOptimizerReplayEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "replay"
+          ],
+          "properties": {
+            "type": {
+              "const": "route_optimizer_replay"
+            },
+            "replay": {
+              "type": "object"
+            },
+            "feedback_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
     "benchmarkSuiteEvent": {
       "allOf": [
         {
@@ -1440,6 +1494,12 @@
             },
             "run": {
               "type": "object"
+            },
+            "route_optimizer": {
+              "type": [
+                "object",
+                "null"
+              ]
             },
             "record_path": {
               "type": [
