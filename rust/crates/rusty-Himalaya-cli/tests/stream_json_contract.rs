@@ -73,6 +73,8 @@ fn known_stream_event_types() -> BTreeSet<String> {
         "route_policy_apply",
         "route_policy_rollback",
         "route_policy_list",
+        "policy_review",
+        "policy_ledger",
         "benchmark_suite",
         "benchmark_task",
         "benchmark_run",
@@ -916,6 +918,39 @@ fn route_policy_proposal_emits_stream_json_event() {
         .expect("route policy proposal event should be emitted");
     assert!(event["proposal"].is_object());
     assert!(event["proposal"]["changes"].is_array());
+}
+
+#[test]
+fn policy_review_emits_stream_json_event() {
+    let workspace = HarnessWorkspace::new(unique_temp_dir("stream-json-policy-review"));
+    workspace.create();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_Himalaya"));
+    command
+        .current_dir(&workspace.root)
+        .env_clear()
+        .env("Himalaya_CONFIG_HOME", &workspace.config_home)
+        .env("HOME", &workspace.home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args([
+            "--output-format",
+            "stream-json",
+            "policy",
+            "review",
+            "--no-record",
+        ]);
+    let output = command.output().expect("Himalaya should launch");
+    assert_success(&output);
+
+    let events = parse_stream_json_stdout(&output.stdout);
+    assert_all_events_are_versioned(&events);
+    let event = events
+        .iter()
+        .find(|event| event["type"] == "policy_review")
+        .expect("policy review event should be emitted");
+    assert_eq!(event["recorded"], false);
+    assert!(event["review"]["ledger_entry"].is_object());
 }
 
 #[test]
@@ -1831,6 +1866,14 @@ fn assert_stream_event_schema(event: &Value) {
         "route_policy_list" => assert!(
             event["proposals"].is_array(),
             "route_policy_list requires proposals array: {event:?}"
+        ),
+        "policy_review" => assert!(
+            event["review"].is_object(),
+            "policy_review requires review object: {event:?}"
+        ),
+        "policy_ledger" => assert!(
+            event["ledger"].is_object(),
+            "policy_ledger requires ledger object: {event:?}"
         ),
         "benchmark_suite" => {
             assert_non_empty_string(&event["suite_id"]);

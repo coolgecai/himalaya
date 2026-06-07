@@ -333,6 +333,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             model,
         } => run_route_command(command, output_format, &model)?,
+        CliAction::Policy {
+            command,
+            output_format,
+            permission_mode,
+        } => run_policy_command(command, output_format, permission_mode)?,
         CliAction::Local {
             command,
             output_format,
@@ -508,6 +513,11 @@ enum CliAction {
         command: RouteCliCommand,
         output_format: CliOutputFormat,
         model: String,
+    },
+    Policy {
+        command: PolicyCliCommand,
+        output_format: CliOutputFormat,
+        permission_mode: PermissionMode,
     },
     Local {
         command: LocalCliCommand,
@@ -803,6 +813,18 @@ enum RouteCliCommand {
     },
     Rollback {
         proposal_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PolicyCliCommand {
+    Review {
+        limit: usize,
+        max_ticks: usize,
+        record: bool,
+    },
+    Ledger {
+        limit: usize,
     },
 }
 
@@ -1216,6 +1238,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             model,
         }),
+        "policy" | "policies" => Ok(CliAction::Policy {
+            command: parse_policy_cli_command(&rest[1..])?,
+            output_format,
+            permission_mode,
+        }),
         "test" | "lint" | "build" | "review" | "diagnostics" | "workspace" | "cwd" => {
             Ok(CliAction::Local {
                 command: parse_local_cli_command(&rest)?,
@@ -1572,6 +1599,94 @@ fn parse_percent_u8(name: &str, value: &str) -> Result<u8, String> {
         return Err(format!("{name} must be between 0 and 100"));
     }
     Ok(parsed)
+}
+
+fn parse_policy_cli_command(args: &[String]) -> Result<PolicyCliCommand, String> {
+    match args.split_first().map(|(command, rest)| (command.as_str(), rest)) {
+        None | Some(("review", [])) => Ok(PolicyCliCommand::Review {
+            limit: 20,
+            max_ticks: 1,
+            record: true,
+        }),
+        Some(("review", rest)) => parse_policy_review_args(rest),
+        Some(("ledger" | "log", rest)) => parse_policy_ledger_args(rest),
+        Some((other, _)) => Err(format!(
+            "unknown policy command: {other}\nUsage: Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]]"
+        )),
+    }
+}
+
+fn parse_policy_review_args(args: &[String]) -> Result<PolicyCliCommand, String> {
+    let mut limit = 20_usize;
+    let mut max_ticks = 1_usize;
+    let mut record = true;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "policy review --limit requires a value".to_string())?;
+                limit = parse_positive_usize("--limit", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--limit=") => {
+                limit = parse_positive_usize("--limit", &value[8..])?;
+                index += 1;
+            }
+            "--max-ticks" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "policy review --max-ticks requires a value".to_string())?;
+                max_ticks = parse_positive_usize("--max-ticks", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--max-ticks=") => {
+                max_ticks = parse_positive_usize("--max-ticks", &value[12..])?;
+                index += 1;
+            }
+            "--no-record" => {
+                record = false;
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown policy review argument: {other}\nUsage: Himalaya policy review [--limit N] [--max-ticks N] [--no-record]"
+                ));
+            }
+        }
+    }
+    Ok(PolicyCliCommand::Review {
+        limit,
+        max_ticks,
+        record,
+    })
+}
+
+fn parse_policy_ledger_args(args: &[String]) -> Result<PolicyCliCommand, String> {
+    let mut limit = 20_usize;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "policy ledger --limit requires a value".to_string())?;
+                limit = parse_positive_usize("--limit", value)?;
+                index += 2;
+            }
+            value if value.starts_with("--limit=") => {
+                limit = parse_positive_usize("--limit", &value[8..])?;
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown policy ledger argument: {other}\nUsage: Himalaya policy ledger [--limit N]"
+                ));
+            }
+        }
+    }
+    Ok(PolicyCliCommand::Ledger { limit })
 }
 
 fn parse_task_status(value: &str) -> Result<runtime::TaskStatus, String> {
@@ -9008,6 +9123,139 @@ fn run_route_command(
     Ok(())
 }
 
+fn run_policy_command(
+    command: PolicyCliCommand,
+    output_format: CliOutputFormat,
+    permission_mode: PermissionMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        PolicyCliCommand::Review {
+            limit,
+            max_ticks,
+            record,
+        } => {
+            let input = build_policy_governance_input(limit, max_ticks, permission_mode)?;
+            let ledger = runtime::PolicyGovernanceLedger::new(policy_governance_dir()?);
+            let review = runtime::review_policy_governance(input);
+            let review = if record {
+                ledger.record_review(review)?
+            } else {
+                review
+            };
+            print_policy_output(
+                json!({
+                    "type": "policy_review",
+                    "review": review,
+                    "recorded": record,
+                    "ledger_path": ledger.ledger_path(),
+                }),
+                output_format,
+            )?;
+        }
+        PolicyCliCommand::Ledger { limit } => {
+            let ledger = runtime::PolicyGovernanceLedger::new(policy_governance_dir()?);
+            let load = ledger.load(limit)?;
+            print_policy_output(
+                json!({
+                    "type": "policy_ledger",
+                    "ledger": load,
+                    "ledger_path": ledger.ledger_path(),
+                }),
+                output_format,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn build_policy_governance_input(
+    limit: usize,
+    max_ticks: usize,
+    permission_mode: PermissionMode,
+) -> Result<runtime::PolicyGovernanceInput, Box<dyn std::error::Error>> {
+    let autonomous_evaluation =
+        match build_autonomous_evaluation_input(limit, max_ticks, permission_mode) {
+            Ok(input) => Some(runtime::evaluate_autonomous_loop(input)),
+            Err(_) => None,
+        };
+    let routing_proposals = runtime::load_routing_policy_proposals(&route_feedback_dir()?)
+        .map(|snapshot| snapshot.proposals)
+        .unwrap_or_default();
+    let applied_routing_policy = runtime::load_applied_routing_policy(&route_feedback_dir()?)?;
+    let scheduler_state = runtime::SchedulerDaemon::new(
+        runtime::DurableTaskScheduler::new(
+            load_task_registry()?,
+            runtime::VerificationRunner::new(Some(env::current_dir()?)),
+        )
+        .with_permission_mode(permission_mode),
+        scheduler_state_dir()?,
+    )
+    .load_state()
+    .ok();
+    Ok(runtime::PolicyGovernanceInput {
+        autonomous_evaluation,
+        routing_proposals,
+        applied_routing_policy,
+        scheduler_state,
+    })
+}
+
+fn print_policy_output(
+    value: Value,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match output_format {
+        CliOutputFormat::StreamJson => print_stream_json_event(value),
+        CliOutputFormat::Json => print_task_json(value)?,
+        CliOutputFormat::Text => println!("{}", render_policy_output_text(&value)),
+    }
+    Ok(())
+}
+
+fn render_policy_output_text(value: &Value) -> String {
+    match value["type"].as_str() {
+        Some("policy_ledger") => render_policy_ledger_text(value),
+        _ => render_policy_review_text(value),
+    }
+}
+
+fn render_policy_review_text(value: &Value) -> String {
+    let entry = &value["review"]["ledger_entry"];
+    let summary = &entry["summary"];
+    let status = entry["status"].as_str().unwrap_or("unknown");
+    let proposals = summary["proposal_count"].as_u64().unwrap_or(0);
+    let conflicts = summary["conflict_count"].as_u64().unwrap_or(0);
+    let failed_gates = summary["failed_gate_count"].as_u64().unwrap_or(0);
+    let recorded = value["recorded"].as_bool().unwrap_or(false);
+    let mut lines = vec![format!(
+        "Policy review\n  Status      {status}\n  Proposals   {proposals}\n  Conflicts   {conflicts}\n  Failed gates {failed_gates}\n  Recorded    {recorded}"
+    )];
+    if let Some(recommendations) = entry["recommendations"].as_array() {
+        lines.push("Recommendations:".to_string());
+        for recommendation in recommendations.iter().filter_map(Value::as_str) {
+            lines.push(format!("  - {recommendation}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_policy_ledger_text(value: &Value) -> String {
+    let ledger = &value["ledger"];
+    let entries = ledger["entries"].as_array().cloned().unwrap_or_default();
+    let malformed = ledger["malformed_lines"].as_u64().unwrap_or(0);
+    let mut lines = vec![format!(
+        "Policy ledger\n  Entries   {}\n  Malformed {malformed}",
+        entries.len()
+    )];
+    for entry in entries {
+        let id = entry["id"].as_str().unwrap_or("unknown");
+        let status = entry["status"].as_str().unwrap_or("unknown");
+        let conflicts = entry["summary"]["conflict_count"].as_u64().unwrap_or(0);
+        lines.push(format!("  - {id}: {status}, conflicts={conflicts}"));
+    }
+    lines.join("\n")
+}
+
 fn run_worker_command(
     command: WorkerCliCommand,
     output_format: CliOutputFormat,
@@ -9330,6 +9578,11 @@ fn route_feedback_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn task_memory_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     Ok(cwd.join(".Himalaya").join("memory"))
+}
+
+fn policy_governance_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    Ok(cwd.join(".Himalaya").join("policy"))
 }
 
 fn load_route_feedback_store() -> Result<runtime::RouteFeedbackStore, Box<dyn std::error::Error>> {
@@ -14618,6 +14871,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  Himalaya policy [review [--limit N] [--max-ticks N] [--no-record]|ledger [--limit N]]"
+    )?;
+    writeln!(
+        out,
+        "      Review cross-domain autonomous policy state and append the governance ledger"
+    )?;
+    writeln!(
+        out,
         "  Himalaya benchmark [list|show <task-id>|run [--record]]"
     )?;
     writeln!(
@@ -14768,23 +15029,23 @@ mod tests {
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         load_files_as_content_blocks, maturity_matrix_value, merge_prompt_with_stdin,
-        normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
-        parse_route_cli_command, parse_task_cli_command, parse_worker_cli_command,
-        permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
+        normalize_permission_mode, parse_args, parse_benchmark_cli_command, parse_export_args,
+        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        parse_history_count, parse_policy_cli_command, parse_route_cli_command,
+        parse_task_cli_command, parse_worker_cli_command, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, slash_command_status, status_context,
         stream_json_event, summarize_tool_payload_for_markdown, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, CronCliCommand,
-        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
-        LocalHelpTopic, PromptHistoryEntry, RouteCliCommand, SlashCommand, SlashCommandStatus,
-        StatusUsage, TaskCliCommand, TaskDaemonCliCommand, TaskPacketCliCommand,
-        TaskSchedulerCliCommand, WorkerCliCommand, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        STREAM_PROTOCOL_VERSION,
+        write_mcp_server_fixture, BenchmarkCliCommand, CliAction, CliOutputFormat, CliToolExecutor,
+        CronCliCommand, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PolicyCliCommand, PromptHistoryEntry,
+        RouteCliCommand, SlashCommand, SlashCommandStatus, StatusUsage, TaskCliCommand,
+        TaskDaemonCliCommand, TaskPacketCliCommand, TaskSchedulerCliCommand, WorkerCliCommand,
+        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STREAM_PROTOCOL_VERSION,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -16161,6 +16422,55 @@ mod tests {
                 command: RouteCliCommand::FeedbackSummary,
                 output_format: CliOutputFormat::Text,
                 model: DEFAULT_MODEL.to_string(),
+            }
+        );
+        assert_eq!(
+            parse_policy_cli_command(&["review".to_string()]).expect("policy review should parse"),
+            PolicyCliCommand::Review {
+                limit: 20,
+                max_ticks: 1,
+                record: true,
+            }
+        );
+        assert_eq!(
+            parse_policy_cli_command(&[
+                "review".to_string(),
+                "--limit=7".to_string(),
+                "--max-ticks".to_string(),
+                "3".to_string(),
+                "--no-record".to_string(),
+            ])
+            .expect("policy review args should parse"),
+            PolicyCliCommand::Review {
+                limit: 7,
+                max_ticks: 3,
+                record: false,
+            }
+        );
+        assert_eq!(
+            parse_policy_cli_command(&[
+                "ledger".to_string(),
+                "--limit".to_string(),
+                "5".to_string()
+            ])
+            .expect("policy ledger should parse"),
+            PolicyCliCommand::Ledger { limit: 5 }
+        );
+        assert_eq!(
+            parse_args(&[
+                "policy".to_string(),
+                "review".to_string(),
+                "--no-record".to_string()
+            ])
+            .expect("policy review should parse"),
+            CliAction::Policy {
+                command: PolicyCliCommand::Review {
+                    limit: 20,
+                    max_ticks: 1,
+                    record: false,
+                },
+                output_format: CliOutputFormat::Text,
+                permission_mode: crate::default_permission_mode(),
             }
         );
         assert_eq!(

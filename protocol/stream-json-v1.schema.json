@@ -191,6 +191,12 @@
           "$ref": "#/$defs/routePolicyListEvent"
         },
         {
+          "$ref": "#/$defs/policyReviewEvent"
+        },
+        {
+          "$ref": "#/$defs/policyLedgerEvent"
+        },
+        {
           "$ref": "#/$defs/benchmarkSuiteEvent"
         },
         {
@@ -290,6 +296,8 @@
         "route_policy_apply",
         "route_policy_rollback",
         "route_policy_list",
+        "policy_review",
+        "policy_ledger",
         "benchmark_suite",
         "benchmark_task",
         "benchmark_run",
@@ -1513,6 +1521,55 @@
               "type": "string"
             },
             "applied_policy_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "policyReviewEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "review"
+          ],
+          "properties": {
+            "type": {
+              "const": "policy_review"
+            },
+            "review": {
+              "type": "object"
+            },
+            "recorded": {
+              "type": "boolean"
+            },
+            "ledger_path": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "policyLedgerEvent": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/baseEvent"
+        },
+        {
+          "required": [
+            "ledger"
+          ],
+          "properties": {
+            "type": {
+              "const": "policy_ledger"
+            },
+            "ledger": {
+              "type": "object"
+            },
+            "ledger_path": {
               "type": "string"
             }
           }

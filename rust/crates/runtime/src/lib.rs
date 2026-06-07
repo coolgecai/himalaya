@@ -39,6 +39,7 @@ mod permissions;
 pub mod plan_executor;
 pub mod plugin_lifecycle;
 mod policy_engine;
+pub mod policy_governance;
 mod prompt;
 pub mod recovery_actions;
 pub mod recovery_orchestrator;
@@ -200,6 +201,13 @@ pub use plugin_lifecycle::{
 pub use policy_engine::{
     evaluate, DiffScope, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
     PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
+};
+pub use policy_governance::{
+    load_policy_governance_ledger, policy_governance_ledger_path, review_policy_governance,
+    PolicyConflict, PolicyDecision, PolicyDomain, PolicyGate, PolicyGovernanceInput,
+    PolicyGovernanceLedger, PolicyGovernanceReview, PolicyLedgerEntry, PolicyLedgerLoad,
+    PolicyLedgerStatus, PolicyLedgerWarning, PolicyProposal, PolicyReference, PolicyReviewSummary,
+    PolicyRiskLevel, POLICY_GOVERNANCE_LEDGER_FILE, POLICY_GOVERNANCE_VERSION,
 };
 pub use prompt::{
     load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,

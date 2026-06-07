@@ -128,6 +128,56 @@ fn help_emits_json_when_requested() {
 }
 
 #[test]
+fn policy_review_records_governance_ledger() {
+    let root = unique_temp_dir("policy-review-json");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let review = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "policy",
+            "review",
+            "--limit",
+            "5",
+            "--max-ticks",
+            "2",
+        ],
+    );
+    assert_eq!(review["type"], "policy_review");
+    assert_eq!(review["recorded"], true);
+    assert_eq!(review["review"]["version"], 1);
+    assert!(review["review"]["ledger_entry"]["summary"].is_object());
+    assert!(review["ledger_path"]
+        .as_str()
+        .expect("ledger path")
+        .ends_with(".Himalaya/policy/ledger.jsonl"));
+    assert!(root.join(".Himalaya/policy/ledger.jsonl").exists());
+
+    let ledger = assert_json_command(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "policy",
+            "ledger",
+            "--limit",
+            "5",
+        ],
+    );
+    assert_eq!(ledger["type"], "policy_ledger");
+    assert_eq!(
+        ledger["ledger"]["entries"]
+            .as_array()
+            .expect("entries")
+            .len(),
+        1
+    );
+    assert_eq!(ledger["ledger"]["malformed_lines"], 0);
+}
+
+#[test]
 fn version_emits_json_when_requested() {
     let root = unique_temp_dir("version-json");
     fs::create_dir_all(&root).expect("temp dir should exist");
