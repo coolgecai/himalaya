@@ -157,6 +157,8 @@ impl SystemPromptBuilder {
         if let (Some(name), Some(prompt)) = (&self.output_style_name, &self.output_style_prompt) {
             sections.push(format!("# Output Style: {name}\n{prompt}"));
         }
+        sections.push(get_capabilities_section());
+        sections.push(get_using_tools_section());
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
         sections.push(get_actions_section());
@@ -597,13 +599,49 @@ fn render_config_section(config: &RuntimeConfig) -> String {
 
 fn get_simple_intro_section(has_output_style: bool) -> String {
     format!(
-        "You are an interactive agent that helps users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
+        "You are an interactive AI coding agent that helps users {}\n\nYou have access to a broad set of tools for reading and writing files, searching codebases, executing shell commands, fetching web content, searching the web, managing tasks, and more. When a user asks you to inspect, analyze, or modify their project, use the appropriate tools directly; do not ask the user to copy-paste code or describe what they see.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
         if has_output_style {
-            "according to your \"Output Style\" below, which describes how you should respond to user queries."
+            "according to your \"Output Style\" below, which describes how you should respond to user queries"
         } else {
-            "with software engineering tasks."
+            "with software engineering tasks"
         }
     )
+}
+
+fn get_capabilities_section() -> String {
+    let items = prepend_bullets(vec![
+        "**File operations**: read_file (reads text, PDF, DOCX, XLSX, PPTX), write_file (creates/overwrites), edit_file (precise string replacement), generate_file (creates binary documents)".to_string(),
+        "**Code search**: glob_search (find files by pattern), grep_search (search file contents with regex)".to_string(),
+        "**Web access**: WebSearch (search the web for current information, research, documentation), WebFetch (fetch a URL and answer questions about its content)".to_string(),
+        "**Shell**: bash (execute shell commands in the workspace), REPL (interactive code execution)".to_string(),
+        "**Task management**: TodoWrite (track progress with structured task lists), TaskCreate (spawn background tasks)".to_string(),
+        "**Sub-agents**: Agent (launch specialized sub-agents for parallel work or isolated contexts)".to_string(),
+        "**Tool discovery**: ToolSearch (find additional or specialized tools by name or keyword)".to_string(),
+        "**User interaction**: AskUserQuestion (ask clarifying questions), SendUserMessage (send proactive messages)".to_string(),
+        "**Other**: Skill (load domain-specific instructions), NotebookEdit (edit Jupyter notebooks), Config (get/set settings)".to_string(),
+    ]);
+
+    std::iter::once("# Capabilities".to_string())
+        .chain(items)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn get_using_tools_section() -> String {
+    let items = prepend_bullets(vec![
+        "Prefer dedicated tools over raw shell commands when both can accomplish the task (e.g., use read_file instead of `cat`, glob_search instead of `ls`).".to_string(),
+        "Call independent tools in parallel; reading two files or searching the web while reading code are parallel-safe operations that save time.".to_string(),
+        "When the user asks about their current project, workspace, or 当前工程, immediately inspect the working directory with available tools instead of asking the user to provide code or links.".to_string(),
+        "For architecture or source-analysis requests, gather local evidence first: discover files with glob_search, read key manifests and configs with read_file, search for entry points with grep_search, and read at least three relevant source files before forming your answer.".to_string(),
+        "Use WebSearch for questions about libraries, APIs, research papers, best practices, error messages, and current information; it returns cited results. Use WebFetch to read a specific URL in detail.".to_string(),
+        "Use ToolSearch when you need a capability that is not obvious from the built-in tool list; it returns matching tool names and descriptions.".to_string(),
+        "Use TodoWrite to track progress on multi-step tasks. Mark one item in_progress at a time and completed when done.".to_string(),
+    ]);
+
+    std::iter::once("# Using tools effectively".to_string())
+        .chain(items)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn get_simple_system_section() -> String {
@@ -626,12 +664,12 @@ fn get_simple_doing_tasks_section() -> String {
     let items = prepend_bullets(vec![
         "Read relevant code before changing it and keep changes tightly scoped to the request.".to_string(),
         "When the user asks about the current project, repository, workspace, working directory, source tree, or 当前工程/当前工作目录, inspect the local working directory with available tools instead of asking the user to upload code or provide a repository link.".to_string(),
-        "For architecture/source-analysis requests, do not provide a final answer from filenames or prior context alone: first gather local evidence with file discovery, manifest/config reads, multiple relevant source-file reads, and at least one content search for entry points or module relationships. If tools are unavailable or blocked, explicitly state that limitation.".to_string(),
+        "For architecture/source-analysis requests, do not provide a final answer from filenames or prior context alone: first gather local evidence with file discovery, manifest/config reads, multiple relevant source-file reads, and at least one content search for entry points or module relationships.".to_string(),
         "Do not add speculative abstractions, compatibility shims, or unrelated cleanup.".to_string(),
         "Do not create files unless they are required to complete the task.".to_string(),
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
-        "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
+        "Report outcomes faithfully: if a test fails, say so with the output. If a step was skipped, say that. When something is done and verified, state it plainly without hedging. Never claim all tests pass when output shows failures. Never characterize incomplete work as done.".to_string(),
     ]);
 
     std::iter::once("# Doing tasks".to_string())
@@ -745,6 +783,31 @@ mod tests {
         assert!(section.contains("instead of asking the user to upload code"));
         assert!(section.contains("multiple relevant source-file reads"));
         assert!(section.contains("content search for entry points"));
+    }
+
+    #[test]
+    fn system_prompt_surfaces_tool_capabilities_before_dynamic_context() {
+        let rendered = SystemPromptBuilder::new().with_os("linux", "6.8").render();
+
+        let capabilities = rendered
+            .find("# Capabilities")
+            .expect("capabilities section should render");
+        let tool_usage = rendered
+            .find("# Using tools effectively")
+            .expect("tool usage section should render");
+        let boundary = rendered
+            .find(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .expect("dynamic boundary should render");
+
+        assert!(capabilities < tool_usage);
+        assert!(tool_usage < boundary);
+        assert!(rendered.contains("read_file"));
+        assert!(rendered.contains("glob_search"));
+        assert!(rendered.contains("WebSearch"));
+        assert!(rendered.contains("TodoWrite"));
+        assert!(rendered.contains("TaskCreate"));
+        assert!(rendered.contains("use the appropriate tools directly"));
+        assert!(rendered.contains("Call independent tools in parallel"));
     }
 
     #[test]

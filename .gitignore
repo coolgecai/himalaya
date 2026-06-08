@@ -8,6 +8,7 @@ rust/target/
 vscode-extension/out/
 vscode-extension/*.vsix
 vscode-extension/compile_output.txt
+dist/
 
 # Generated packaged binaries
 bin/
@@ -33,6 +34,7 @@ rust/.Himalayad-agents/
 
 # Local editor and tool config
 .vscode/
+.claude/
 rust/.cargo/
 
 # Logs
