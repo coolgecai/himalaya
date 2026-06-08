@@ -164,18 +164,18 @@ impl PolicyApplyCoordinator {
         let adapter_result = adapter.apply(&validated, plan.dry_run)?;
         let blockers = blocker_messages(&adapter_result.blockers);
         let report_id = format!("policy-apply-{}", now_millis());
-        let receipt = policy_action_receipt(
-            report_id.clone(),
+        let receipt = policy_action_receipt(PolicyActionReceiptInput {
+            id: report_id.clone(),
             plan,
-            adapter_result.status,
-            adapter_result.executed,
-            Some(validated.before_status),
-            adapter_result.after_status,
-            Some(descriptor.name),
-            adapter_result.adapter_report_id.clone(),
-            adapter_result.blockers.clone(),
-            adapter_result.recommendations.clone(),
-        );
+            status: adapter_result.status,
+            executed: adapter_result.executed,
+            before_status: Some(validated.before_status),
+            after_status: adapter_result.after_status,
+            adapter: Some(descriptor.name),
+            adapter_report_id: adapter_result.adapter_report_id.clone(),
+            blockers: adapter_result.blockers.clone(),
+            recommendations: adapter_result.recommendations.clone(),
+        });
         Ok(PolicyApplyReport {
             version: POLICY_GOVERNANCE_VERSION,
             id: report_id,
@@ -276,18 +276,18 @@ impl PolicyApplyCoordinator {
         let adapter_result = adapter.rollback(&validated)?;
         let blockers = blocker_messages(&adapter_result.blockers);
         let report_id = format!("policy-rollback-{}", now_millis());
-        let receipt = policy_action_receipt(
-            report_id.clone(),
+        let receipt = policy_action_receipt(PolicyActionReceiptInput {
+            id: report_id.clone(),
             plan,
-            adapter_result.status,
-            adapter_result.executed,
-            Some(validated.before_status),
-            adapter_result.after_status,
-            Some(descriptor.name),
-            adapter_result.adapter_report_id.clone(),
-            adapter_result.blockers.clone(),
-            adapter_result.recommendations.clone(),
-        );
+            status: adapter_result.status,
+            executed: adapter_result.executed,
+            before_status: Some(validated.before_status),
+            after_status: adapter_result.after_status,
+            adapter: Some(descriptor.name),
+            adapter_report_id: adapter_result.adapter_report_id.clone(),
+            blockers: adapter_result.blockers.clone(),
+            recommendations: adapter_result.recommendations.clone(),
+        });
         Ok(PolicyRollbackReport {
             version: POLICY_GOVERNANCE_VERSION,
             id: report_id,
@@ -395,12 +395,12 @@ fn build_policy_apply_plan(
 
     let mut actions = Vec::new();
     for proposal in &review.ledger_entry.proposals {
-        if !domain_filter.map_or(true, |domain| domain == proposal.domain) {
+        if domain_filter.is_some_and(|domain| domain != proposal.domain) {
             continue;
         }
-        if !proposal_id
+        if proposal_id
             .as_deref()
-            .map_or(true, |wanted| wanted == proposal.id)
+            .is_some_and(|wanted| wanted != proposal.id)
         {
             continue;
         }
@@ -418,7 +418,7 @@ fn build_policy_apply_plan(
             ) {
                 continue;
             }
-            if !domain_filter.map_or(true, |domain| domain == decision.domain) {
+            if domain_filter.is_some_and(|domain| domain != decision.domain) {
                 continue;
             }
             actions.push(policy_apply_action_from_decision(decision, operation));
@@ -680,18 +680,18 @@ fn blocked_apply_report(
     let report_id = format!("policy-apply-{}", now_millis());
     let blockers = blocker_messages(&structured_blockers);
     let recommendations = vec![recommendation.to_string()];
-    let receipt = policy_action_receipt(
-        report_id.clone(),
+    let receipt = policy_action_receipt(PolicyActionReceiptInput {
+        id: report_id.clone(),
         plan,
-        PolicyLedgerStatus::ApplyBlocked,
-        false,
-        None,
-        None,
-        None,
-        None,
-        structured_blockers.clone(),
-        recommendations.clone(),
-    );
+        status: PolicyLedgerStatus::ApplyBlocked,
+        executed: false,
+        before_status: None,
+        after_status: None,
+        adapter: None,
+        adapter_report_id: None,
+        blockers: structured_blockers.clone(),
+        recommendations: recommendations.clone(),
+    });
     PolicyApplyReport {
         version: POLICY_GOVERNANCE_VERSION,
         id: report_id,
@@ -717,18 +717,18 @@ fn blocked_rollback_report(
     let report_id = format!("policy-rollback-{}", now_millis());
     let blockers = blocker_messages(&structured_blockers);
     let recommendations = vec![recommendation.to_string()];
-    let receipt = policy_action_receipt(
-        report_id.clone(),
+    let receipt = policy_action_receipt(PolicyActionReceiptInput {
+        id: report_id.clone(),
         plan,
-        PolicyLedgerStatus::RollbackBlocked,
-        false,
-        None,
-        None,
-        None,
-        None,
-        structured_blockers.clone(),
-        recommendations.clone(),
-    );
+        status: PolicyLedgerStatus::RollbackBlocked,
+        executed: false,
+        before_status: None,
+        after_status: None,
+        adapter: None,
+        adapter_report_id: None,
+        blockers: structured_blockers.clone(),
+        recommendations: recommendations.clone(),
+    });
     PolicyRollbackReport {
         version: POLICY_GOVERNANCE_VERSION,
         id: report_id,
@@ -745,9 +745,9 @@ fn blocked_rollback_report(
     }
 }
 
-fn policy_action_receipt(
+struct PolicyActionReceiptInput<'a> {
     id: String,
-    plan: &PolicyApplyPlan,
+    plan: &'a PolicyApplyPlan,
     status: PolicyLedgerStatus,
     executed: bool,
     before_status: Option<PolicyLedgerStatus>,
@@ -756,25 +756,27 @@ fn policy_action_receipt(
     adapter_report_id: Option<String>,
     blockers: Vec<PolicyBlocker>,
     recommendations: Vec<String>,
-) -> PolicyActionReceipt {
+}
+
+fn policy_action_receipt(input: PolicyActionReceiptInput<'_>) -> PolicyActionReceipt {
     PolicyActionReceipt {
         version: POLICY_GOVERNANCE_VERSION,
-        id: format!("{id}-receipt"),
-        plan_id: plan.id.clone(),
-        plan_fingerprint: plan.fingerprint.clone(),
-        operation: plan.operation,
-        dry_run: plan.dry_run,
-        domain: plan.domain_filter,
-        proposal_id: plan.proposal_id.clone(),
-        status,
-        executed,
-        before_status,
-        after_status,
-        adapter,
-        adapter_report_id,
-        ledger_entry_id: Some(id),
-        blockers,
-        recommendations,
+        id: format!("{}-receipt", input.id),
+        plan_id: input.plan.id.clone(),
+        plan_fingerprint: input.plan.fingerprint.clone(),
+        operation: input.plan.operation,
+        dry_run: input.plan.dry_run,
+        domain: input.plan.domain_filter,
+        proposal_id: input.plan.proposal_id.clone(),
+        status: input.status,
+        executed: input.executed,
+        before_status: input.before_status,
+        after_status: input.after_status,
+        adapter: input.adapter,
+        adapter_report_id: input.adapter_report_id,
+        ledger_entry_id: Some(input.id),
+        blockers: input.blockers,
+        recommendations: input.recommendations,
     }
 }
 

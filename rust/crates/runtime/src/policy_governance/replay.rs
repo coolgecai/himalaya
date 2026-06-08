@@ -74,9 +74,7 @@ pub fn replay_policy_lifecycle_entries(load: PolicyLedgerLoad) -> PolicyLifecycl
                 });
             }
             if entry.status == PolicyLedgerStatus::RolledBack
-                && !seen
-                    .iter()
-                    .any(|status| *status == PolicyLedgerStatus::Applied)
+                && !seen.contains(&PolicyLedgerStatus::Applied)
             {
                 anomalies.push(PolicyReplayAnomaly {
                     entry_id: entry.id.clone(),
@@ -146,8 +144,8 @@ pub fn filter_policy_lifecycle_replay(
         .lifecycles
         .iter()
         .filter(|lifecycle| {
-            domain.map_or(true, |wanted| lifecycle.domain == wanted)
-                && action_contains.map_or(true, |wanted| {
+            domain.is_none_or(|wanted| lifecycle.domain == wanted)
+                && action_contains.is_none_or(|wanted| {
                     lifecycle
                         .events
                         .iter()

@@ -643,8 +643,7 @@ fn recommend_autonomous_policy(
                 if recommended_max_ticks < requested_max_ticks {
                     action = AutonomousPolicyAction::ReduceTicks;
                     reasons.push(format!(
-                        "recent runs usually reached idle in {:.1} tick(s)",
-                        avg_idle
+                        "recent runs usually reached idle in {avg_idle:.1} tick(s)"
                     ));
                 }
             }

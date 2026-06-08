@@ -163,9 +163,7 @@ pub(super) fn routing_policy_proposal(proposal: &RoutingPolicyProposal) -> Polic
             reason: gate.reason.clone(),
         })
         .collect::<Vec<_>>();
-    let risk = if gates.iter().any(|gate| gate.blocks_apply) {
-        PolicyRiskLevel::High
-    } else if proposal.changes.len() > 1 {
+    let risk = if gates.iter().any(|gate| gate.blocks_apply) || proposal.changes.len() > 1 {
         PolicyRiskLevel::High
     } else if proposal.changes.is_empty() {
         PolicyRiskLevel::Low

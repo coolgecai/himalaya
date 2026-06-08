@@ -1333,13 +1333,10 @@ fn cron_run_fires_due_entry_end_to_end() {
     assert!(cron_run["created_tasks"][0]["memory_context"].is_object());
     assert_eq!(cron_run["autonomous_run"]["status"], "running");
     assert!(cron_run["autonomous_run"]["worker_supervisor_ticks"].is_array());
-    assert!(
-        cron_run["scheduler"]["runs"]
-            .as_array()
-            .expect("scheduler runs array")
-            .len()
-            >= 1
-    );
+    assert!(!cron_run["scheduler"]["runs"]
+        .as_array()
+        .expect("scheduler runs array")
+        .is_empty());
 
     // The fired entry's run was recorded in the persisted registry.
     let crons_path = workspace

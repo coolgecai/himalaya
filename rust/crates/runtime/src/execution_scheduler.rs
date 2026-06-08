@@ -572,7 +572,7 @@ fn task_snapshot(
                 && node.worker_id.as_deref().is_some_and(|worker_id| {
                     worker_registry
                         .and_then(|registry| registry.get(worker_id))
-                        .map_or(true, |worker| {
+                        .is_none_or(|worker| {
                             matches!(
                                 worker.status,
                                 WorkerStatus::Spawning

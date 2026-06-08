@@ -294,8 +294,6 @@ fn integration_components(
             "scheduler",
             if input.scheduler_state.is_some() {
                 AutonomousIntegrationCheckStatus::Passed
-            } else if summary.task_count == 0 {
-                AutonomousIntegrationCheckStatus::Warning
             } else {
                 AutonomousIntegrationCheckStatus::Warning
             },
