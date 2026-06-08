@@ -3,6 +3,7 @@ name = "rusty-Himalaya-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "AI-powered CLI coding assistant with autonomous task planning and model routing."
 publish.workspace = true
 
 [[bin]]
@@ -38,7 +39,7 @@ section = "devel"
 priority = "optional"
 assets = [
   ["target/release/Himalaya", "usr/bin/himalaya-code", "755"],
-  ["../../../README.md", "usr/share/doc/himalaya-code/README.md", "644"],
+  ["../../README.md", "usr/share/doc/himalaya-code/README.md", "644"],
   ["../plugins/bundled/example-bundled/.Himalaya-plugin/plugin.json", "usr/share/himalaya-code/bundled/example-bundled/.Himalaya-plugin/plugin.json", "644"],
   ["../plugins/bundled/example-bundled/hooks/pre.sh", "usr/share/himalaya-code/bundled/example-bundled/hooks/pre.sh", "755"],
   ["../plugins/bundled/example-bundled/hooks/post.sh", "usr/share/himalaya-code/bundled/example-bundled/hooks/post.sh", "755"],
