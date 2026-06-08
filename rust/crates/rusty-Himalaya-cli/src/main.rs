@@ -15266,12 +15266,7 @@ fn expand_at_file_syntax(input: &str, model: &str) -> Result<(String, Vec<Conten
 
         match extract_file(path, want_image) {
             Ok(FileContent::Text(text)) => {
-                if text.contains("[No extractable text was found in this PDF attachment") {
-                    eprintln!(
-                        "Attachment warning: no extractable text found in {}",
-                        path.display()
-                    );
-                }
+                warn_for_extracted_attachment_text(path, &text);
                 let label = path_str;
                 result.push_str(&format!("[File: {label}]\n{text}\n"));
             }
@@ -15341,12 +15336,7 @@ fn load_files_as_content_blocks(
         }
         match extract_file(path, want_image) {
             Ok(FileContent::Text(text)) => {
-                if text.contains("[No extractable text was found in this PDF attachment") {
-                    eprintln!(
-                        "Attachment warning: no extractable text found in {}",
-                        path.display()
-                    );
-                }
+                warn_for_extracted_attachment_text(path, &text);
                 let label = path.display().to_string();
                 blocks.push(ContentBlock::Text {
                     text: format!("[File: {label}]\n{text}"),
@@ -15365,6 +15355,38 @@ fn load_files_as_content_blocks(
         }
     }
     Ok(blocks)
+}
+
+const LARGE_TEXT_ATTACHMENT_WARNING_CHARS: usize = 120_000;
+
+fn warn_for_extracted_attachment_text(path: &Path, text: &str) {
+    for warning in extracted_attachment_warnings(path, text) {
+        eprintln!("{warning}");
+    }
+}
+
+fn extracted_attachment_warnings(path: &Path, text: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if text.contains(file_extract::PDF_NO_EXTRACTABLE_TEXT) {
+        warnings.push(format!(
+            "Attachment warning: no extractable text found in {}",
+            path.display()
+        ));
+    } else if text.contains(file_extract::PDF_EXTRACTION_WARNING_PREFIX) {
+        warnings.push(format!(
+            "Attachment warning: partial or low-confidence PDF text extraction for {}",
+            path.display()
+        ));
+    }
+
+    let extracted_chars = text.chars().count();
+    if extracted_chars >= LARGE_TEXT_ATTACHMENT_WARNING_CHARS {
+        warnings.push(format!(
+            "Attachment warning: extracted {extracted_chars} characters from {}; small-context local models may not read the whole attachment in one turn",
+            path.display()
+        ));
+    }
+    warnings
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
@@ -15655,13 +15677,13 @@ mod tests {
     use super::{
         build_plan_output, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        extracted_attachment_warnings, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         load_files_as_content_blocks, maturity_matrix_value, merge_prompt_with_stdin,
         normalize_permission_mode, parse_args, parse_benchmark_cli_command, parse_export_args,
@@ -15681,7 +15703,8 @@ mod tests {
         InternalPromptProgressState, LiveCli, LocalHelpTopic, PolicyCliCommand, PromptHistoryEntry,
         RouteCliCommand, SlashCommand, SlashCommandStatus, StatusUsage, TaskCliCommand,
         TaskDaemonCliCommand, TaskPacketCliCommand, TaskSchedulerCliCommand, WorkerCliCommand,
-        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STREAM_PROTOCOL_VERSION,
+        DEFAULT_MODEL, LARGE_TEXT_ATTACHMENT_WARNING_CHARS, LATEST_SESSION_REFERENCE,
+        STREAM_PROTOCOL_VERSION,
     };
     use crate::autonomous_cli::{
         render_autonomous_daemon_report_text, render_autonomous_health_checkpoint_text,
@@ -16698,6 +16721,39 @@ mod tests {
         }
 
         fs::remove_dir_all(&root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn extracted_attachment_warnings_cover_pdf_failure_modes() {
+        let missing_text = extracted_attachment_warnings(
+            Path::new("/tmp/scanned.pdf"),
+            file_extract::PDF_NO_EXTRACTABLE_TEXT,
+        );
+        assert!(
+            missing_text[0].contains("no extractable text found"),
+            "{missing_text:?}"
+        );
+
+        let partial_text = extracted_attachment_warnings(
+            Path::new("/tmp/partial.pdf"),
+            &format!(
+                "{} text was detected on only 1/20 pages]\nbody",
+                file_extract::PDF_EXTRACTION_WARNING_PREFIX
+            ),
+        );
+        assert!(
+            partial_text[0].contains("partial or low-confidence PDF text extraction"),
+            "{partial_text:?}"
+        );
+
+        let large_text = extracted_attachment_warnings(
+            Path::new("/tmp/thesis.pdf"),
+            &"x".repeat(LARGE_TEXT_ATTACHMENT_WARNING_CHARS),
+        );
+        assert!(
+            large_text[0].contains("small-context local models may not read the whole attachment"),
+            "{large_text:?}"
+        );
     }
 
     #[test]
