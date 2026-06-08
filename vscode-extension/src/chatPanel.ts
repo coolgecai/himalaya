@@ -37,7 +37,6 @@ export interface ChatLaunchOptions {
   cloudApiKey?: string;
   cloudModel?: string;
   showReasoning?: boolean;
-  showDecisioningDemo?: boolean;
   selectedHistoryId?: string | null;
   selectedCliSessionId?: string | null;
 }
@@ -235,13 +234,9 @@ export class HimalayaChatPanel {
   initialize(options: ChatLaunchOptions = {}): void {
     // Restore persisted showReasoning preference when not explicitly provided
     const saved = this.context.workspaceState.get<boolean>(this.reasoningPrefKey);
-    const savedDemo = this.context.workspaceState.get<boolean>(this.demoModePrefKey);
     const mergedOptions = { ...options } as ChatLaunchOptions;
     if (saved !== undefined && mergedOptions.showReasoning === undefined) {
       mergedOptions.showReasoning = Boolean(saved);
-    }
-    if (savedDemo !== undefined && mergedOptions.showDecisioningDemo === undefined) {
-      mergedOptions.showDecisioningDemo = Boolean(savedDemo);
     }
     this.currentOptions = mergedOptions;
     this.selectedHistoryId = options.selectedHistoryId ?? this.currentBootstrap.history.activeRecordId;
@@ -276,7 +271,6 @@ export class HimalayaChatPanel {
   private replStderrHandler: ((chunk: string) => void) | null = null;
   private readonly dangerApprovalKeyPrefix = 'himalayaCode.dangerApproval.v1';
   private readonly reasoningPrefKey = 'himalayaCode.showReasoning.v1';
-  private readonly demoModePrefKey = 'himalayaCode.showDecisioningDemo.v1';
   private readonly languagePreferenceKey = 'himalayaCode.preferredResponseLanguage.v1';
 
   private summarizePrompt(prompt: string): string {
@@ -289,7 +283,7 @@ export class HimalayaChatPanel {
       return;
     }
 
-    const typedMessage = message as { type?: string; command?: string; prompt?: string; model?: string; modelBackend?: string; permissionMode?: string; resumeTarget?: string; cwd?: string; historyId?: string; selectedHistoryId?: string | null; selectedCliSessionId?: string | null; files?: unknown };
+    const typedMessage = message as { type?: string; action?: string; command?: string; prompt?: string; model?: string; modelBackend?: string; permissionMode?: string; resumeTarget?: string; cwd?: string; historyId?: string; selectedHistoryId?: string | null; selectedCliSessionId?: string | null; files?: unknown };
 
     switch (typedMessage.type) {
       case 'pick-file':
@@ -343,14 +337,6 @@ export class HimalayaChatPanel {
         }
         break;
 
-      case 'toggle-decisioning-demo':
-        if ((typedMessage as any).enabled !== undefined) {
-          const enabled = Boolean((typedMessage as any).enabled);
-          this.currentOptions = { ...this.currentOptions, showDecisioningDemo: enabled };
-          void this.context.workspaceState.update(this.demoModePrefKey, enabled);
-        }
-        break;
-      
       case 'command':
         if (typedMessage.command === 'configureModel') {
           void this.openModelConfigurationWizard();
@@ -384,6 +370,38 @@ export class HimalayaChatPanel {
         break;
       
       case 'history-action':
+        if (typedMessage.action === 'delete' && typedMessage.historyId) {
+          const historyId = typedMessage.historyId;
+          void (async () => {
+            const wasSelected = this.selectedHistoryId === historyId || this.history.activeRecordId() === historyId;
+            await this.history.remove(historyId);
+            if (wasSelected) {
+              this.abortController?.abort();
+              this.closeReplWorker();
+              this.isStreamingPrompt = false;
+              this.selectedHistoryId = null;
+              this.selectedCliSessionId = null;
+              this.currentOptions = {
+                ...this.currentOptions,
+                resumeTarget: undefined,
+                selectedHistoryId: null,
+                selectedCliSessionId: null
+              };
+            }
+            void this.host.webview.postMessage({
+              type: 'historyDeleted',
+              historyId,
+              activeRecordId: this.history.activeRecordId(),
+              selectedHistoryId: this.selectedHistoryId,
+              selectedCliSessionId: this.selectedCliSessionId
+            });
+          })().catch((error) => {
+            const text = error instanceof Error ? error.message : String(error);
+            this.output.appendLine(`[history] delete failed: ${text}`);
+            void this.host.webview.postMessage({ type: 'error', text: `Failed to delete history: ${text}` });
+          });
+          break;
+        }
         if (typedMessage.selectedHistoryId !== undefined) {
           this.selectedHistoryId = typedMessage.selectedHistoryId;
         }
@@ -513,6 +531,7 @@ export class HimalayaChatPanel {
       this.replStderrHandler = input.onStderr;
     }
     if (!this.replHandle) {
+      this.host.webview.postMessage({ type: 'runStatus', text: 'Starting REPL worker…', kind: 'running' });
       let handle: HimalayaReplHandle | null = null;
       const effectiveResumeTarget = input.resumeTarget;
       const created = await this.cli.startRepl({
@@ -537,6 +556,9 @@ export class HimalayaChatPanel {
       await created.ready;
       this.replHandle = created;
       this.replKey = key;
+      this.host.webview.postMessage({ type: 'runStatus', text: 'REPL worker ready.', kind: 'running' });
+    } else {
+      this.host.webview.postMessage({ type: 'runStatus', text: 'Reusing REPL worker…', kind: 'running' });
     }
     return this.replHandle;
   }
@@ -987,6 +1009,7 @@ export class HimalayaChatPanel {
             }
           });
           this.replBusy = true;
+          this.host.webview.postMessage({ type: 'runStatus', text: 'Sending prompt…', kind: 'running' });
           handle.send(JSON.stringify({ type: 'prompt', text: cliPrompt, files: attachmentPaths }));
           await new Promise<void>((resolve, reject) => {
             const started = Date.now();
@@ -1014,6 +1037,7 @@ export class HimalayaChatPanel {
             throw error;
           }
           const text = error instanceof Error ? error.message : String(error);
+          this.host.webview.postMessage({ type: 'runStatus', text: 'Falling back to one-shot execution…', kind: 'running' });
           this.host.webview.postMessage({ type: 'stderrChunk', text: `REPL worker unavailable; falling back to one-shot execution. ${text}\n` });
           result = await runOnce();
         } finally {
@@ -1022,6 +1046,7 @@ export class HimalayaChatPanel {
           this.replStderrHandler = null;
         }
       } else {
+        this.host.webview.postMessage({ type: 'runStatus', text: 'Running one-shot command…', kind: 'running' });
         result = await runOnce();
         this.replCanReuse = true;
       }
@@ -1390,7 +1415,7 @@ export class HimalayaChatPanel {
   private async configureLocalModelRoute(): Promise<void> {
     const localModels = this.currentBootstrap.modelCatalog.localModels.length > 0
       ? this.currentBootstrap.modelCatalog.localModels
-      : await this.cli.listLocalModels();
+      : await this.cli.listLocalModels({ force: true });
 
     if (localModels.length === 0) {
       void vscode.window.showWarningMessage('No Ollama-managed local models were found. Start Ollama and try again.');
@@ -1461,7 +1486,6 @@ export class HimalayaChatPanel {
       isTrusted,
       activeRecordId,
       showReasoning: Boolean(options.showReasoning),
-      showDecisioningDemo: Boolean(options.showDecisioningDemo),
       identity: bootstrap.identity ?? {}
     }).replace(/</g, '\\u003c');
 
@@ -1962,6 +1986,25 @@ export class HimalayaChatPanel {
     .history-item.active { background: var(--accent-soft); color: var(--accent-text); }
     .history-item .hi-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .history-item .hi-meta { font-size: 10px; color: var(--text-dim); flex-shrink: 0; }
+    .history-delete {
+      width: 22px;
+      height: 22px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text-dim);
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .history-delete:hover {
+      border-color: rgba(244,71,71,0.35);
+      background: rgba(244,71,71,0.10);
+      color: #ff9a9a;
+    }
     /* ── composer ── */
     .composer {
       flex: 0 0 auto;
@@ -2125,42 +2168,6 @@ export class HimalayaChatPanel {
       gap: 6px;
     }
     .trust-banner[hidden] { display: none; }
-    .decisioning-demo-surface {
-      flex: 0 0 auto;
-      margin: 8px 10px 0;
-      padding: 10px;
-      border-radius: 12px;
-      border: 1px dashed rgba(76,132,255,0.40);
-      background: linear-gradient(180deg, rgba(76,132,255,0.08), rgba(255,255,255,0.02));
-      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
-    }
-    .decisioning-demo-surface[hidden] { display: none; }
-    .decisioning-demo-header {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 10px;
-      margin-bottom: 8px;
-      color: var(--text-dim);
-      font-size: 11px;
-      line-height: 1.45;
-    }
-    .decisioning-demo-kicker {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-    .decisioning-demo-title {
-      color: var(--text);
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: .03em;
-    }
-    .decisioning-badge.demo {
-      border-color: rgba(76,132,255,0.35);
-      background: rgba(76,132,255,0.12);
-      color: #a8c7ff;
-    }
     .task-board-surface {
       flex: 0 0 auto;
       margin: 8px 10px 0;
@@ -2302,7 +2309,6 @@ export class HimalayaChatPanel {
     <button class="icon-btn" id="btnHistory" title="Toggle history">&#9776;</button>
     <button class="icon-btn" id="btnNew" title="New session">&#43;</button>
     <button class="icon-btn" id="btnReasoning" title="Toggle reasoning visualization">🔎</button>
-    <button class="icon-btn" id="btnDemo" title="Force-visible decisioning demo mode">✨</button>
     <button class="icon-btn" id="btnRefresh" title="Refresh">&#8635;</button>
   </div>
 
@@ -2326,7 +2332,6 @@ export class HimalayaChatPanel {
     <button class="icon-btn" id="btnStatus" title="Status">&#9432;</button>
   </div>
 
-  <div class="decisioning-demo-surface" id="decisioningDemoSurface" hidden></div>
   <div class="task-board-surface" id="taskBoardSurface" hidden></div>
 
   <!-- history drawer (collapsed by default) -->
@@ -2407,7 +2412,6 @@ export class HimalayaChatPanel {
       isTrusted: INIT.isTrusted,
       activeRecordId: INIT.activeRecordId,
       showReasoning: INIT.showReasoning || false,
-      showDecisioningDemo: INIT.showDecisioningDemo || false,
       identity: INIT.identity || {},
       historyOpen: false,
       streaming: false,
@@ -2449,7 +2453,6 @@ export class HimalayaChatPanel {
     const historyDrawer= document.getElementById('historyDrawer');
     const historyList  = document.getElementById('historyList');
     const trustBanner  = document.getElementById('trustBanner');
-    const decisioningDemoSurface = document.getElementById('decisioningDemoSurface');
     const taskBoardSurface = document.getElementById('taskBoardSurface');
 
     /* ── attachment state ── */
@@ -2674,7 +2677,27 @@ export class HimalayaChatPanel {
         const date = new Date(rec.updatedAt || rec.createdAt || 0).toLocaleDateString();
         item.innerHTML =
           '<span class="hi-title">' + esc(rec.title || 'Untitled') + '</span>' +
-          '<span class="hi-meta">' + esc(date) + '</span>';
+          '<span class="hi-meta">' + esc(date) + '</span>' +
+          '<button type="button" class="history-delete" title="Delete history" aria-label="Delete history">&#128465;</button>';
+        const deleteButton = item.querySelector('.history-delete');
+        if (deleteButton) {
+          deleteButton.addEventListener('click', function(event) {
+            event.stopPropagation();
+            if (!window.confirm('Delete this history record?')) { return; }
+            state.historyRecords = state.historyRecords.filter(function(item) { return item.id !== rec.id; });
+            if (state.activeRecordId === rec.id) {
+              state.activeRecordId = null;
+              state.resumeTarget = '';
+              state.messages = [];
+              state.recoveryEvidence = [];
+              state.taskBoard = taskBoardInitialState();
+              renderThread();
+            }
+            renderHistory();
+            setStatus('History deleted.', 'done');
+            vscode.postMessage({ type: 'history-action', action: 'delete', historyId: rec.id });
+          });
+        }
         item.addEventListener('click', function() {
           state.activeRecordId = rec.id;
           state.resumeTarget = rec.resumeTarget || '';
@@ -2835,92 +2858,6 @@ export class HimalayaChatPanel {
       return '<section class="decisioning-section"><div class="decisioning-section-title">Workbench Overview</div><div class="decisioning-overview">' + metrics.join('') + '</div></section>';
     }
 
-    function getDecisioningDemoEvent() {
-      return {
-        kind: 'tool_selection',
-        title: 'Forced-visible decisioning demo',
-        summary: 'Synthetic snapshot showing tool scores, risk grading, and plan structure even before live decisioning events arrive.',
-        task_id: 'demo-turn',
-        confidence: 0.87,
-        risk_score: 0.42,
-        risk_level: 'medium',
-        selected_tools: ['search', 'planner'],
-        parallelizable: true,
-        action: 'review',
-        tool_scores: [
-          {
-            name: 'search',
-            score: 0.92,
-            success_rate: 0.96,
-            latency_ms: 42,
-            cost: 0.05,
-            parallelizable: true,
-            capabilities: ['search', 'read', 'context'],
-            selected: true
-          },
-          {
-            name: 'planner',
-            score: 0.84,
-            success_rate: 0.90,
-            latency_ms: 88,
-            cost: 0.12,
-            parallelizable: true,
-            capabilities: ['planning', 'analysis'],
-            selected: true
-          },
-          {
-            name: 'writer',
-            score: 0.63,
-            success_rate: 0.81,
-            latency_ms: 120,
-            cost: 0.10,
-            parallelizable: false,
-            capabilities: ['write', 'edit'],
-            selected: false
-          }
-        ],
-        plan_tree: {
-          kind: 'task',
-          id: 'demo-turn',
-          title: 'Inspect and summarize the workspace',
-          parallelizable: true,
-          estimated_effort: 4,
-          candidate_tools: ['search', 'planner', 'writer'],
-          notes: [
-            'Demo mode keeps this surface visible even if no live decisioning event is emitted.',
-            'The card reuses the same rendering path as real decisioning events.'
-          ],
-          children: [
-            {
-              kind: 'step',
-              id: 'demo-turn-analyze',
-              title: 'Analyze the task and rank candidate tools',
-              parallelizable: false,
-              estimated_effort: 2,
-              candidate_tools: ['search', 'planner'],
-              notes: ['Shows the tool score panel and selected badges.'],
-              children: []
-            },
-            {
-              kind: 'step',
-              id: 'demo-turn-verify',
-              title: 'Verify the outcome and surface risk',
-              parallelizable: false,
-              estimated_effort: 1,
-              candidate_tools: ['planner', 'writer'],
-              notes: ['Shows the risk meter and the plan tree hierarchy.'],
-              children: []
-            }
-          ]
-        },
-        details: [
-          'Demo mode: the panel stays visible without waiting for a live decisioning turn.',
-          'Use this mode to show tool scores, risk grade, and plan tree on demand.',
-          'The backend decisioning pipeline still emits the same fields when enabled.'
-        ]
-      };
-    }
-
     function renderDecisioningEventMarkup(event) {
       const kind = esc(renderDecisioningKindLabel(event.kind));
       const title = esc(String(event.title || 'Decisioning'));
@@ -2949,45 +2886,6 @@ export class HimalayaChatPanel {
       if (notesHtml) { sections.push(notesHtml); }
       const body = summary ? '<div class="decisioning-summary">' + esc(summary) + '</div>' : '<div class="decisioning-summary">' + esc(JSON.stringify(event, null, 2)) + '</div>';
       return '<div class="msg-role">Decisioning · ' + kind + ' · ' + title + '</div><div class="msg-body"><div class="decisioning-card"><div class="decisioning-header">' + body + '<div class="decisioning-badges">' + badges.join('') + '</div></div>' + sections.join('') + '</div></div>';
-    }
-
-    function updateDecisioningDemoToggle() {
-      try {
-        const btn = document.getElementById('btnDemo');
-        if (!btn) { return; }
-        btn.classList.toggle('active', Boolean(state.showDecisioningDemo));
-        btn.style.opacity = state.showDecisioningDemo ? '1' : '0.65';
-        btn.title = state.showDecisioningDemo ? 'Hide forced-visible decisioning demo mode' : 'Show forced-visible decisioning demo mode';
-      } catch (e) {
-        try { vscode.postMessage({ type: 'webview-error', message: 'updateDecisioningDemoToggle failed: ' + String(e) }); } catch (_) {}
-      }
-    }
-
-    function updateDecisioningDemoSurface() {
-      try {
-        if (!decisioningDemoSurface) { return; }
-        if (!state.showDecisioningDemo) {
-          decisioningDemoSurface.hidden = true;
-          decisioningDemoSurface.innerHTML = '';
-          return;
-        }
-        const demoEvent = getDecisioningDemoEvent();
-        decisioningDemoSurface.hidden = false;
-        decisioningDemoSurface.innerHTML =
-          '<div class="decisioning-demo-header">' +
-            '<div class="decisioning-demo-kicker">' +
-              '<div class="decisioning-demo-title">Forced-visible decisioning demo</div>' +
-              '<div>This surface stays visible so the new decisioning UI is obvious even when the backend does not emit a live event.</div>' +
-            '</div>' +
-            '<div class="decisioning-badges">' +
-              renderDecisioningSummaryBadge('demo mode', 'demo') +
-              renderDecisioningSummaryBadge('persistent surface') +
-            '</div>' +
-          '</div>' +
-          '<div class="msg decisioning-step">' + renderDecisioningEventMarkup(demoEvent) + '</div>';
-      } catch (e) {
-        try { vscode.postMessage({ type: 'webview-error', message: 'updateDecisioningDemoSurface failed: ' + String(e) }); } catch (_) {}
-      }
     }
 
     function renderDecisioningKindLabel(kind) {
@@ -3884,21 +3782,8 @@ export class HimalayaChatPanel {
         } catch (_) {}
       });
     }
-    const btnDemoEl = document.getElementById('btnDemo');
-    if (btnDemoEl) {
-      btnDemoEl.addEventListener('click', function() {
-        try {
-          state.showDecisioningDemo = !state.showDecisioningDemo;
-          updateDecisioningDemoToggle();
-          updateDecisioningDemoSurface();
-          try { vscode.postMessage({ type: 'toggle-decisioning-demo', enabled: state.showDecisioningDemo }); } catch (_) {}
-        } catch (_) {}
-      });
-    }
     // ensure initial visual state
     try { updateReasoningToggle(); } catch (_) {}
-    try { updateDecisioningDemoToggle(); } catch (_) {}
-    try { updateDecisioningDemoSurface(); } catch (_) {}
     try { updateTaskBoardSurface(); } catch (_) {}
 
     const btnRefreshEl = document.getElementById('btnRefresh');
@@ -3986,7 +3871,6 @@ export class HimalayaChatPanel {
             if (msg.options.permissionMode) { state.permissionMode = msg.options.permissionMode; }
             if (msg.options.resumeTarget !== undefined) { state.resumeTarget = msg.options.resumeTarget || ''; }
             if (msg.options.showReasoning !== undefined) { state.showReasoning = Boolean(msg.options.showReasoning); }
-            if (msg.options.showDecisioningDemo !== undefined) { state.showDecisioningDemo = Boolean(msg.options.showDecisioningDemo); }
           }
           trustBanner.hidden = state.isTrusted;
             setStatus(
@@ -3996,8 +3880,6 @@ export class HimalayaChatPanel {
           updateModelBar();
           updateSendButtonState();
           try { updateReasoningToggle(); } catch (_) {}
-          try { updateDecisioningDemoToggle(); } catch (_) {}
-          try { updateDecisioningDemoSurface(); } catch (_) {}
           try { updateTaskBoardSurface(); } catch (_) {}
           break;
         
@@ -4005,6 +3887,24 @@ export class HimalayaChatPanel {
           if (msg.record) {
             applyHistoryRecord(msg.record);
             renderHistory();
+          }
+          break;
+        case 'historyDeleted':
+          if (msg.historyId) {
+            state.historyRecords = state.historyRecords.filter(function(rec) { return rec.id !== msg.historyId; });
+            if (state.activeRecordId === msg.historyId || msg.selectedHistoryId === null) {
+              state.activeRecordId = msg.activeRecordId || null;
+              if (!state.activeRecordId) {
+                state.messages = [];
+                state.recoveryEvidence = [];
+                state.resumeTarget = '';
+                state.taskBoard = taskBoardInitialState();
+                renderThread();
+              }
+            }
+            renderHistory();
+            updateSendButtonState();
+            setStatus('History deleted.', 'done');
           }
           break;
         case 'session-reset':
@@ -4031,6 +3931,9 @@ export class HimalayaChatPanel {
           }
           break;
         }
+        case 'runStatus':
+          setStatus(String(msg.text || 'Running…'), msg.kind || 'running');
+          break;
         case 'assistantStart':
           state.lastRunFailed = false;
           if (!streamBubble) { startStream(); }

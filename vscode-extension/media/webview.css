@@ -504,11 +504,30 @@
       border-bottom: 1px solid var(--border);
       font-size: 12px;
     }
-    .history-item:hover { background: var(--surface2); }
-    .history-item.active { background: var(--accent-soft); color: var(--accent-text); }
-    .history-item .hi-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .history-item .hi-meta { font-size: 10px; color: var(--text-dim); flex-shrink: 0; }
-    /* ── composer ── */
+	    .history-item:hover { background: var(--surface2); }
+	    .history-item.active { background: var(--accent-soft); color: var(--accent-text); }
+	    .history-item .hi-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	    .history-item .hi-meta { font-size: 10px; color: var(--text-dim); flex-shrink: 0; }
+	    .history-delete {
+	      width: 22px;
+	      height: 22px;
+	      display: inline-flex;
+	      align-items: center;
+	      justify-content: center;
+	      flex-shrink: 0;
+	      border: 1px solid transparent;
+	      border-radius: 6px;
+	      background: transparent;
+	      color: var(--text-dim);
+	      cursor: pointer;
+	      font-size: 12px;
+	    }
+	    .history-delete:hover {
+	      border-color: rgba(244,71,71,0.35);
+	      background: rgba(244,71,71,0.10);
+	      color: #ff9a9a;
+	    }
+	    /* ── composer ── */
     .composer {
       flex: 0 0 auto;
       border-top: 1px solid var(--border);
@@ -673,39 +692,3 @@
       gap: 6px;
     }
     .trust-banner[hidden] { display: none; }
-    .decisioning-demo-surface {
-      flex: 0 0 auto;
-      margin: 8px 10px 0;
-      padding: 10px;
-      border-radius: 12px;
-      border: 1px dashed rgba(76,132,255,0.40);
-      background: linear-gradient(180deg, rgba(76,132,255,0.08), rgba(255,255,255,0.02));
-      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
-    }
-    .decisioning-demo-surface[hidden] { display: none; }
-    .decisioning-demo-header {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 10px;
-      margin-bottom: 8px;
-      color: var(--text-dim);
-      font-size: 11px;
-      line-height: 1.45;
-    }
-    .decisioning-demo-kicker {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-    .decisioning-demo-title {
-      color: var(--text);
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: .03em;
-    }
-    .decisioning-badge.demo {
-      border-color: rgba(76,132,255,0.35);
-      background: rgba(76,132,255,0.12);
-      color: #a8c7ff;
-    }

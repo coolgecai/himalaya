@@ -35,7 +35,14 @@ export interface ResolvedBinary {
   source: BinarySource;
 }
 
+const LOCAL_MODEL_CACHE_TTL_MS = 30_000;
+const LOCAL_MODEL_HTTP_TIMEOUT_MS = 1_200;
+const LOCAL_MODEL_CLI_TIMEOUT_MS = 2_000;
+
 export class HimalayaCli {
+  private localModelCache: { at: number; models: string[] } | null = null;
+  private localModelListPromise: Promise<string[]> | null = null;
+
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly output: vscode.OutputChannel
@@ -345,7 +352,28 @@ export class HimalayaCli {
     }
   }
 
-  async listLocalModels(): Promise<string[]> {
+  async listLocalModels(options: { force?: boolean } = {}): Promise<string[]> {
+    const now = Date.now();
+    if (!options.force && this.localModelCache && now - this.localModelCache.at < LOCAL_MODEL_CACHE_TTL_MS) {
+      return this.localModelCache.models.slice();
+    }
+    if (this.localModelListPromise) {
+      return (await this.localModelListPromise).slice();
+    }
+
+    this.localModelListPromise = this.loadLocalModels()
+      .then((models) => {
+        this.localModelCache = { at: Date.now(), models };
+        return models;
+      })
+      .finally(() => {
+        this.localModelListPromise = null;
+      });
+
+    return (await this.localModelListPromise).slice();
+  }
+
+  private async loadLocalModels(): Promise<string[]> {
     const modelsViaHttp = await this.listLocalModelsViaHttp();
     if (modelsViaHttp.length > 0) {
       return modelsViaHttp;
@@ -473,7 +501,14 @@ export class HimalayaCli {
     }
 
     try {
-      const response = await fetchFn('http://127.0.0.1:11434/api/tags');
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), LOCAL_MODEL_HTTP_TIMEOUT_MS);
+      let response: Response;
+      try {
+        response = await fetchFn('http://127.0.0.1:11434/api/tags', { signal: controller.signal });
+      } finally {
+        clearTimeout(timer);
+      }
       if (!response.ok) {
         return [];
       }
@@ -489,7 +524,7 @@ export class HimalayaCli {
   private async listLocalModelsViaCli(): Promise<string[]> {
     try {
       return await new Promise<string[]>((resolve) => {
-        cp.execFile('ollama', ['list'], { timeout: 5000, maxBuffer: 1024 * 1024 }, (error, stdout) => {
+        cp.execFile('ollama', ['list'], { timeout: LOCAL_MODEL_CLI_TIMEOUT_MS, maxBuffer: 1024 * 1024 }, (error, stdout) => {
           if (error) {
             resolve([]);
             return;

@@ -17,12 +17,11 @@
       model: INIT.model,
       modelBackend: INIT.modelBackend,
       permissionMode: INIT.permissionMode,
-      resumeTarget: INIT.resumeTarget || '',
-      isTrusted: INIT.isTrusted,
-      activeRecordId: INIT.activeRecordId,
-      showReasoning: INIT.showReasoning || false,
-      showDecisioningDemo: INIT.showDecisioningDemo || false,
-      historyOpen: false,
+	      resumeTarget: INIT.resumeTarget || '',
+	      isTrusted: INIT.isTrusted,
+	      activeRecordId: INIT.activeRecordId,
+	      showReasoning: INIT.showReasoning || false,
+	      historyOpen: false,
       streaming: false,
       lastRunFailed: false,
       messages: [],   /* {role, text} */
@@ -42,10 +41,9 @@
     const permLabel    = document.getElementById('permLabel');
     const statusDot    = document.getElementById('statusDot');
     const statusText   = document.getElementById('statusText');
-    const historyDrawer= document.getElementById('historyDrawer');
-    const historyList  = document.getElementById('historyList');
-    const trustBanner  = document.getElementById('trustBanner');
-    const decisioningDemoSurface = document.getElementById('decisioningDemoSurface');
+	    const historyDrawer= document.getElementById('historyDrawer');
+	    const historyList  = document.getElementById('historyList');
+	    const trustBanner  = document.getElementById('trustBanner');
 
     /* ── attachment state ── */
     let attachedFiles = [];
@@ -306,12 +304,30 @@
       state.historyRecords.forEach(function(rec) {
         const item = document.createElement('div');
         item.className = 'history-item' + (rec.id === state.activeRecordId ? ' active' : '');
-        const date = new Date(rec.updatedAt || rec.createdAt || 0).toLocaleDateString();
-        item.innerHTML =
-          '<span class="hi-title">' + esc(rec.title || 'Untitled') + '</span>' +
-          '<span class="hi-meta">' + esc(date) + '</span>';
-        item.addEventListener('click', function() {
-          state.activeRecordId = rec.id;
+	        const date = new Date(rec.updatedAt || rec.createdAt || 0).toLocaleDateString();
+	        item.innerHTML =
+	          '<span class="hi-title">' + esc(rec.title || 'Untitled') + '</span>' +
+	          '<span class="hi-meta">' + esc(date) + '</span>' +
+	          '<button type="button" class="history-delete" title="Delete history" aria-label="Delete history">&#128465;</button>';
+	        const deleteButton = item.querySelector('.history-delete');
+	        if (deleteButton) {
+	          deleteButton.addEventListener('click', function(event) {
+	            event.stopPropagation();
+	            if (!window.confirm('Delete this history record?')) { return; }
+	            state.historyRecords = state.historyRecords.filter(function(item) { return item.id !== rec.id; });
+	            if (state.activeRecordId === rec.id) {
+	              state.activeRecordId = null;
+	              state.resumeTarget = '';
+	              state.messages = [];
+	              renderThread();
+	            }
+	            renderHistory();
+	            setStatus('History deleted.', 'done');
+	            vscode.postMessage({ type: 'history-action', action: 'delete', historyId: rec.id });
+	          });
+	        }
+	        item.addEventListener('click', function() {
+	          state.activeRecordId = rec.id;
           vscode.postMessage({ type: 'history-action', historyId: rec.id, selectedHistoryId: rec.id });
           /* load messages from record */
           state.messages = (rec.messages || []).map(function(m) { return { role: m.role, text: m.text }; });
@@ -530,93 +546,7 @@
       return '<span class="decisioning-badge' + (className ? ' ' + className : '') + '">' + esc(label) + '</span>';
     }
 
-    function getDecisioningDemoEvent() {
-      return {
-        kind: 'tool_selection',
-        title: 'Forced-visible decisioning demo',
-        summary: 'Synthetic snapshot showing tool scores, risk grading, and plan structure even before live decisioning events arrive.',
-        task_id: 'demo-turn',
-        confidence: 0.87,
-        risk_score: 0.42,
-        risk_level: 'medium',
-        selected_tools: ['search', 'planner'],
-        parallelizable: true,
-        action: 'review',
-        tool_scores: [
-          {
-            name: 'search',
-            score: 0.92,
-            success_rate: 0.96,
-            latency_ms: 42,
-            cost: 0.05,
-            parallelizable: true,
-            capabilities: ['search', 'read', 'context'],
-            selected: true
-          },
-          {
-            name: 'planner',
-            score: 0.84,
-            success_rate: 0.90,
-            latency_ms: 88,
-            cost: 0.12,
-            parallelizable: true,
-            capabilities: ['planning', 'analysis'],
-            selected: true
-          },
-          {
-            name: 'writer',
-            score: 0.63,
-            success_rate: 0.81,
-            latency_ms: 120,
-            cost: 0.10,
-            parallelizable: false,
-            capabilities: ['write', 'edit'],
-            selected: false
-          }
-        ],
-        plan_tree: {
-          kind: 'task',
-          id: 'demo-turn',
-          title: 'Inspect and summarize the workspace',
-          parallelizable: true,
-          estimated_effort: 4,
-          candidate_tools: ['search', 'planner', 'writer'],
-          notes: [
-            'Demo mode keeps this surface visible even if no live decisioning event is emitted.',
-            'The card reuses the same rendering path as real decisioning events.'
-          ],
-          children: [
-            {
-              kind: 'step',
-              id: 'demo-turn-analyze',
-              title: 'Analyze the task and rank candidate tools',
-              parallelizable: false,
-              estimated_effort: 2,
-              candidate_tools: ['search', 'planner'],
-              notes: ['Shows the tool score panel and selected badges.'],
-              children: []
-            },
-            {
-              kind: 'step',
-              id: 'demo-turn-verify',
-              title: 'Verify the outcome and surface risk',
-              parallelizable: false,
-              estimated_effort: 1,
-              candidate_tools: ['planner', 'writer'],
-              notes: ['Shows the risk meter and the plan tree hierarchy.'],
-              children: []
-            }
-          ]
-        },
-        details: [
-          'Demo mode: the panel stays visible without waiting for a live decisioning turn.',
-          'Use this mode to show tool scores, risk grade, and plan tree on demand.',
-          'The backend decisioning pipeline still emits the same fields when enabled.'
-        ]
-      };
-    }
-
-    function renderDecisioningEventMarkup(event) {
+	    function renderDecisioningEventMarkup(event) {
       const kind = esc(renderDecisioningKindLabel(event.kind));
       const title = esc(String(event.title || 'Decisioning'));
       const summary = String(event.summary || '');
@@ -644,46 +574,7 @@
       return '<div class="msg-role">Decisioning · ' + kind + ' · ' + title + '</div><div class="msg-body"><div class="decisioning-card"><div class="decisioning-header">' + body + '<div class="decisioning-badges">' + badges.join('') + '</div></div>' + sections.join('') + '</div></div>';
     }
 
-    function updateDecisioningDemoToggle() {
-      try {
-        const btn = document.getElementById('btnDemo');
-        if (!btn) { return; }
-        btn.classList.toggle('active', Boolean(state.showDecisioningDemo));
-        btn.style.opacity = state.showDecisioningDemo ? '1' : '0.65';
-        btn.title = state.showDecisioningDemo ? 'Hide forced-visible decisioning demo mode' : 'Show forced-visible decisioning demo mode';
-      } catch (e) {
-        try { vscode.postMessage({ type: 'webview-error', message: 'updateDecisioningDemoToggle failed: ' + String(e) }); } catch (_) {}
-      }
-    }
-
-    function updateDecisioningDemoSurface() {
-      try {
-        if (!decisioningDemoSurface) { return; }
-        if (!state.showDecisioningDemo) {
-          decisioningDemoSurface.hidden = true;
-          decisioningDemoSurface.innerHTML = '';
-          return;
-        }
-        const demoEvent = getDecisioningDemoEvent();
-        decisioningDemoSurface.hidden = false;
-        decisioningDemoSurface.innerHTML =
-          '<div class="decisioning-demo-header">' +
-            '<div class="decisioning-demo-kicker">' +
-              '<div class="decisioning-demo-title">Forced-visible decisioning demo</div>' +
-              '<div>This surface stays visible so the new decisioning UI is obvious even when the backend does not emit a live event.</div>' +
-            '</div>' +
-            '<div class="decisioning-badges">' +
-              renderDecisioningSummaryBadge('demo mode', 'demo') +
-              renderDecisioningSummaryBadge('persistent surface') +
-            '</div>' +
-          '</div>' +
-          '<div class="msg decisioning-step">' + renderDecisioningEventMarkup(demoEvent) + '</div>';
-      } catch (e) {
-        try { vscode.postMessage({ type: 'webview-error', message: 'updateDecisioningDemoSurface failed: ' + String(e) }); } catch (_) {}
-      }
-    }
-
-    function renderDecisioningKindLabel(kind) {
+	    function renderDecisioningKindLabel(kind) {
       const raw = String(kind || '').trim();
       const lookup = {
         tool_selection: 'Tool selection',
@@ -991,21 +882,8 @@
         } catch (_) {}
       });
     }
-    const btnDemoEl = document.getElementById('btnDemo');
-    if (btnDemoEl) {
-      btnDemoEl.addEventListener('click', function() {
-        try {
-          state.showDecisioningDemo = !state.showDecisioningDemo;
-          updateDecisioningDemoToggle();
-          updateDecisioningDemoSurface();
-          try { vscode.postMessage({ type: 'toggle-decisioning-demo', enabled: state.showDecisioningDemo }); } catch (_) {}
-        } catch (_) {}
-      });
-    }
-    // ensure initial visual state
-    try { updateReasoningToggle(); } catch (_) {}
-    try { updateDecisioningDemoToggle(); } catch (_) {}
-    try { updateDecisioningDemoSurface(); } catch (_) {}
+	    // ensure initial visual state
+	    try { updateReasoningToggle(); } catch (_) {}
 
     const btnRefreshEl = document.getElementById('btnRefresh');
     if (btnRefreshEl) {
@@ -1060,24 +938,37 @@
           if (msg.options) {
             if (msg.options.model) { state.model = msg.options.model; }
             if (msg.options.modelBackend) { state.modelBackend = msg.options.modelBackend; }
-            if (msg.options.permissionMode) { state.permissionMode = msg.options.permissionMode; }
-            if (msg.options.resumeTarget !== undefined) { state.resumeTarget = msg.options.resumeTarget || ''; }
-            if (msg.options.showReasoning !== undefined) { state.showReasoning = Boolean(msg.options.showReasoning); }
-            if (msg.options.showDecisioningDemo !== undefined) { state.showDecisioningDemo = Boolean(msg.options.showDecisioningDemo); }
-          }
+	            if (msg.options.permissionMode) { state.permissionMode = msg.options.permissionMode; }
+	            if (msg.options.resumeTarget !== undefined) { state.resumeTarget = msg.options.resumeTarget || ''; }
+	            if (msg.options.showReasoning !== undefined) { state.showReasoning = Boolean(msg.options.showReasoning); }
+	          }
           trustBanner.hidden = state.isTrusted;
             setStatus(
               state.isTrusted ? 'Ready' : 'Workspace untrusted — execution blocked.',
               state.isTrusted ? '' : 'error'
             );
-          updateModelBar();
-          updateSendButtonState();
-          try { updateReasoningToggle(); } catch (_) {}
-          try { updateDecisioningDemoToggle(); } catch (_) {}
-          try { updateDecisioningDemoSurface(); } catch (_) {}
-          break;
+	          updateModelBar();
+	          updateSendButtonState();
+	          try { updateReasoningToggle(); } catch (_) {}
+	          break;
+	        case 'historyDeleted':
+	          if (msg.historyId) {
+	            state.historyRecords = state.historyRecords.filter(function(rec) { return rec.id !== msg.historyId; });
+	            if (state.activeRecordId === msg.historyId || msg.selectedHistoryId === null) {
+	              state.activeRecordId = msg.activeRecordId || null;
+	              if (!state.activeRecordId) {
+	                state.messages = [];
+	                state.resumeTarget = '';
+	                renderThread();
+	              }
+	            }
+	            renderHistory();
+	            updateSendButtonState();
+	            setStatus('History deleted.', 'done');
+	          }
+	          break;
 
-        case 'session-reset':
+	        case 'session-reset':
           state.messages = [];
           state.activeRecordId = null;
           state.resumeTarget = '';

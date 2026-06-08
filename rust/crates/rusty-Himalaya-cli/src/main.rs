@@ -15202,22 +15202,31 @@ fn expand_file_prefix_lines(input: &str) -> String {
     out.trim_end().to_string()
 }
 
+fn attachment_may_require_vision(path: &std::path::Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp"
+    )
+}
+
+fn model_wants_image_blocks(model: &str) -> bool {
+    let base_url = std::env::var("OPENAI_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    api::model_supports_vision_probed(model, base_url.as_deref())
+}
+
 fn expand_at_file_syntax(input: &str, model: &str) -> Result<(String, Vec<ContentBlock>), String> {
     use file_extract::{extract_file, FileContent};
 
-    // Only probe the model for vision support when the prompt actually contains
-    // an attachment token. The probe makes a blocking network request on a
-    // cache miss, so running it on every plain-text turn added seconds of
-    // latency for nothing.
-    let has_attachment = input.contains('@');
-    let want_image = if has_attachment {
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .ok()
-            .filter(|s| !s.is_empty());
-        api::model_supports_vision_probed(model, base_url.as_deref())
-    } else {
-        false
-    };
+    // The vision probe may perform network I/O and can wake a local model. Only
+    // run it lazily when an actual raster image attachment is being expanded.
+    let mut want_image_cache: Option<bool> = None;
     let mut image_blocks = Vec::new();
     let mut result = String::with_capacity(input.len());
     let mut chars = input.char_indices().peekable();
@@ -15263,6 +15272,12 @@ fn expand_at_file_syntax(input: &str, model: &str) -> Result<(String, Vec<Conten
         for _ in 0..skip {
             chars.next();
         }
+
+        let want_image = if attachment_may_require_vision(path) {
+            *want_image_cache.get_or_insert_with(|| model_wants_image_blocks(model))
+        } else {
+            false
+        };
 
         match extract_file(path, want_image) {
             Ok(FileContent::Text(text)) => {
@@ -15312,7 +15327,7 @@ fn attachment_summary(expanded_text: &str, image_blocks: &[ContentBlock]) -> Str
 
 /// Load files from `paths` and convert them to [`ContentBlock`]s.
 ///
-/// Uses [`api::model_supports_vision`] to decide whether images should be
+/// Uses [`api::model_supports_vision_probed`] to decide whether images should be
 /// sent as base64 vision blocks or downgraded to text placeholders (for
 /// Ollama and other models without vision support).
 fn load_files_as_content_blocks(
@@ -15321,10 +15336,14 @@ fn load_files_as_content_blocks(
 ) -> Result<Vec<ContentBlock>, String> {
     use file_extract::{extract_file, FileContent};
 
-    let base_url = std::env::var("OPENAI_BASE_URL")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let want_image = api::model_supports_vision_probed(model, base_url.as_deref());
+    let want_image = if paths
+        .iter()
+        .any(|path| !is_attachment_blocked(path) && attachment_may_require_vision(path))
+    {
+        model_wants_image_blocks(model)
+    } else {
+        false
+    };
     let mut blocks = Vec::new();
     for path in paths {
         if is_attachment_blocked(path) {
@@ -15675,15 +15694,16 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     use super::{
-        build_plan_output, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        extracted_attachment_warnings, filter_tool_specs, format_bughunter_report,
-        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
-        format_connected_line, format_cost_report, format_history_timestamp,
-        format_internal_prompt_progress_line, format_issue_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
+        attachment_may_require_vision, build_plan_output, build_runtime_plugin_state_with_loader,
+        build_runtime_with_plugin_state, collect_session_prompt_history,
+        create_managed_session_handle, describe_tool_progress, extracted_attachment_warnings,
+        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_connected_line,
+        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
+        format_issue_report, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_pr_report,
+        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
+        format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         load_files_as_content_blocks, maturity_matrix_value, merge_prompt_with_stdin,
         normalize_permission_mode, parse_args, parse_benchmark_cli_command, parse_export_args,
@@ -16721,6 +16741,18 @@ mod tests {
         }
 
         fs::remove_dir_all(&root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn attachment_vision_probe_gate_only_matches_raster_images() {
+        assert!(attachment_may_require_vision(Path::new("diagram.png")));
+        assert!(attachment_may_require_vision(Path::new("photo.JPEG")));
+        assert!(attachment_may_require_vision(Path::new("scan.webp")));
+
+        assert!(!attachment_may_require_vision(Path::new("paper.pdf")));
+        assert!(!attachment_may_require_vision(Path::new("notes.md")));
+        assert!(!attachment_may_require_vision(Path::new("vector.svg")));
+        assert!(!attachment_may_require_vision(Path::new("clip.mp4")));
     }
 
     #[test]

@@ -189,6 +189,7 @@ export class HimalayaHistoryStore {
   async remove(recordId: string): Promise<void> {
     const activeId = this.activeRecordId();
     const records = this.records().filter((item) => item.id !== recordId);
+    this.deleteRecordBody(recordId);
     await this.persist(records, activeId === recordId ? null : activeId);
 
     if (activeId === recordId) {
@@ -337,6 +338,14 @@ export class HimalayaHistoryStore {
       fs.writeFileSync(filePath, JSON.stringify(body), 'utf8');
     } catch {
       // History indexing should not block chat execution if disk persistence fails.
+    }
+  }
+
+  private deleteRecordBody(recordId: string): void {
+    try {
+      fs.rmSync(this.recordBodyPath(recordId), { force: true });
+    } catch {
+      // Best-effort cleanup: the history index remains authoritative.
     }
   }
 }

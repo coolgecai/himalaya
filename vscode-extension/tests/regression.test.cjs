@@ -27,6 +27,7 @@ const chatPanelSource = fs.readFileSync(chatPanelPath, 'utf8');
 const chatParticipantSource = fs.readFileSync(chatParticipantPath, 'utf8');
 const extensionSource = fs.readFileSync(extensionPath, 'utf8');
 const historySource = fs.readFileSync(historyPath, 'utf8');
+const cliSource = fs.readFileSync(path.join(root, 'src', 'cli.ts'), 'utf8');
 const permissionPolicySource = fs.readFileSync(path.join(root, 'src', 'permissionPolicy.ts'), 'utf8');
 const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 
@@ -891,6 +892,26 @@ test('history snapshot sends lightweight index and lazy-loads selected records',
   assert.match(chatPanelSource, /type:\s*'historyRecord'/);
   assert.match(chatPanelSource, /function applyHistoryRecord\(rec\)/);
   assert.match(chatPanelSource, /case 'historyRecord':/);
+});
+
+test('history drawer can delete records and deprecated decisioning demo is removed', () => {
+  assert.match(historySource, /async remove\(recordId:\s*string\):\s*Promise<void>/);
+  assert.match(historySource, /deleteRecordBody\(recordId\)/);
+  assert.match(chatPanelSource, /typedMessage\.action === 'delete' && typedMessage\.historyId/);
+  assert.match(chatPanelSource, /class="history-delete"/);
+  assert.match(chatPanelSource, /type:\s*'historyDeleted'/);
+  assert.match(chatPanelSource, /case 'historyDeleted':/);
+  assert.doesNotMatch(chatPanelSource, /btnDemo|showDecisioningDemo|toggle-decisioning-demo|decisioning-demo/);
+});
+
+test('local model discovery is cached and time bounded', () => {
+  assert.match(cliSource, /LOCAL_MODEL_CACHE_TTL_MS\s*=\s*30_000/);
+  assert.match(cliSource, /LOCAL_MODEL_HTTP_TIMEOUT_MS\s*=\s*1_200/);
+  assert.match(cliSource, /LOCAL_MODEL_CLI_TIMEOUT_MS\s*=\s*2_000/);
+  assert.match(cliSource, /private localModelCache/);
+  assert.match(cliSource, /async listLocalModels\(options:\s*\{\s*force\?:\s*boolean\s*\}\s*=\s*\{\}\)/);
+  assert.match(cliSource, /new AbortController\(\)/);
+  assert.match(cliSource, /timeout:\s*LOCAL_MODEL_CLI_TIMEOUT_MS/);
 });
 
 test('attachment path extraction accepts descriptor and Uri-shaped values', () => {
