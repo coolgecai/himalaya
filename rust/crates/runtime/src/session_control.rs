@@ -396,11 +396,12 @@ pub fn resolve_managed_session_path_for(
     base_dir: impl AsRef<Path>,
     session_id: &str,
 ) -> Result<PathBuf, SessionControlError> {
-    let directory = managed_sessions_dir_for(base_dir)?;
-    for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
-        let path = directory.join(format!("{session_id}.{extension}"));
-        if path.exists() {
-            return Ok(path);
+    for directory in managed_session_search_dirs(base_dir.as_ref())? {
+        for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
+            let path = directory.join(format!("{session_id}.{extension}"));
+            if path.exists() {
+                return Ok(path);
+            }
         }
     }
     Err(SessionControlError::Format(
@@ -425,55 +426,63 @@ pub fn list_managed_sessions_for(
     base_dir: impl AsRef<Path>,
 ) -> Result<Vec<ManagedSessionSummary>, SessionControlError> {
     let mut sessions = Vec::new();
-    for entry in fs::read_dir(managed_sessions_dir_for(base_dir)?)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !is_managed_session_file(&path) {
-            continue;
+    for directory in managed_session_search_dirs(base_dir.as_ref())? {
+        let read_result = fs::read_dir(directory);
+        let entries = match read_result {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !is_managed_session_file(&path) {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            let modified_epoch_millis = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default();
+            let (id, message_count, parent_session_id, branch_name) =
+                match Session::load_from_path(&path) {
+                    Ok(session) => {
+                        let parent_session_id = session
+                            .fork
+                            .as_ref()
+                            .map(|fork| fork.parent_session_id.clone());
+                        let branch_name = session
+                            .fork
+                            .as_ref()
+                            .and_then(|fork| fork.branch_name.clone());
+                        (
+                            session.session_id,
+                            session.messages.len(),
+                            parent_session_id,
+                            branch_name,
+                        )
+                    }
+                    Err(_) => (
+                        path.file_stem()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        0,
+                        None,
+                        None,
+                    ),
+                };
+            sessions.push(ManagedSessionSummary {
+                id,
+                path,
+                modified_epoch_millis,
+                message_count,
+                parent_session_id,
+                branch_name,
+            });
         }
-        let metadata = entry.metadata()?;
-        let modified_epoch_millis = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default();
-        let (id, message_count, parent_session_id, branch_name) =
-            match Session::load_from_path(&path) {
-                Ok(session) => {
-                    let parent_session_id = session
-                        .fork
-                        .as_ref()
-                        .map(|fork| fork.parent_session_id.clone());
-                    let branch_name = session
-                        .fork
-                        .as_ref()
-                        .and_then(|fork| fork.branch_name.clone());
-                    (
-                        session.session_id,
-                        session.messages.len(),
-                        parent_session_id,
-                        branch_name,
-                    )
-                }
-                Err(_) => (
-                    path.file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    0,
-                    None,
-                    None,
-                ),
-            };
-        sessions.push(ManagedSessionSummary {
-            id,
-            path,
-            modified_epoch_millis,
-            message_count,
-            parent_session_id,
-            branch_name,
-        });
     }
     sessions.sort_by(|left, right| {
         right
@@ -574,12 +583,57 @@ fn format_no_managed_sessions() -> String {
     )
 }
 
+fn managed_session_search_dirs(base_dir: &Path) -> Result<Vec<PathBuf>, SessionControlError> {
+    let root = managed_sessions_dir_for(base_dir)?;
+    let mut dirs = Vec::new();
+
+    let current_namespace = root.join(workspace_fingerprint(base_dir));
+    push_dir_if_exists(&mut dirs, current_namespace)?;
+    push_unique_path(&mut dirs, root.clone());
+
+    let read_result = fs::read_dir(&root);
+    let mut namespace_dirs = match read_result {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| match entry.file_type() {
+                Ok(file_type) if file_type.is_dir() => Some(entry.path()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err.into()),
+    };
+    namespace_dirs.sort();
+    for directory in namespace_dirs {
+        push_unique_path(&mut dirs, directory);
+    }
+
+    Ok(dirs)
+}
+
+fn push_dir_if_exists(dirs: &mut Vec<PathBuf>, path: PathBuf) -> Result<(), SessionControlError> {
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => push_unique_path(dirs, path),
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
+fn push_unique_path(dirs: &mut Vec<PathBuf>, path: PathBuf) {
+    if !dirs.iter().any(|existing| existing == &path) {
+        dirs.push(path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         create_managed_session_handle_for, fork_managed_session_for, is_session_reference_alias,
-        list_managed_sessions_for, load_managed_session_for, resolve_session_reference_for,
-        workspace_fingerprint, ManagedSessionSummary, SessionStore, LATEST_SESSION_REFERENCE,
+        latest_managed_session_for, list_managed_sessions_for, load_managed_session_for,
+        resolve_session_reference_for, workspace_fingerprint, ManagedSessionSummary, SessionStore,
+        LATEST_SESSION_REFERENCE, PRIMARY_SESSION_EXTENSION,
     };
     use crate::session::Session;
     use std::fs;
@@ -605,6 +659,21 @@ mod tests {
         session
             .save_to_path(&handle.path)
             .expect("session should persist");
+        session
+    }
+
+    fn persist_session_in_directory(directory: &Path, text: &str) -> Session {
+        fs::create_dir_all(directory).expect("session namespace should exist");
+        let mut session = Session::new();
+        session
+            .push_user_text(text)
+            .expect("session message should save");
+        let path = directory.join(format!(
+            "{}.{PRIMARY_SESSION_EXTENSION}",
+            session.session_id
+        ));
+        let session = session.with_persistence_path(path.clone());
+        session.save_to_path(&path).expect("session should persist");
         session
     }
 
@@ -700,6 +769,60 @@ mod tests {
             forked.session.persistence_path(),
             Some(forked.handle.path.as_path())
         );
+        fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn resolves_sessions_from_fingerprinted_namespace_after_workspace_rename() {
+        // given
+        let base = temp_dir();
+        let old_workspace = base.join("Himalaya-main");
+        let renamed_workspace = base.join("himalaya");
+        fs::create_dir_all(&old_workspace).expect("old workspace should exist");
+        fs::create_dir_all(&renamed_workspace).expect("renamed workspace should exist");
+        let old_namespace = renamed_workspace
+            .join(".Himalaya")
+            .join("sessions")
+            .join(workspace_fingerprint(&old_workspace));
+        let session = persist_session_in_directory(&old_namespace, "pre-rename session");
+
+        // when
+        let handle = resolve_session_reference_for(&renamed_workspace, &session.session_id)
+            .expect("session id should resolve from legacy fingerprint namespace");
+        let loaded = load_managed_session_for(&renamed_workspace, &session.session_id)
+            .expect("session should load from legacy fingerprint namespace");
+
+        // then
+        assert_eq!(handle.id, session.session_id);
+        assert_eq!(loaded.handle.id, session.session_id);
+        assert_eq!(loaded.session.messages.len(), 1);
+        assert!(handle.path.starts_with(old_namespace));
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn latest_considers_sessions_in_fingerprinted_namespaces() {
+        // given
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir should exist");
+        let flat = persist_session(&root, "flat session");
+        wait_for_next_millisecond();
+        let namespace = root
+            .join(".Himalaya")
+            .join("sessions")
+            .join("legacy-workspace-hash");
+        let namespaced = persist_session_in_directory(&namespace, "namespaced session");
+
+        // when
+        let latest = latest_managed_session_for(&root).expect("latest should resolve");
+        let sessions = list_managed_sessions_for(&root).expect("sessions should list");
+
+        // then
+        assert_eq!(latest.id, namespaced.session_id);
+        assert!(sessions.iter().any(|summary| summary.id == flat.session_id));
+        assert!(sessions
+            .iter()
+            .any(|summary| summary.id == namespaced.session_id));
         fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 

@@ -11366,24 +11366,9 @@ fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn s
 }
 
 fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let directory = sessions_dir()?;
-    for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
-        let path = directory.join(format!("{session_id}.{extension}"));
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-    // Backward compatibility: pre-isolation sessions were stored at
-    // `.Himalaya/sessions/<id>.{jsonl,json}` without the per-workspace hash
-    // subdirectory. Walk up from `directory` to the `.Himalaya/sessions/` root
-    // and try the flat layout as a fallback so users do not lose access
-    // to their pre-upgrade managed sessions.
-    if let Some(legacy_root) = directory
-        .parent()
-        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
-    {
+    for directory in session_search_dirs()? {
         for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
-            let path = legacy_root.join(format!("{session_id}.{extension}"));
+            let path = directory.join(format!("{session_id}.{extension}"));
             if path.exists() {
                 return Ok(path);
             }
@@ -11462,17 +11447,8 @@ fn collect_sessions_from_dir(
 
 fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
     let mut sessions = Vec::new();
-    let primary_dir = sessions_dir()?;
-    collect_sessions_from_dir(&primary_dir, &mut sessions)?;
-
-    // Backward compatibility: include sessions stored in the pre-isolation
-    // flat `.Himalaya/sessions/` root so users do not lose access to existing
-    // managed sessions after the workspace-hashed subdirectory rollout.
-    if let Some(legacy_root) = primary_dir
-        .parent()
-        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
-    {
-        collect_sessions_from_dir(legacy_root, &mut sessions)?;
+    for directory in session_search_dirs()? {
+        collect_sessions_from_dir(&directory, &mut sessions)?;
     }
 
     sessions.sort_by(|left, right| {
@@ -11519,6 +11495,45 @@ fn format_no_managed_sessions() -> String {
     format!(
         "no managed sessions found in .Himalaya/sessions/\nStart `Himalaya` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
     )
+}
+
+fn session_search_dirs() -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let primary_dir = sessions_dir()?;
+    let mut dirs = vec![primary_dir.clone()];
+
+    let Some(root) = primary_dir
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+        .map(Path::to_path_buf)
+    else {
+        return Ok(dirs);
+    };
+
+    push_unique_session_dir(&mut dirs, root.clone());
+
+    let mut namespace_dirs = match fs::read_dir(&root) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| match entry.file_type() {
+                Ok(file_type) if file_type.is_dir() => Some(entry.path()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    namespace_dirs.sort();
+    for directory in namespace_dirs {
+        push_unique_session_dir(&mut dirs, directory);
+    }
+
+    Ok(dirs)
+}
+
+fn push_unique_session_dir(dirs: &mut Vec<PathBuf>, directory: PathBuf) {
+    if !dirs.iter().any(|existing| existing == &directory) {
+        dirs.push(directory);
+    }
 }
 
 fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -19104,6 +19119,41 @@ UU conflicted.rs",
             .expect("legacy session should save");
 
         let resolved = resolve_session_reference("legacy").expect("legacy session should resolve");
+        assert_eq!(
+            resolved
+                .path
+                .canonicalize()
+                .expect("resolved path should exist"),
+            legacy_path
+                .canonicalize()
+                .expect("legacy path should exist")
+        );
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn managed_sessions_resolve_legacy_fingerprint_namespace() {
+        let _guard = cwd_lock().lock().expect("cwd lock");
+        let workspace = temp_workspace("session-namespace-resolution");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+
+        let legacy_namespace = workspace
+            .join(".Himalaya")
+            .join("sessions")
+            .join("legacy-workspace-hash");
+        std::fs::create_dir_all(&legacy_namespace).expect("legacy namespace should exist");
+        let legacy_path = legacy_namespace.join("session-before-rename.jsonl");
+        Session::new()
+            .with_persistence_path(legacy_path.clone())
+            .save_to_path(&legacy_path)
+            .expect("legacy namespaced session should save");
+
+        let resolved = resolve_session_reference("session-before-rename")
+            .expect("legacy namespaced session should resolve");
         assert_eq!(
             resolved
                 .path
