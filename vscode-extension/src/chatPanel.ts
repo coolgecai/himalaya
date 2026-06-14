@@ -393,6 +393,7 @@ export class HimalayaChatPanel {
           this.selectedHistoryId = null;
           this.selectedCliSessionId = null;
           this.forceNewSession = true;
+          this.sessionAllowedTools.clear();
           this.currentOptions = {
             ...this.currentOptions,
             prompt: undefined,
@@ -1006,15 +1007,19 @@ export class HimalayaChatPanel {
         case 'permission_request': {
           const requestedTool = typeof event.tool === 'string' ? event.tool : 'unknown';
           const requestReason = typeof event.reason === 'string' ? event.reason : '';
+          const requiredMode = typeof event.required_mode === 'string' ? event.required_mode : undefined;
+          const toolInput = typeof event.input === 'string' ? event.input : JSON.stringify(event.input ?? '');
           this.host.webview.postMessage({
             type: 'permissionRequest',
             tool: requestedTool,
             reason: requestReason,
             currentMode: typeof event.current_mode === 'string' ? event.current_mode : undefined,
-            requiredMode: typeof event.required_mode === 'string' ? event.required_mode : undefined,
-            input: typeof event.input === 'string' ? event.input : JSON.stringify(event.input ?? ''),
+            requiredMode,
+            input: toolInput,
           });
-          offerPermissionRetryOnce(requestedTool, requestReason, event.type);
+          // The CLI is now BLOCKED waiting for our decision on stdin. Ask the user
+          // via a native modal and write the decision back to the REPL worker.
+          void this.resolvePermissionRequest(requestedTool, requestReason, requiredMode, toolInput);
           break;
         }
         case 'permission_denial': {
@@ -1209,6 +1214,53 @@ export class HimalayaChatPanel {
     const resolvedCwd = cwd ? path.resolve(cwd) : workspaceRoots[0];
     return workspaceRoots.every((root) => root === resolvedCwd || root.startsWith(resolvedCwd + path.sep));
   }
+  // Tools the user approved "for this session" via the permission modal, so we
+  // don't re-prompt for the same tool repeatedly within one chat session.
+  private sessionAllowedTools = new Set<string>();
+
+  private async resolvePermissionRequest(
+    tool: string,
+    reason: string,
+    requiredMode: string | undefined,
+    input: string
+  ): Promise<void> {
+    let decision: 'allow' | 'allow_always' | 'deny';
+    if (this.sessionAllowedTools.has(tool)) {
+      decision = 'allow';
+    } else {
+      const detailParts = [
+        reason ? reason : `The tool "${tool}" needs elevated permission to run.`,
+        requiredMode ? `Required mode: ${requiredMode}.` : '',
+        input ? `Input: ${input.length > 200 ? input.slice(0, 200) + '…' : input}` : ''
+      ].filter(Boolean);
+      const choice = await vscode.window.showWarningMessage(
+        `Himalaya wants to run "${tool}".`,
+        { modal: true, detail: detailParts.join('\n') },
+        'Allow once',
+        'Allow for this session',
+        'Deny'
+      );
+      if (choice === 'Allow once') {
+        decision = 'allow';
+      } else if (choice === 'Allow for this session') {
+        decision = 'allow_always';
+        this.sessionAllowedTools.add(tool);
+      } else {
+        decision = 'deny';
+      }
+    }
+    // Write the decision back to the blocked CLI turn over the REPL stdin.
+    try {
+      this.replHandle?.send(JSON.stringify({ type: 'permission_response', decision }));
+    } catch (error) {
+      this.output.appendLine(`[permission] failed to send decision: ${String(error)}`);
+    }
+    this.host.webview.postMessage({
+      type: 'stderrChunk',
+      text: `Permission for ${tool}: ${decision === 'deny' ? 'denied' : 'allowed'}\n`
+    });
+  }
+
   private async confirmPermissionForRun(permissionMode: string, prompt: string): Promise<boolean> {
     if (permissionMode !== DANGEROUS_PERMISSION_MODE) {
       return true;
@@ -1517,22 +1569,37 @@ export class HimalayaChatPanel {
     // Reuse the previously saved key when the user leaves the field blank.
     const effectiveApiKey = cloudApiKey.trim() || savedSelection?.apiKey || '';
 
-    // Offer a list of known models (mirrors the CLI built-in aliases) plus a
-    // "Custom…" entry that falls back to the InputBox for unknown models.
-    const KNOWN_CLOUD_MODELS = [
-      { label: 'Himalaya-opus-4-6', description: 'Himalaya Opus (high quality)', detail: 'Built-in' },
-      { label: 'Himalaya-sonnet-4-6', description: 'Himalaya Sonnet (balanced)', detail: 'Built-in' },
-      { label: 'Himalaya-haiku-4-5-20251213', description: 'Himalaya Haiku (fast)', detail: 'Built-in' },
-      { label: 'gpt-4o', description: 'OpenAI GPT-4o', detail: 'Common' },
-      { label: 'gpt-4o-mini', description: 'OpenAI GPT-4o Mini (fast)', detail: 'Common' },
+    // Fetch the real model catalogue from the provider's /v1/models endpoint so
+    // the user selects an actually-available model (Codex/Claude UX). Falls
+    // back gracefully to the built-in aliases + profiles when unreachable.
+    let cloudModels: { name: string }[] = [];
+    try {
+      cloudModels = await this.cli.listCloudModels(cloudBaseUrl.trim(), effectiveApiKey);
+    } catch (_) { /* keep empty */ }
+    const builtinAliases = [
+      'Himalaya-opus-4-6', 'Himalaya-sonnet-4-6', 'Himalaya-haiku-4-5-20251213',
+      'gpt-4o', 'gpt-4o-mini', 'Himalaya-fable-5', 'claude-sonnet-4-6'
     ];
-
+    // Merge provider models, deduplicated with built-in names.
+    const seen = new Set<string>();
+    const modelOptions: vscode.QuickPickItem[] = [];
+    for (const m of cloudModels) {
+      const label = m.name.trim();
+      if (!label || seen.has(label)) { continue; }
+      seen.add(label);
+      modelOptions.push({ label, description: 'Provider', detail: 'Cloud' });
+    }
+    for (const alias of builtinAliases) {
+      if (!seen.has(alias)) {
+        seen.add(alias);
+        modelOptions.push({ label: alias, description: 'Built-in', detail: 'Known model' });
+      }
+    }
     const defaultModel = this.currentOptions.cloudModel || this.currentOptions.model || this.currentBootstrap.config.defaultModel;
-    const knownMatch = KNOWN_CLOUD_MODELS.find(m => m.label === defaultModel);
-    const modelOptions = [
-      ...KNOWN_CLOUD_MODELS,
-      { label: 'Custom model name…', description: 'Enter a model name not in the list', detail: 'Other' }
-    ];
+    if (defaultModel && !seen.has(defaultModel)) {
+      modelOptions.unshift({ label: defaultModel, description: 'Current', detail: 'Pre-selected' });
+    }
+    modelOptions.push({ label: 'Custom model name…', description: 'Enter a model name not in the list', detail: 'Other' });
     const modelPick = await vscode.window.showQuickPick(modelOptions, {
       title: 'Cloud model',
       placeHolder: `Select a model (default: ${defaultModel})`,
@@ -1990,6 +2057,31 @@ export class HimalayaChatPanel {
     .msg.reasoning-step { background: rgba(76,132,255,0.04); border-left: 2px solid #4c84ff; padding: 6px 8px; align-self: flex-start; max-width: 100%; }
     .msg.reasoning-step .msg-role { color: #4c84ff; }
     .msg.reasoning-step .msg-body { font-size: 12px; color: var(--text-dim); font-family: inherit; }
+    /* ── inline thinking blocks (Claude-style foldable reasoning) ── */
+    .msg.thinking-block { align-self: stretch; max-width: 100%; padding: 0; background: none; }
+    .thinking-details {
+      border-left: 2px solid rgba(140,140,150,0.4);
+      background: rgba(127,127,127,0.05);
+      border-radius: 0 8px 8px 0;
+      padding: 2px 0;
+    }
+    .thinking-summary {
+      cursor: pointer; list-style: none; user-select: none;
+      display: flex; align-items: center; gap: 6px;
+      padding: 5px 10px; font-size: 11.5px; color: var(--text-dim);
+    }
+    .thinking-summary::-webkit-details-marker { display: none; }
+    .thinking-icon { opacity: 0.8; }
+    .thinking-label { font-weight: 600; letter-spacing: 0.02em; }
+    .thinking-kind { color: rgba(140,140,150,0.7); font-size: 10.5px; text-transform: lowercase; }
+    .thinking-summary:hover { color: var(--text); }
+    .thinking-details[open] > .thinking-summary { border-bottom: 1px solid rgba(127,127,127,0.12); margin-bottom: 4px; }
+    .thinking-body {
+      padding: 2px 12px 8px 14px; font-size: 12px; line-height: 1.5;
+      color: var(--text-dim); font-style: normal;
+    }
+    .thinking-body p { margin: 0 0 6px; }
+    .thinking-body code { background: rgba(127,127,127,0.16); padding: 1px 4px; border-radius: 3px; }
     .msg.decisioning-step { background: rgba(255,167,38,0.05); border-left: 2px solid #ffa726; padding: 6px 8px; align-self: flex-start; max-width: 100%; }
     .msg.decisioning-step .msg-role { color: #ffa726; }
     .msg.decisioning-step .msg-body { font-size: 12px; color: var(--text-dim); font-family: inherit; }
@@ -3499,18 +3591,40 @@ export class HimalayaChatPanel {
     }
 
     /* ── reasoning visualization ── */
+    // Render a reasoning step as an inline, collapsible "Thinking" block in the
+    // conversation timeline (Claude-style). Interleaves with answer text by
+    // arrival order: any in-progress answer stream is finalized first so the
+    // next answer chunk starts a fresh bubble AFTER this thinking block.
+    function thinkingTextFromStep(step) {
+      if (!step || typeof step !== 'object') { return String(step || ''); }
+      if (typeof step.content === 'string' && step.content.trim()) { return step.content; }
+      if (typeof step.text === 'string' && step.text.trim()) { return step.text; }
+      if (step.step_type === 'redacted_thinking') { return '(redacted by provider)'; }
+      try { return JSON.stringify(step, null, 2); } catch (_) { return String(step); }
+    }
+
     function addReasoningStep(step) {
       try {
         if (!step) { return; }
         if (!state.showReasoning) { return; }
         if (!thread) { return; }
+        // Close any active answer stream so the thinking block lands before the
+        // next answer segment (preserves think → answer → think ordering).
+        if (streamBubble) { endStream(); }
+        const text = thinkingTextFromStep(step);
+        const kind = String(step.step_type || 'analysis').replace(/_/g, ' ');
         const div = document.createElement('div');
-        div.className = 'msg reasoning-step';
-        const role = esc(String(step.step_type || 'reason'));
-        const body = esc(JSON.stringify(step, null, 2));
-        div.innerHTML = '<div class="msg-role">' + role + '</div><div class="msg-body">' + body + '</div>';
+        div.className = 'msg thinking-block';
+        const details = document.createElement('details');
+        details.className = 'thinking-details';
+        // Collapsed by default — like Claude's foldable thinking.
+        details.innerHTML = '<summary class="thinking-summary">' +
+          '<span class="thinking-icon">💭</span><span class="thinking-label">Thinking</span>' +
+          '<span class="thinking-kind">' + esc(kind) + '</span></summary>' +
+          '<div class="thinking-body">' + renderMarkdown(text) + '</div>';
+        div.appendChild(details);
         thread.appendChild(div);
-        scrollBottom();
+        smartScroll();
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'addReasoningStep failed: ' + String(e) }); } catch (_) {}
       }
@@ -5387,6 +5501,8 @@ export class HimalayaSidebarChatViewProvider implements vscode.WebviewViewProvid
   async openModelConfig(): Promise<void> {
     await this.surface?.openModelConfigurationWizard();
   }
+
+  async openSkills(): Promise<void> { await this.surface?.manageSkills(); }
 
   async refresh(): Promise<void> {
     if (!this.surface) {

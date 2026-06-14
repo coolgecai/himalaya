@@ -38,6 +38,10 @@ export interface HimalayaSkillInfo {
   shadowed: boolean;
 }
 
+export interface HimalayaCloudModelInfo {
+  name: string;
+}
+
 export interface ResolvedBinary {
   path: string;
   source: BinarySource;
@@ -406,6 +410,39 @@ export class HimalayaCli {
       }
     } catch { /* keep raw stdout */ }
     return { ok: result.exitCode === 0, message: message || (result.exitCode === 0 ? 'Installed.' : 'Install failed.') };
+  }
+
+  /// Enumerate cloud (OpenAI-compatible) models by hitting the provider's
+  /// `GET /v1/models` endpoint with the given credentials. Falls back to
+  /// the default model name when unreachable. Timeout: 8 s.
+  async listCloudModels(baseUrl: string, apiKey: string): Promise<HimalayaCloudModelInfo[]> {
+    try {
+      const cleanBase = baseUrl.replace(/\/+$/, '');
+      const url = `${cleanBase}/models`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8_000);
+      let response: Response;
+      try {
+        const fetchFn = globalThis.fetch;
+        if (!fetchFn) { return []; }
+        response = await fetchFn(url, {
+          method: 'GET',
+          headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!response.ok) { return []; }
+      const body = await response.text();
+      const parsed = JSON.parse(body) as { data?: { id?: unknown }[] };
+      if (!Array.isArray(parsed.data)) { return []; }
+      return parsed.data
+        .map((entry) => (entry && typeof entry.id === 'string' ? { name: entry.id } : null))
+        .filter((m): m is HimalayaCloudModelInfo => m !== null);
+    } catch {
+      return [];
+    }
   }
 
   async listLocalModels(options: { force?: boolean } = {}): Promise<string[]> {

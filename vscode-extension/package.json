@@ -108,6 +108,10 @@
         "title": "Himalaya: Configure Model"
       },
       {
+        "command": "himalaya.manageSkills",
+        "title": "Himalaya: Manage Skills"
+      },
+      {
         "command": "himalaya.status",
         "title": "Himalaya: Status"
       },

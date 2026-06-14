@@ -95,6 +95,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await vscode.commands.executeCommand('himalaya.secondaryChatView.focus');
       await sidebarChat.openModelConfig();
     }),
+    vscode.commands.registerCommand('himalaya.manageSkills', async () => {
+      await vscode.commands.executeCommand('himalaya.secondaryChatView.focus');
+      await sidebarChat.openSkills();
+    }),
     vscode.commands.registerCommand('himalaya.status', async () => {
       await cli.runToOutputChannel(['status'], 'Himalaya status');
     }),

@@ -13664,6 +13664,8 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
 struct CliPermissionPrompter {
     current_mode: PermissionMode,
     stream_json: bool,
+    /// Tools the host approved "always" for this session (stream-json mode).
+    session_allowed_tools: std::collections::HashSet<String>,
 }
 
 impl CliPermissionPrompter {
@@ -13675,6 +13677,7 @@ impl CliPermissionPrompter {
         Self {
             current_mode,
             stream_json,
+            session_allowed_tools: std::collections::HashSet::new(),
         }
     }
 }
@@ -13691,15 +13694,51 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
         if self.stream_json {
-            return runtime::PermissionPromptDecision::Deny {
-                reason: request.reason.clone().unwrap_or_else(|| {
+            // Host-driven approval (VS Code): a tool that needs elevation emits a
+            // `permission_request` event; the host replies with a single line
+            //   {"type":"permission_response","decision":"allow|deny|allow_always"}
+            // read from stdin. This closes the loop so writes/installs are no
+            // longer auto-denied. Missing/garbled replies fall back to Deny.
+            if self.session_allowed_tools.contains(&request.tool_name) {
+                return runtime::PermissionPromptDecision::Allow;
+            }
+            let deny_reason = || {
+                request.reason.clone().unwrap_or_else(|| {
                     format!(
                         "tool '{}' requires {} permission; current mode is {}",
                         request.tool_name,
                         request.required_mode.as_str(),
                         request.current_mode.as_str()
                     )
-                }),
+                })
+            };
+            let mut response = String::new();
+            match std::io::stdin().read_line(&mut response) {
+                Ok(0) | Err(_) => {
+                    return runtime::PermissionPromptDecision::Deny {
+                        reason: deny_reason(),
+                    };
+                }
+                Ok(_) => {}
+            }
+            let decision = serde_json::from_str::<serde_json::Value>(response.trim())
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("decision")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| response.trim().to_string());
+            return match decision.as_str() {
+                "allow" | "allow_once" | "yes" | "y" => runtime::PermissionPromptDecision::Allow,
+                "allow_always" | "allow_session" => {
+                    self.session_allowed_tools.insert(request.tool_name.clone());
+                    runtime::PermissionPromptDecision::Allow
+                }
+                _ => runtime::PermissionPromptDecision::Deny {
+                    reason: deny_reason(),
+                },
             };
         }
 

@@ -797,18 +797,22 @@ test('permission retry paths share one danger-full-access helper', () => {
   assert.match(chatPanelSource, /private\s+offerDangerFullAccessRetry\(/);
   assert.match(chatPanelSource, /const offerPermissionRetryOnce = \(toolName: string, reason: string, source: string\) => \{/);
   assert.match(chatPanelSource, /offerPermissionRetryOnce\(toolName, output, 'tool_result'\)/);
-  assert.match(chatPanelSource, /offerPermissionRetryOnce\(requestedTool, requestReason, event\.type\)/);
   assert.match(chatPanelSource, /offerPermissionRetryOnce\(deniedTool, denialReason, event\.type\)/);
   assert.doesNotMatch(chatPanelSource, /user approved via stream event/);
 });
-test('permission request stream events render structured fields', () => {
+test('permission closed-loop authorizes tools via host stdin response', () => {
+  // #4: the CLI no longer auto-denies; extension shows a modal and writes back.
   assert.match(chatPanelSource, /case 'permission_request'/);
+  assert.match(chatPanelSource, /resolvePermissionRequest\(requestedTool/);
+  assert.match(chatPanelSource, /type: 'permission_response', decision/);
+  assert.match(chatPanelSource, /sessionAllowedTools\.add\(tool\)/);
+  assert.match(chatPanelSource, /Allow for this session/);
+  assert.match(chatPanelSource, /Deny/);
+  assert.match(chatPanelSource, /private sessionAllowedTools = new Set/);
+  // Still forwards structured fields to the webview for awareness.
   assert.match(chatPanelSource, /type: 'permissionRequest'/);
-  assert.match(chatPanelSource, /currentMode: typeof event\.current_mode === 'string' \? event\.current_mode : undefined/);
-  assert.match(chatPanelSource, /requiredMode: typeof event\.required_mode === 'string' \? event\.required_mode : undefined/);
   assert.match(chatPanelSource, /case 'permissionRequest': \{/);
   assert.match(chatPanelSource, /Permission requested for/);
-  assert.match(chatPanelSource, /body \+= '\\\\nInput: ' \+ input\.slice\(0, 240\)/);
 });
 test('tool and permission webview events render structured fields', () => {
   assert.match(chatPanelSource, /case 'toolStep': \{/);
@@ -1193,12 +1197,30 @@ test('cloud model config is unified with the CLI provider.json format', () => {
   }
 });
 
+test('cloud model wizard fetches real model catalogue from provider', () => {
+  // #3: listCloudModels hits GET /v1/models, with fallback.
+  assert.match(cliSource, /async listCloudModels\(baseUrl: string, apiKey: string\): Promise<HimalayaCloudModelInfo\[\]>/);
+  assert.match(cliSource, /\`\$\{cleanBase\}\/models\`/);
+  assert.match(cliSource, /Authorization.*Bearer.*apiKey/);
+  // configureCloudModelRoute merges provider models into the picker
+  assert.match(chatPanelSource, /this\.cli\.listCloudModels\(cloudBaseUrl\.trim\(\), effectiveApiKey\)/);
+  assert.match(chatPanelSource, /seen\.has\(alias\)/);
+});
+
 test('cloud model wizard mirrors selection into the shared provider.json', () => {
+  // Still mirrors to CLI-compatible provider.json (from #4).
   assert.match(chatPanelSource, /import \{ loadProviderSelection, saveProviderSelection \} from '\.\/providerConfig'/);
   assert.match(chatPanelSource, /saveProviderSelection\(workspaceRoot, \{/);
   assert.match(chatPanelSource, /const savedSelection = workspaceRoot \? loadProviderSelection\(workspaceRoot\) : null/);
-  // Reuse persisted key when the user leaves the field blank.
   assert.match(chatPanelSource, /const effectiveApiKey = cloudApiKey\.trim\(\) \|\| savedSelection\?\.apiKey \|\| ''/);
+});
+
+
+test('himalaya.manageSkills is a registered command accessible from the palette', () => {
+  // #5: command entry in package.json + handler in extension.ts.
+  assert.ok(packageJson.contributes.commands.some(function(cmd) { return cmd.command === 'himalaya.manageSkills'; }), 'command registered');
+  assert.match(extensionSource, /'himalaya.manageSkills'/);
+  assert.match(chatPanelSource, /async openSkills\(\): Promise<void> \{ await this\.surface\?\.manageSkills\(\)/);
 });
 
 test('execution gate blocks run callback when danger confirmation is denied', async () => {
