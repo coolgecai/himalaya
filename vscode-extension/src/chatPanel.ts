@@ -4,6 +4,7 @@ import * as path from 'path';
 import { HimalayaCli, type HimalayaReplHandle } from './cli';
 import { ChatHistoryRecord, ChatHistorySnapshot, HimalayaHistoryStore, RecoveryEvidence } from './history';
 import { readModelRoute, writeModelRoute } from './modelRoute';
+import { loadProviderSelection, saveProviderSelection } from './providerConfig';
 import {
   DANGEROUS_PERMISSION_MODE,
   DEFAULT_PERMISSION_MODE,
@@ -267,11 +268,39 @@ export class HimalayaChatPanel {
   private replKey: string | null = null;
   private replBusy = false;
   private replCanReuse = true;
+  // Set when the user explicitly starts a new session, so the next REPL spawn
+  // passes --new and the CLI does NOT auto-resume the latest workspace session.
+  private forceNewSession = false;
   private replEventHandler: ((event: unknown) => void) | null = null;
   private replStderrHandler: ((chunk: string) => void) | null = null;
   private readonly dangerApprovalKeyPrefix = 'himalayaCode.dangerApproval.v1';
   private readonly reasoningPrefKey = 'himalayaCode.showReasoning.v1';
   private readonly languagePreferenceKey = 'himalayaCode.preferredResponseLanguage.v1';
+
+  // Resolve a (possibly relative) path from a tool card and open it in the editor.
+  private async openFileFromCard(rawPath: string, line: number | null): Promise<void> {
+    const path = (rawPath || '').trim();
+    if (!path) { return; }
+    try {
+      let uri: vscode.Uri;
+      if (path.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(path)) {
+        uri = vscode.Uri.file(path);
+      } else {
+        const folder = vscode.workspace.workspaceFolders?.[0];
+        uri = folder ? vscode.Uri.joinPath(folder.uri, path) : vscode.Uri.file(path);
+      }
+      const doc = await vscode.workspace.openTextDocument(uri);
+      const options: vscode.TextDocumentShowOptions = { preview: true };
+      if (line != null && line > 0) {
+        const pos = new vscode.Position(Math.max(0, line - 1), 0);
+        options.selection = new vscode.Range(pos, pos);
+      }
+      await vscode.window.showTextDocument(doc, options);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      void vscode.window.showWarningMessage(`Could not open ${path}: ${message}`);
+    }
+  }
 
   private summarizePrompt(prompt: string): string {
     const compact = prompt.replace(/\s+/gu, ' ').trim();
@@ -308,6 +337,12 @@ export class HimalayaChatPanel {
           selectedCliSessionId: this.selectedCliSessionId
         });
         break;
+      case 'openFile':
+        void this.openFileFromCard(
+          typeof (typedMessage as any).path === 'string' ? (typedMessage as any).path : '',
+          typeof (typedMessage as any).line === 'number' ? (typedMessage as any).line : null
+        );
+        break;
       case 'cancel':
         if (this.replHandle && this.replBusy) {
           this.replHandle.kill();
@@ -343,6 +378,11 @@ export class HimalayaChatPanel {
           break;
         }
 
+        if (typedMessage.command === 'manageSkills') {
+          void this.manageSkills();
+          break;
+        }
+
         if (typedMessage.command === 'doctor' || typedMessage.command === 'status') {
           void this.executeUtilityCommand(typedMessage.command);
           break;
@@ -352,6 +392,7 @@ export class HimalayaChatPanel {
           this.closeReplWorker();
           this.selectedHistoryId = null;
           this.selectedCliSessionId = null;
+          this.forceNewSession = true;
           this.currentOptions = {
             ...this.currentOptions,
             prompt: undefined,
@@ -373,6 +414,28 @@ export class HimalayaChatPanel {
         if (typedMessage.action === 'delete' && typedMessage.historyId) {
           const historyId = typedMessage.historyId;
           void (async () => {
+            const record = this.history.records().find((item) => item.id === historyId);
+            if (!record) {
+              void this.host.webview.postMessage({
+                type: 'historyDeleted',
+                historyId,
+                activeRecordId: this.history.activeRecordId(),
+                selectedHistoryId: this.selectedHistoryId,
+                selectedCliSessionId: this.selectedCliSessionId
+              });
+              return;
+            }
+
+            const choice = await vscode.window.showWarningMessage(
+              `Delete history "${this.summarizePrompt(record.title)}"? This cannot be undone.`,
+              { modal: true },
+              'Delete'
+            );
+            if (choice !== 'Delete') {
+              void this.host.webview.postMessage({ type: 'historyDeleteCancelled', historyId });
+              return;
+            }
+
             const wasSelected = this.selectedHistoryId === historyId || this.history.activeRecordId() === historyId;
             await this.history.remove(historyId);
             if (wasSelected) {
@@ -534,11 +597,16 @@ export class HimalayaChatPanel {
       this.host.webview.postMessage({ type: 'runStatus', text: 'Starting REPL worker…', kind: 'running' });
       let handle: HimalayaReplHandle | null = null;
       const effectiveResumeTarget = input.resumeTarget;
+      // Consume the one-shot "new session" intent: when set (and no explicit
+      // resume target), tell the CLI to start fresh instead of auto-resuming.
+      const startFresh = this.forceNewSession && !effectiveResumeTarget;
+      this.forceNewSession = false;
       const created = await this.cli.startRepl({
         model: input.model,
         permissionMode: input.permissionMode,
         cwd: input.cwd,
         resumeTarget: effectiveResumeTarget,
+        forceNewSession: startFresh,
         allowBroadCwd: this.shouldAllowBroadCwd(input.cwd),
         env: input.env,
         onEvent: (event) => this.replEventHandler?.(event),
@@ -797,7 +865,13 @@ export class HimalayaChatPanel {
           }
           break;
         case 'tool_use': {
-          this.host.webview.postMessage({ type: 'toolStep', step: 'use', name: event.name, input: JSON.stringify(event.input) });
+          this.host.webview.postMessage({
+            type: 'toolStep',
+            step: 'use',
+            name: event.name,
+            input: JSON.stringify(event.input),
+            inputData: event.input ?? null
+          });
           break;
         }
         case 'tool_result': {
@@ -832,7 +906,10 @@ export class HimalayaChatPanel {
           break;
         case 'decisioning_event':
           try {
-            if (event.decisioning_event) {
+            // Decisioning events ARE the reasoning visualization (they carry the
+            // chain-of-thought / analysis). Only forward when the user opted in,
+            // otherwise reasoning leaks into the thread despite the toggle being off.
+            if (event.decisioning_event && Boolean(this.currentOptions.showReasoning)) {
               this.host.webview.postMessage({ type: 'decisioningEvent', event: event.decisioning_event });
             }
           } catch (e) {
@@ -895,6 +972,15 @@ export class HimalayaChatPanel {
         case 'worker_supervisor_tick':
           this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event });
           break;
+        case 'context_event': {
+          const kind = typeof event.kind === 'string' ? event.kind : '';
+          if (kind === 'context_compact') {
+            const removed = typeof event.removed_entries === 'number' ? event.removed_entries : undefined;
+            const notice = typeof event.notice === 'string' ? event.notice : undefined;
+            this.host.webview.postMessage({ type: 'contextCompacted', removed, notice });
+          }
+          break;
+        }
         case 'recovery_suggestion': {
           const recoveryEvidence: RecoveryEvidence = {
             tool: typeof event.tool === 'string' ? event.tool : undefined,
@@ -1287,6 +1373,87 @@ export class HimalayaChatPanel {
     };
   }
 
+  /// Skills manager: list discovered skills, invoke one (inserts `$skill` into
+  /// the composer), or install a new skill from a local path. Shares the CLI's
+  /// skill backend (.Himalaya/skills) so CLI and extension see the same skills.
+  async manageSkills(): Promise<void> {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const cwd = this.currentOptions.cwd?.trim() || workspaceFolder;
+    const skills = await this.cli.listSkills(cwd);
+
+    type SkillItem = vscode.QuickPickItem & { action: 'invoke' | 'install' | 'refresh'; skillName?: string };
+    const items: SkillItem[] = [];
+    const active = skills.filter((s) => !s.shadowed);
+    for (const skill of active) {
+      items.push({
+        label: `$(star) ${skill.name}`,
+        description: skill.source || undefined,
+        detail: skill.description || undefined,
+        action: 'invoke',
+        skillName: skill.name
+      });
+    }
+    if (active.length === 0) {
+      items.push({
+        label: '$(info) No skills found',
+        detail: 'Install a skill (a directory with SKILL.md, or a .md file) to get started.',
+        action: 'install'
+      });
+    }
+    items.push({ label: '', kind: vscode.QuickPickItemKind.Separator, action: 'refresh' });
+    items.push({ label: '$(cloud-download) Install skill…', detail: 'Pick a SKILL.md directory or markdown file to install', action: 'install' });
+    items.push({ label: '$(refresh) Refresh skills', action: 'refresh' });
+
+    const picked = await vscode.window.showQuickPick(items, {
+      title: `Skills (${active.length} available)`,
+      placeHolder: 'Invoke a skill, or install a new one',
+      ignoreFocusOut: true,
+      matchOnDescription: true,
+      matchOnDetail: true
+    });
+    if (!picked) { return; }
+
+    if (picked.action === 'refresh') {
+      await this.manageSkills();
+      return;
+    }
+
+    if (picked.action === 'install') {
+      await this.installSkillInteractive(cwd);
+      return;
+    }
+
+    if (picked.action === 'invoke' && picked.skillName) {
+      // Insert the `$skill` invocation token into the composer so the user can
+      // add arguments before sending. The CLI expands `$skill args` on submit.
+      void this.host.webview.postMessage({ type: 'insertComposerText', text: '$' + picked.skillName + ' ' });
+    }
+  }
+
+  private async installSkillInteractive(cwd?: string): Promise<void> {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectMany: false,
+      canSelectFiles: true,
+      canSelectFolders: true,
+      openLabel: 'Install skill',
+      title: 'Select a skill directory (with SKILL.md) or a markdown file'
+    });
+    if (!uris || uris.length === 0) { return; }
+    const sourcePath = uris[0].fsPath;
+    try {
+      const result = await this.cli.installSkill(sourcePath, cwd);
+      if (result.ok) {
+        void vscode.window.showInformationMessage(`Skill installed: ${result.message}`);
+        await this.manageSkills();
+      } else {
+        void vscode.window.showWarningMessage(`Skill install failed: ${result.message}`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      void vscode.window.showErrorMessage(`Skill install error: ${message}`);
+    }
+  }
+
   async openModelConfigurationWizard(): Promise<void> {
     const routeMode = await vscode.window.showQuickPick(
       [
@@ -1320,10 +1487,14 @@ export class HimalayaChatPanel {
   }
 
   private async configureCloudModelRoute(): Promise<void> {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    // Prefer a previously persisted base URL (shared with the CLI via
+    // provider.json) so re-running the wizard pre-fills the last value.
+    const savedSelection = workspaceRoot ? loadProviderSelection(workspaceRoot) : null;
     const cloudBaseUrl = await vscode.window.showInputBox({
       title: 'Cloud model',
       prompt: 'Enter the cloud network address or OpenAI-compatible base URL',
-      value: this.currentBootstrap.config.ollamaBaseUrl || 'https://api.openai.com/v1',
+      value: savedSelection?.baseUrl || this.currentBootstrap.config.ollamaBaseUrl || 'https://api.openai.com/v1',
       ignoreFocusOut: true
     });
 
@@ -1333,7 +1504,9 @@ export class HimalayaChatPanel {
 
     const cloudApiKey = await vscode.window.showInputBox({
       title: 'Cloud model',
-      prompt: 'Enter the API key',
+      prompt: savedSelection?.apiKey
+        ? 'Enter the API key (leave blank to keep the existing one)'
+        : 'Enter the API key',
       password: true,
       ignoreFocusOut: true
     });
@@ -1341,6 +1514,8 @@ export class HimalayaChatPanel {
     if (cloudApiKey === undefined) {
       return;
     }
+    // Reuse the previously saved key when the user leaves the field blank.
+    const effectiveApiKey = cloudApiKey.trim() || savedSelection?.apiKey || '';
 
     // Offer a list of known models (mirrors the CLI built-in aliases) plus a
     // "Custom…" entry that falls back to the InputBox for unknown models.
@@ -1385,7 +1560,7 @@ export class HimalayaChatPanel {
     } else {
       selectedModel = modelPick.label.trim();
     }
-    if (!cloudBaseUrl.trim() || !cloudApiKey.trim() || !selectedModel) {
+    if (!cloudBaseUrl.trim() || !effectiveApiKey || !selectedModel) {
       void vscode.window.showWarningMessage('Cloud model setup requires a network address, API key, and model name.');
       return;
     }
@@ -1395,21 +1570,36 @@ export class HimalayaChatPanel {
       modelBackend: 'cloud',
       modelSource: 'cloud',
       cloudBaseUrl: cloudBaseUrl.trim(),
-      cloudApiKey: cloudApiKey.trim(),
+      cloudApiKey: effectiveApiKey,
       cloudModel: selectedModel
     });
+
+    // Unify with the CLI: mirror the selection into the shared provider.json
+    // (+ credentials file) so `Himalaya` picks up the same cloud model.
+    if (workspaceRoot) {
+      try {
+        saveProviderSelection(workspaceRoot, {
+          model: selectedModel,
+          baseUrl: cloudBaseUrl.trim(),
+          apiKey: effectiveApiKey
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.output.appendLine(`[model] failed to mirror cloud config to provider.json: ${message}`);
+      }
+    }
 
     this.currentOptions = {
       ...this.currentOptions,
       model: selectedModel,
       modelBackend: 'cloud',
       cloudBaseUrl: cloudBaseUrl.trim(),
-      cloudApiKey: cloudApiKey.trim(),
+      cloudApiKey: effectiveApiKey,
       cloudModel: selectedModel
     };
 
     void this.host.webview.postMessage({ type: 'model-updated', model: selectedModel, modelBackend: 'cloud' });
-    void vscode.window.showInformationMessage(`Himalaya cloud model set to ${selectedModel}.`);
+    void vscode.window.showInformationMessage(`Himalaya cloud model set to ${selectedModel} (shared with CLI).`);
   }
 
   private async configureLocalModelRoute(): Promise<void> {
@@ -1464,8 +1654,11 @@ export class HimalayaChatPanel {
       "default-src 'none'",
       `img-src ${webview.cspSource} https: data:`,
       `style-src ${webview.cspSource} 'unsafe-inline'`,
-      `script-src 'nonce-${nonce}'`
+      `script-src 'nonce-${nonce}' ${webview.cspSource}`
     ].join('; ');
+    const markedUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.context.extensionUri, 'media', 'marked.umd.js')
+    );
     const localModels: string[] = bootstrap.modelCatalog?.localModels ?? [];
     const historyRecords = bootstrap.history?.records ?? [];
     const activeRecordId = bootstrap.history?.activeRecordId ?? null;
@@ -1628,20 +1821,238 @@ export class HimalayaChatPanel {
     }
     .msg.user { background: var(--user-bg); align-self: flex-end; max-width: 88%; }
     .msg.assistant { background: var(--assistant-bg); align-self: flex-start; max-width: 100%; }
+    /* ── rendered markdown in assistant bodies ── */
+    .msg.assistant .msg-body { white-space: normal; line-height: 1.5; }
+    .msg.assistant .msg-body > :first-child { margin-top: 0; }
+    .msg.assistant .msg-body > :last-child { margin-bottom: 0; }
+    .msg.assistant .msg-body p { margin: 0 0 8px; }
+    .msg.assistant .msg-body h1,
+    .msg.assistant .msg-body h2,
+    .msg.assistant .msg-body h3,
+    .msg.assistant .msg-body h4 { margin: 14px 0 6px; line-height: 1.3; font-weight: 600; }
+    .msg.assistant .msg-body h1 { font-size: 1.4em; }
+    .msg.assistant .msg-body h2 { font-size: 1.25em; }
+    .msg.assistant .msg-body h3 { font-size: 1.1em; }
+    .msg.assistant .msg-body h4 { font-size: 1em; }
+    .msg.assistant .msg-body ul,
+    .msg.assistant .msg-body ol { margin: 0 0 8px; padding-left: 22px; }
+    .msg.assistant .msg-body li { margin: 2px 0; }
+    .msg.assistant .msg-body li > p { margin: 0; }
+    .msg.assistant .msg-body a { color: var(--link, #4c84ff); text-decoration: none; }
+    .msg.assistant .msg-body a:hover { text-decoration: underline; }
+    .msg.assistant .msg-body code {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.92em;
+      background: rgba(127,127,127,0.16);
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    .msg.assistant .msg-body pre {
+      margin: 0 0 10px;
+      padding: 10px 12px;
+      background: rgba(127,127,127,0.12);
+      border: 1px solid rgba(127,127,127,0.18);
+      border-radius: 8px;
+      overflow-x: auto;
+      white-space: pre;
+    }
+    .msg.assistant .msg-body pre code {
+      background: none;
+      padding: 0;
+      font-size: 0.88em;
+      line-height: 1.45;
+    }
+    .msg.assistant .msg-body blockquote {
+      margin: 0 0 8px;
+      padding: 2px 0 2px 12px;
+      border-left: 3px solid rgba(127,127,127,0.4);
+      color: var(--text-dim);
+    }
+    .msg.assistant .msg-body table {
+      border-collapse: collapse;
+      margin: 0 0 10px;
+      display: block;
+      overflow-x: auto;
+      max-width: 100%;
+    }
+    .msg.assistant .msg-body th,
+    .msg.assistant .msg-body td {
+      border: 1px solid rgba(127,127,127,0.28);
+      padding: 4px 8px;
+      text-align: left;
+    }
+    .msg.assistant .msg-body th { background: rgba(127,127,127,0.12); font-weight: 600; }
+    .msg.assistant .msg-body hr { border: none; border-top: 1px solid rgba(127,127,127,0.25); margin: 12px 0; }
+    .msg.assistant .msg-body img { max-width: 100%; height: auto; border-radius: 6px; }
+    .msg.assistant .msg-body .cursor { display: inline-block; }
     .msg.error { background: rgba(244,71,71,0.08); border: 1px solid rgba(244,71,71,0.25); color: #f88; }
     .msg.stderr { background: rgba(255,200,0,0.06); border: 1px solid rgba(255,200,0,0.15); color: #ffd; font-size: 11px; font-family: monospace; }
     .msg.tool-step { background: rgba(78,201,176,0.05); border-left: 2px solid #4ec9b0; padding: 4px 8px; align-self: flex-start; max-width: 100%; }
     .msg.tool-step .msg-role { color: #4ec9b0; }
     .msg.tool-step .msg-body { font-size: 11.5px; font-family: monospace; color: var(--text-dim); }
+    /* ── rich tool cards ── */
+    .msg.tool-card {
+      align-self: flex-start;
+      max-width: 100%;
+      width: 100%;
+      background: rgba(78,201,176,0.045);
+      border: 1px solid rgba(78,201,176,0.18);
+      border-left: 2px solid #4ec9b0;
+      border-radius: 8px;
+      padding: 7px 9px;
+      gap: 6px;
+    }
+    .msg.tool-card.has-error { border-left-color: #f44; border-color: rgba(244,71,71,0.25); }
+    .tool-head { display: flex; align-items: center; gap: 7px; }
+    .tool-icon { color: #4ec9b0; font-size: 12px; width: 14px; text-align: center; }
+    .tool-card.has-error .tool-icon { color: #ff8a8a; }
+    .tool-name { font-size: 11.5px; font-weight: 600; color: var(--text); letter-spacing: 0.01em; }
+    .tool-subtle { font-size: 11px; color: var(--text-dim); margin: 2px 0; }
+    .tool-pathline { margin: 2px 0; }
+    .tool-path {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11.5px;
+      color: var(--link, #4c84ff);
+      background: rgba(76,132,255,0.08);
+      border: 1px solid rgba(76,132,255,0.18);
+      border-radius: 5px;
+      padding: 1px 6px;
+      cursor: pointer;
+      word-break: break-all;
+      text-align: left;
+    }
+    .tool-path:hover { background: rgba(76,132,255,0.18); text-decoration: underline; }
+    .tool-kv { display: flex; gap: 6px; align-items: baseline; font-size: 11.5px; margin: 2px 0; flex-wrap: wrap; }
+    .tool-k { color: var(--text-dim); min-width: 52px; }
+    .tool-kv code { font-family: var(--vscode-editor-font-family, monospace); background: rgba(127,127,127,0.14); padding: 1px 5px; border-radius: 4px; }
+    pre.tool-code {
+      margin: 4px 0 0;
+      padding: 8px 10px;
+      background: rgba(127,127,127,0.12);
+      border: 1px solid rgba(127,127,127,0.16);
+      border-radius: 6px;
+      overflow-x: auto;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11.5px;
+      line-height: 1.5;
+      white-space: pre;
+    }
+    .tok-cmd { color: #4ec9b0; }
+    .tok-flag { color: #c586c0; }
+    .tok-str { color: #ce9178; }
+    .tok-num { color: #b5cea8; }
+    .tok-cmt { color: #6a9955; font-style: italic; }
+    .tool-diff {
+      margin: 4px 0 0;
+      border: 1px solid rgba(127,127,127,0.16);
+      border-radius: 6px;
+      overflow-x: auto;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11.5px;
+      line-height: 1.45;
+    }
+    .diff-row { padding: 0 8px; white-space: pre; }
+    .diff-del { background: rgba(244,71,71,0.10); color: #f4a0a0; }
+    .diff-add { background: rgba(78,201,176,0.12); color: #8fe6cf; }
+    .tool-result-slot:empty { display: none; }
+    details.tool-result {
+      margin: 5px 0 0;
+      border-top: 1px dashed rgba(127,127,127,0.2);
+      padding-top: 4px;
+    }
+    details.tool-result > summary {
+      cursor: pointer;
+      font-size: 11px;
+      color: var(--text-dim);
+      list-style: none;
+      user-select: none;
+    }
+    details.tool-result > summary::-webkit-details-marker { display: none; }
+    details.tool-result[open] > summary { color: var(--text); margin-bottom: 4px; }
+    details.tool-result-error > summary { color: #ff8a8a; }
+    pre.tool-result-body {
+      margin: 0;
+      padding: 8px 10px;
+      background: rgba(127,127,127,0.10);
+      border-radius: 6px;
+      overflow-x: auto;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+    .tool-result-error pre.tool-result-body { color: #f4b0b0; }
+    .tool-result-empty { font-size: 11px; color: var(--text-dim); font-style: italic; }
+    .tool-more { font-size: 10.5px; color: var(--text-dim); margin-top: 3px; }
     .msg.reasoning-step { background: rgba(76,132,255,0.04); border-left: 2px solid #4c84ff; padding: 6px 8px; align-self: flex-start; max-width: 100%; }
     .msg.reasoning-step .msg-role { color: #4c84ff; }
     .msg.reasoning-step .msg-body { font-size: 12px; color: var(--text-dim); font-family: inherit; }
     .msg.decisioning-step { background: rgba(255,167,38,0.05); border-left: 2px solid #ffa726; padding: 6px 8px; align-self: flex-start; max-width: 100%; }
     .msg.decisioning-step .msg-role { color: #ffa726; }
     .msg.decisioning-step .msg-body { font-size: 12px; color: var(--text-dim); font-family: inherit; }
+    /* ── runtime event cards ── */
+    .msg.runtime-event {
+      align-self: flex-start;
+      width: 100%;
+      max-width: 100%;
+      background: rgba(127,127,127,0.05);
+      border: 1px solid rgba(127,127,127,0.16);
+      border-left: 2px solid var(--rt-tone, #8a8a8a);
+      border-radius: 8px;
+      padding: 7px 9px;
+      gap: 5px;
+    }
+    .msg.runtime-event.tone-ok { --rt-tone: #4ec9b0; }
+    .msg.runtime-event.tone-err { --rt-tone: #f4564f; }
+    .msg.runtime-event.tone-warn { --rt-tone: #e2b341; }
+    .msg.runtime-event.tone-run { --rt-tone: #4c84ff; }
+    .msg.runtime-event.tone-idle { --rt-tone: #8a8a8a; }
+    .rt-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+    .rt-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--rt-tone, #8a8a8a); flex-shrink: 0; }
+    .msg.runtime-event.tone-run .rt-dot { box-shadow: 0 0 0 3px rgba(76,132,255,0.18); }
+    .rt-kind { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--rt-tone, #8a8a8a); font-weight: 600; }
+    .rt-summary { font-size: 11.5px; color: var(--text-dim); flex: 1; min-width: 0; }
+    .rt-detail { font-size: 11.5px; color: var(--text); display: flex; flex-direction: column; gap: 3px; }
+    .rt-pills { display: flex; flex-wrap: wrap; gap: 4px; }
+    .rt-pill { font-size: 10.5px; padding: 1px 7px; border-radius: 10px; border: 1px solid transparent; }
+    .rt-pill-ok { background: rgba(78,201,176,0.14); color: #8fe6cf; border-color: rgba(78,201,176,0.3); }
+    .rt-pill-err { background: rgba(244,71,71,0.14); color: #ffa0a0; border-color: rgba(244,71,71,0.3); }
+    .rt-pill-warn { background: rgba(226,179,65,0.14); color: #ecd08a; border-color: rgba(226,179,65,0.3); }
+    .rt-pill-run { background: rgba(76,132,255,0.14); color: #a9c4ff; border-color: rgba(76,132,255,0.3); }
+    .rt-pill-idle { background: rgba(127,127,127,0.14); color: var(--text-dim); border-color: rgba(127,127,127,0.25); }
+    .rt-row { display: flex; gap: 6px; align-items: baseline; }
+    .rt-k { color: var(--text-dim); min-width: 64px; font-size: 11px; }
+    .rt-v { color: var(--text); word-break: break-word; flex: 1; min-width: 0; }
+    .rt-muted { color: var(--text-dim); font-size: 10.5px; }
+    .rt-route { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; }
+    .rt-phase { color: var(--text-dim); text-transform: uppercase; font-size: 10px; letter-spacing: 0.04em; }
+    .rt-arrow { color: var(--text-dim); }
+    .rt-model { color: #4ec9b0; font-weight: 600; font-family: var(--vscode-editor-font-family, monospace); }
+    .rt-conf { display: flex; align-items: center; gap: 7px; }
+    .rt-conf-track { flex: 1; height: 5px; background: rgba(127,127,127,0.2); border-radius: 3px; overflow: hidden; }
+    .rt-conf-fill { height: 100%; background: linear-gradient(90deg, #4c84ff, #4ec9b0); border-radius: 3px; }
+    .rt-conf-label { font-size: 10.5px; color: var(--text-dim); min-width: 30px; text-align: right; }
+    .rt-steps { margin: 2px 0 0; padding-left: 18px; font-size: 11px; }
+    .rt-steps li { margin: 1px 0; }
+    .rt-timeline { list-style: none; margin: 2px 0 0; padding: 0; font-size: 11px; }
+    .rt-timeline li { position: relative; padding: 1px 0 1px 14px; }
+    .rt-timeline li::before { content: ''; position: absolute; left: 2px; top: 7px; width: 6px; height: 6px; border-radius: 50%; }
+    .rt-timeline li.rt-tl-ok::before { background: #4ec9b0; }
+    .rt-timeline li.rt-tl-err::before { background: #f4564f; }
+    .rt-timeline li.rt-tl-run::before { background: #4c84ff; }
+    details.rt-raw { margin-top: 2px; }
+    details.rt-raw > summary { cursor: pointer; font-size: 10.5px; color: var(--text-dim); list-style: none; }
+    details.rt-raw > summary::-webkit-details-marker { display: none; }
+    details.rt-raw pre { margin: 4px 0 0; padding: 7px 9px; background: rgba(127,127,127,0.10); border-radius: 6px; overflow-x: auto; font-size: 10.5px; line-height: 1.4; max-height: 220px; overflow-y: auto; }
     .msg.recovery-suggestion { background: rgba(181,126,220,0.06); border-left: 2px solid #b57edc; padding: 6px 8px; align-self: flex-start; max-width: 100%; }
     .msg.recovery-suggestion .msg-role { color: #d6a8ff; }
     .msg.recovery-suggestion .msg-body { font-size: 12px; color: var(--text-dim); font-family: inherit; }
+    .msg.notice { background: rgba(120,170,255,0.06); border-left: 2px solid #6b9fff; padding: 5px 8px; align-self: center; max-width: 92%; }
+    .msg.notice .msg-role { color: #9cc0ff; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .msg.notice .msg-body { font-size: 11.5px; color: var(--text-dim); font-family: inherit; }
     .decisioning-card {
       display: flex;
       flex-direction: column;
@@ -2005,6 +2416,10 @@ export class HimalayaChatPanel {
       background: rgba(244,71,71,0.10);
       color: #ff9a9a;
     }
+    .history-delete:disabled {
+      opacity: 0.5;
+      cursor: wait;
+    }
     /* ── composer ── */
     .composer {
       flex: 0 0 auto;
@@ -2171,19 +2586,48 @@ export class HimalayaChatPanel {
     .task-board-surface {
       flex: 0 0 auto;
       margin: 8px 10px 0;
-      padding: 10px;
-      border-radius: 12px;
+      padding: 8px;
+      border-radius: 8px;
       border: 1px solid rgba(78,201,176,0.25);
       background: linear-gradient(180deg, rgba(78,201,176,0.08), rgba(255,255,255,0.02));
       box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
     }
     .task-board-surface[hidden] { display: none; }
+    .task-board-surface.collapsed {
+      padding: 7px 9px;
+    }
     .task-board-header {
       display: flex;
-      align-items: flex-start;
+      align-items: center;
       justify-content: space-between;
       gap: 10px;
       margin-bottom: 8px;
+    }
+    .task-board-surface.collapsed .task-board-header {
+      margin-bottom: 0;
+    }
+    .task-board-heading {
+      flex: 1;
+      min-width: 0;
+      cursor: pointer;
+    }
+    .task-board-toggle {
+      width: 24px;
+      height: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      border: 1px solid rgba(78,201,176,0.22);
+      border-radius: 6px;
+      background: rgba(78,201,176,0.07);
+      color: var(--text);
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .task-board-toggle:hover {
+      border-color: rgba(78,201,176,0.42);
+      background: rgba(78,201,176,0.13);
     }
     .task-board-title {
       color: var(--text);
@@ -2196,6 +2640,18 @@ export class HimalayaChatPanel {
       font-size: 11px;
       line-height: 1.45;
       margin-top: 2px;
+    }
+    .task-board-summary {
+      color: var(--text-dim);
+      font-size: 11px;
+      line-height: 1.35;
+      margin-top: 2px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .task-board-body[hidden] {
+      display: none;
     }
     .task-board-grid {
       display: grid;
@@ -2282,6 +2738,30 @@ export class HimalayaChatPanel {
       font-size: 11px;
       line-height: 1.4;
     }
+    /* ── task board progress visualization ── */
+    .tb-seg-ok { background: #4ec9b0; }
+    .tb-seg-err { background: #f4564f; }
+    .tb-seg-warn { background: #e2b341; }
+    .tb-seg-run { background: #4c84ff; }
+    .tb-seg-idle { background: rgba(127,127,127,0.45); }
+    .tb-progress { margin: 4px 0 8px; }
+    .tb-progress-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+    .tb-progress-label { font-size: 11px; color: var(--text); }
+    .tb-progress-pct { font-size: 11px; color: var(--text-dim); font-weight: 600; }
+    .tb-bar { display: flex; height: 6px; border-radius: 4px; overflow: hidden; background: rgba(127,127,127,0.18); }
+    .tb-bar-seg { height: 100%; }
+    .tb-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+    .tb-chip { font-size: 10px; padding: 1px 6px; border-radius: 9px; border: 1px solid transparent; }
+    .tb-chip-ok { background: rgba(78,201,176,0.14); color: #8fe6cf; border-color: rgba(78,201,176,0.3); }
+    .tb-chip-err { background: rgba(244,71,71,0.14); color: #ffa0a0; border-color: rgba(244,71,71,0.3); }
+    .tb-chip-warn { background: rgba(226,179,65,0.14); color: #ecd08a; border-color: rgba(226,179,65,0.3); }
+    .tb-chip-run { background: rgba(76,132,255,0.14); color: #a9c4ff; border-color: rgba(76,132,255,0.3); }
+    .tb-chip-idle { background: rgba(127,127,127,0.14); color: var(--text-dim); border-color: rgba(127,127,127,0.25); }
+    .tb-nodes { margin-top: 8px; }
+    .tb-nodes-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .tb-nodes-count { font-size: 10.5px; color: var(--text-dim); font-weight: 600; }
+    .tb-node-grid { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 5px; }
+    .tb-node-dot { width: 9px; height: 9px; border-radius: 2px; flex-shrink: 0; }
     .task-board-status {
       display: inline-flex;
       align-items: center;
@@ -2308,6 +2788,7 @@ export class HimalayaChatPanel {
     <span class="topbar-title">Himalaya</span>
     <button class="icon-btn" id="btnHistory" title="Toggle history">&#9776;</button>
     <button class="icon-btn" id="btnNew" title="New session">&#43;</button>
+    <button class="icon-btn" id="btnSkills" title="Skills">&#9733;</button>
     <button class="icon-btn" id="btnReasoning" title="Toggle reasoning visualization">🔎</button>
     <button class="icon-btn" id="btnRefresh" title="Refresh">&#8635;</button>
   </div>
@@ -2381,7 +2862,8 @@ export class HimalayaChatPanel {
   </div>
 
 `;
-    const _script = `  <script nonce="${nonce}">
+    const _script = `  <script nonce="${nonce}" src="${markedUri}"></script>
+  <script nonce="${nonce}">
   window.onerror = function(msg, src, line, col, err) {
     try {
       if (window.__himalayaPostError) {
@@ -2425,14 +2907,20 @@ export class HimalayaChatPanel {
       }),
       recoveryEvidence: (ACTIVE_RECORD.recoveryEvidence || []).slice(),
       taskBoard: {
+        collapsed: true,
         tasks: {},
         taskOrder: [],
         currentNode: null,
+        planNodes: {},
+        planNodeOrder: [],
         recoveryEvents: [],
         workers: {},
         workerOrder: [],
         selectedWorkerId: null,
-        workerSupervisor: null
+        workerSupervisor: null,
+        daemon: null,
+        routeSummary: null,
+        benchmark: null
       },
       historyRecords: HISTORY
     };
@@ -2588,19 +3076,67 @@ export class HimalayaChatPanel {
       if (role === 'user') { return (state.identity && state.identity.userDisplayName) || 'You'; }
       if (role === 'assistant') { return (state.identity && state.identity.assistantDisplayName) || 'Himalaya'; }
       if (role === 'tool-step') { return 'Tool'; }
+      if (role === 'notice') { return 'Context'; }
       return (String(role || '')[0] || '').toUpperCase() + String(role || '').slice(1);
     }
 
 
     let streamBubble = null;
     let streamCursor = null;
+    let streamBuffer = '';
+    let streamRendered = '';
+    let streamRenderQueued = false;
 
-    
+    if (typeof marked !== 'undefined' && marked.setOptions) {
+      marked.setOptions({ gfm: true, breaks: false });
+    }
+
+    function renderMarkdown(md) {
+      try {
+        if (typeof marked !== 'undefined' && marked.parse) {
+          return marked.parse(String(md == null ? '' : md), { mangle: false, headerIds: false });
+        }
+      } catch (e) { /* fall through to escaped text */ }
+      return '<p>' + esc(md) + '</p>';
+    }
+
+    // Find a boundary in the buffer that is safe to render — avoid splitting an
+    // open code fence so partial \`\`\` blocks don't flash as broken markup.
+    function findSafeRenderBoundary(text) {
+      const fences = (text.match(/\`\`\`/g) || []).length;
+      if (fences % 2 === 0) { return text.length; }
+      const lastFence = text.lastIndexOf('\`\`\`');
+      return lastFence > 0 ? lastFence : text.length;
+    }
+
+    function smartScroll() {
+      try {
+        if (!thread) { return; }
+        const nearBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 60;
+        if (nearBottom) { thread.scrollTop = thread.scrollHeight; }
+      } catch (_) {}
+    }
+
+    function flushStreamRender() {
+      streamRenderQueued = false;
+      if (!streamBubble) { return; }
+      const body = streamBubble.querySelector ? streamBubble.querySelector('.msg-body') : null;
+      if (!body) { return; }
+      const boundary = findSafeRenderBoundary(streamBuffer);
+      const safeText = streamBuffer.slice(0, boundary);
+      if (safeText === streamRendered) { return; }
+      streamRendered = safeText;
+      body.innerHTML = renderMarkdown(safeText);
+      if (streamCursor) { body.appendChild(streamCursor); }
+      smartScroll();
+    }
 
     function startStream() {
       try {
         if (!thread) { return; }
         showEmpty(false);
+        streamBuffer = '';
+        streamRendered = '';
         streamBubble = document.createElement('div');
         streamBubble.className = 'msg assistant';
         streamBubble.innerHTML = '<div class="msg-role">' + esc(labelForRole('assistant')) + '</div><div class="msg-body"></div>';
@@ -2618,15 +3154,12 @@ export class HimalayaChatPanel {
     function appendStream(text) {
       try {
         if (!streamBubble) { startStream(); }
-        const body = streamBubble && streamBubble.querySelector ? streamBubble.querySelector('.msg-body') : null;
-        if (!body) { return; }
-        const textNode = document.createTextNode(text);
-        if (streamCursor && streamCursor.parentNode === body) {
-          body.insertBefore(textNode, streamCursor);
-        } else {
-          body.appendChild(textNode);
+        if (!streamBubble) { return; }
+        streamBuffer += (text == null ? '' : text);
+        if (!streamRenderQueued) {
+          streamRenderQueued = true;
+          (window.requestAnimationFrame || window.setTimeout)(flushStreamRender, 16);
         }
-        scrollBottom();
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'appendStream failed: ' + String(e) }); } catch (_) {}
       }
@@ -2634,9 +3167,19 @@ export class HimalayaChatPanel {
 
     function endStream() {
       try {
+        if (streamBubble) {
+          const body = streamBubble.querySelector('.msg-body');
+          if (body) {
+            body.innerHTML = renderMarkdown(streamBuffer);
+          }
+        }
         if (streamCursor && streamCursor.remove) { streamCursor.remove(); }
         streamCursor = null;
+        streamBuffer = '';
+        streamRendered = '';
+        streamRenderQueued = false;
         streamBubble = null;
+        smartScroll();
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'endStream failed: ' + String(e) }); } catch (_) {}
       }
@@ -2683,18 +3226,8 @@ export class HimalayaChatPanel {
         if (deleteButton) {
           deleteButton.addEventListener('click', function(event) {
             event.stopPropagation();
-            if (!window.confirm('Delete this history record?')) { return; }
-            state.historyRecords = state.historyRecords.filter(function(item) { return item.id !== rec.id; });
-            if (state.activeRecordId === rec.id) {
-              state.activeRecordId = null;
-              state.resumeTarget = '';
-              state.messages = [];
-              state.recoveryEvidence = [];
-              state.taskBoard = taskBoardInitialState();
-              renderThread();
-            }
-            renderHistory();
-            setStatus('History deleted.', 'done');
+            deleteButton.disabled = true;
+            setStatus('Confirm deletion in VS Code...', '');
             vscode.postMessage({ type: 'history-action', action: 'delete', historyId: rec.id });
           });
         }
@@ -2726,10 +3259,10 @@ export class HimalayaChatPanel {
       try {
         if (!thread) { return; }
         const div = document.createElement('div');
-        const cls = role === 'user' ? 'msg user' : role === 'assistant' ? 'msg assistant' : role === 'error' ? 'msg error' : role === 'stderr' ? 'msg stderr' : role === 'tool-step' ? 'msg tool-step' : 'msg';
+        const cls = role === 'user' ? 'msg user' : role === 'assistant' ? 'msg assistant' : role === 'error' ? 'msg error' : role === 'stderr' ? 'msg stderr' : role === 'tool-step' ? 'msg tool-step' : role === 'notice' ? 'msg notice' : 'msg';
         div.className = cls;
         const label = labelForRole(role);
-        let body = esc(text || '');
+        let body = role === 'assistant' ? renderMarkdown(text || '') : esc(text || '');
         if (Array.isArray(attachments) && attachments.length > 0) {
           const chips = attachments.map(function(attachment) {
             const name = attachment && attachment.displayName ? attachment.displayName : attachment && attachment.path ? String(attachment.path).split(/[\\/]/).pop() : 'attachment';
@@ -2743,6 +3276,193 @@ export class HimalayaChatPanel {
         scrollBottom();
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'addBubble failed: ' + String(e) }); } catch (_) {}
+      }
+    }
+
+    /* ── rich tool cards ── */
+    // Per-tool icon + human label. Falls back to a generic gear.
+    function toolMeta(name) {
+      const n = String(name || '').toLowerCase();
+      const map = {
+        bash: { icon: '➜', label: 'Shell', lang: 'bash' },
+        read_file: { icon: '\u{1F4C4}', label: 'Read', lang: '' },
+        write_file: { icon: '✎', label: 'Write', lang: '' },
+        generate_file: { icon: '\u{1F4DD}', label: 'Generate', lang: '' },
+        edit_file: { icon: '✎', label: 'Edit', lang: '' },
+        glob_search: { icon: '\u{1F50D}', label: 'Glob', lang: '' },
+        grep_search: { icon: '\u{1F50D}', label: 'Grep', lang: '' },
+        webfetch: { icon: '\u{1F310}', label: 'Fetch', lang: '' },
+        websearch: { icon: '\u{1F50E}', label: 'Search', lang: '' },
+        todowrite: { icon: '☑', label: 'Todo', lang: '' }
+      };
+      return map[n] || { icon: '⚙', label: String(name || 'Tool'), lang: '' };
+    }
+
+    function parseToolInput(msg) {
+      if (msg && msg.inputData && typeof msg.inputData === 'object') { return msg.inputData; }
+      if (msg && typeof msg.input === 'string' && msg.input) {
+        try { return JSON.parse(msg.input); } catch (_) { return null; }
+      }
+      return null;
+    }
+
+    // Split "path:line" or "path#L12" suffix off a file reference.
+    function splitPathLine(raw) {
+      const s = String(raw || '');
+      let m = s.match(/^(.*?):(\\d+)(?::\\d+)?$/);
+      if (m) { return { path: m[1], line: parseInt(m[2], 10) }; }
+      m = s.match(/^(.*?)#L(\\d+)/);
+      if (m) { return { path: m[1], line: parseInt(m[2], 10) }; }
+      return { path: s, line: null };
+    }
+
+    // Clickable file path chip — posts openFile back to the extension host.
+    function filePathChip(rawPath) {
+      const parsed = splitPathLine(rawPath);
+      const display = esc(String(rawPath || ''));
+      const dataPath = esc(parsed.path);
+      const dataLine = parsed.line != null ? String(parsed.line) : '';
+      return '<button type="button" class="tool-path" data-open-path="' + dataPath +
+        '" data-open-line="' + dataLine + '" title="' + esc('Open ' + parsed.path) + '">' +
+        display + '</button>';
+    }
+
+    // Minimal, dependency-free token highlighter for shell/code snippets.
+    function highlightCode(code, lang) {
+      let html = esc(String(code == null ? '' : code));
+      if (lang === 'bash') {
+        html = html
+          .replace(/(^|\\n)(\\s*)(#[^\\n]*)/g, '$1$2<span class="tok-cmt">$3</span>')
+          .replace(/(&quot;[^&]*?&quot;|&#39;[^&]*?&#39;)/g, '<span class="tok-str">$1</span>')
+          .replace(/(^|[|&;]\\s*)([a-zA-Z_][\\w.-]*)/g, '$1<span class="tok-cmd">$2</span>')
+          .replace(/(\\s)(--?[a-zA-Z][\\w-]*)/g, '$1<span class="tok-flag">$2</span>');
+      } else {
+        html = html
+          .replace(/(&quot;[^&]*?&quot;|&#39;[^&]*?&#39;)/g, '<span class="tok-str">$1</span>')
+          .replace(/\\b(\\d+(?:\\.\\d+)?)\\b/g, '<span class="tok-num">$1</span>');
+      }
+      return html;
+    }
+
+    function codeBlock(code, lang) {
+      return '<pre class="tool-code' + (lang ? ' lang-' + lang : '') + '"><code>' +
+        highlightCode(code, lang) + '</code></pre>';
+    }
+
+    // TOOL_CARD_BUILDERS_1
+    // Render a unified-diff style preview for edit_file (old → new).
+    function renderDiff(oldStr, newStr) {
+      const oldLines = String(oldStr == null ? '' : oldStr).split('\\n');
+      const newLines = String(newStr == null ? '' : newStr).split('\\n');
+      const rows = [];
+      oldLines.forEach(function(l) {
+        if (l.length || oldLines.length > 1) { rows.push('<div class="diff-row diff-del">- ' + esc(l) + '</div>'); }
+      });
+      newLines.forEach(function(l) {
+        if (l.length || newLines.length > 1) { rows.push('<div class="diff-row diff-add">+ ' + esc(l) + '</div>'); }
+      });
+      return '<div class="tool-diff">' + rows.join('') + '</div>';
+    }
+
+    // Build the body markup for a tool_use, dispatched by tool name.
+    function toolUseBody(name, input) {
+      const n = String(name || '').toLowerCase();
+      const meta = toolMeta(name);
+      if (!input || typeof input !== 'object') { return ''; }
+      if (n === 'bash') {
+        const cmd = input.command || '';
+        const desc = input.description ? '<div class="tool-subtle">' + esc(String(input.description)) + '</div>' : '';
+        return desc + codeBlock(cmd, 'bash');
+      }
+      if (n === 'read_file' || n === 'write_file' || n === 'generate_file' || n === 'edit_file') {
+        let out = '<div class="tool-pathline">' + filePathChip(input.path || '') + '</div>';
+        if (n === 'edit_file') { out += renderDiff(input.old_string, input.new_string); }
+        else if (n === 'write_file' || n === 'generate_file') {
+          const content = String(input.content || '');
+          const preview = content.length > 600 ? content.slice(0, 600) + '\\n…' : content;
+          if (preview) { out += codeBlock(preview, meta.lang); }
+        }
+        return out;
+      }
+      if (n === 'glob_search' || n === 'grep_search') {
+        let out = '<div class="tool-kv"><span class="tool-k">pattern</span><code>' + esc(String(input.pattern || '')) + '</code></div>';
+        if (input.path) { out += '<div class="tool-kv"><span class="tool-k">path</span>' + filePathChip(input.path) + '</div>'; }
+        if (input.glob) { out += '<div class="tool-kv"><span class="tool-k">glob</span><code>' + esc(String(input.glob)) + '</code></div>'; }
+        return out;
+      }
+      if (n === 'webfetch') {
+        return '<div class="tool-kv"><span class="tool-k">url</span><code>' + esc(String(input.url || '')) + '</code></div>' +
+          (input.prompt ? '<div class="tool-subtle">' + esc(String(input.prompt)) + '</div>' : '');
+      }
+      if (n === 'websearch') {
+        return '<div class="tool-kv"><span class="tool-k">query</span><code>' + esc(String(input.query || '')) + '</code></div>';
+      }
+      // Generic fallback: pretty-print JSON.
+      try { return codeBlock(JSON.stringify(input, null, 2), ''); } catch (_) { return ''; }
+    }
+
+    // TOOL_CARD_BUILDERS_2
+    // Track the most recent tool card per tool name so a tool_result can attach
+    // its output to the matching tool_use card.
+    const pendingToolCards = {};
+
+    function buildResultBlock(output, isError) {
+      const text = String(output == null ? '' : output);
+      const trimmed = text.trim();
+      if (!trimmed) {
+        return '<div class="tool-result-empty">' + (isError ? 'failed' : 'no output') + '</div>';
+      }
+      const lines = text.split('\\n');
+      const collapsed = lines.length > 12 || text.length > 800;
+      const shown = collapsed ? lines.slice(0, 12).join('\\n') + '\\n…' : text;
+      const cls = 'tool-result' + (isError ? ' tool-result-error' : '');
+      const moreNote = collapsed ? '<div class="tool-more">' + (lines.length - 12 > 0 ? '+' + (lines.length - 12) + ' more lines' : 'truncated') + '</div>' : '';
+      return '<details class="' + cls + '"' + (isError || !collapsed ? ' open' : '') + '>' +
+        '<summary>' + (isError ? '✗ error' : '✓ output') + '</summary>' +
+        '<pre class="tool-result-body"><code>' + esc(shown) + '</code></pre>' + moreNote + '</details>';
+    }
+
+    function renderToolCard(msg) {
+      try {
+        if (!thread) { return; }
+        const name = msg.name ? String(msg.name) : 'tool';
+        if (msg.step === 'result') {
+          // Attach to the pending use-card if present, else create a standalone card.
+          const card = pendingToolCards[name];
+          const block = buildResultBlock(msg.output, msg.isError);
+          if (card && card.querySelector) {
+            const slot = card.querySelector('.tool-result-slot');
+            if (slot) { slot.innerHTML = block; }
+            if (msg.isError) { card.classList.add('has-error'); }
+            delete pendingToolCards[name];
+            smartScroll();
+            return;
+          }
+          const div = document.createElement('div');
+          div.className = 'msg tool-card' + (msg.isError ? ' has-error' : '');
+          const meta = toolMeta(name);
+          div.innerHTML = '<div class="tool-head"><span class="tool-icon">' + meta.icon + '</span>' +
+            '<span class="tool-name">' + esc(meta.label) + '</span></div>' +
+            '<div class="tool-result-slot">' + block + '</div>';
+          thread.appendChild(div);
+          smartScroll();
+          return;
+        }
+        // step === 'use'
+        showEmpty(false);
+        const input = parseToolInput(msg);
+        const meta = toolMeta(name);
+        const div = document.createElement('div');
+        div.className = 'msg tool-card';
+        div.innerHTML = '<div class="tool-head"><span class="tool-icon">' + meta.icon + '</span>' +
+          '<span class="tool-name">' + esc(meta.label) + '</span></div>' +
+          '<div class="tool-use-body">' + toolUseBody(name, input) + '</div>' +
+          '<div class="tool-result-slot"></div>';
+        thread.appendChild(div);
+        pendingToolCards[name] = div;
+        smartScroll();
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'renderToolCard failed: ' + String(e) }); } catch (_) {}
       }
     }
 
@@ -3170,11 +3890,179 @@ export class HimalayaChatPanel {
       }
       return event && typeof event === 'object' ? JSON.stringify(event) : String(event || '');
     }
+    // RUNTIME_EVENT_CARD_HELPERS
+    // Map a status/kind string to a visual tone: ok | warn | err | run | idle.
+    function toneFromStatus(s) {
+      const v = String(s || '').toLowerCase();
+      if (/(fail|error|blocked|escalat|reject|denied|cancel)/.test(v)) { return 'err'; }
+      if (/(complete|success|passed|recovered|done|resolved|assigned)/.test(v)) { return 'ok'; }
+      if (/(running|in_progress|started|retry|pending|resume|scheduled)/.test(v)) { return 'run'; }
+      if (/(warn|partial|skip|degraded)/.test(v)) { return 'warn'; }
+      return 'idle';
+    }
+
+    function runtimeEventTone(kind, event) {
+      const v = event && typeof event === 'object' ? event : {};
+      if (kind === 'plan_execution_event') { return toneFromStatus(v.status || v.kind); }
+      if (kind === 'task_ledger_event') { return toneFromStatus(v.status || v.event); }
+      if (kind === 'model_route_event') { return 'run'; }
+      if (kind === 'team_execution_event') { return toneFromStatus(v.kind); }
+      if (kind === 'recovery_event') {
+        const a = v.recovery_attempted;
+        if (a && a.result) {
+          if (a.result.recovered) { return 'ok'; }
+          if (a.result.escalation_required) { return 'err'; }
+          if (a.result.partial_recovery) { return 'warn'; }
+        }
+        if (Object.prototype.hasOwnProperty.call(v, 'recovery_failed') || Object.prototype.hasOwnProperty.call(v, 'escalated')) { return 'err'; }
+        if (Object.prototype.hasOwnProperty.call(v, 'recovery_succeeded')) { return 'ok'; }
+        return 'run';
+      }
+      if (kind === 'recovery_action_event' || kind === 'task_recovery') {
+        const ex = v.execution && typeof v.execution === 'object' ? v.execution : v;
+        const results = Array.isArray(ex.results) ? ex.results : [];
+        if (results.some(function(r) { return r && r.blocked; })) { return 'err'; }
+        if (results.length && results.every(function(r) { return r && r.executed; })) { return 'ok'; }
+        return 'run';
+      }
+      if (kind === 'task_execution_event' || kind === 'task_execution') {
+        const o = v.outcome && typeof v.outcome === 'object' ? v.outcome : v;
+        if (o.blocked) { return 'err'; }
+        if (o.completed) { return 'ok'; }
+        return 'run';
+      }
+      if (kind === 'task_verification') {
+        const r = v.result && typeof v.result === 'object' ? v.result : v;
+        return r.passed === true ? 'ok' : (r.passed === false ? 'err' : 'idle');
+      }
+      return 'idle';
+    }
+
+    // Small helpers shared by the detail renderers.
+    function rtRow(k, v) {
+      if (v == null || v === '') { return ''; }
+      return '<div class="rt-row"><span class="rt-k">' + esc(k) + '</span><span class="rt-v">' + esc(String(v)) + '</span></div>';
+    }
+    function rtPill(text, tone) {
+      return '<span class="rt-pill rt-pill-' + (tone || 'idle') + '">' + esc(String(text)) + '</span>';
+    }
+    function rtConfidenceBar(conf) {
+      const pct = Math.max(0, Math.min(100, Math.round(Number(conf) * 100)));
+      return '<div class="rt-conf"><div class="rt-conf-track"><div class="rt-conf-fill" style="width:' + pct + '%"></div></div>' +
+        '<span class="rt-conf-label">' + pct + '%</span></div>';
+    }
+
+    // RUNTIME_EVENT_CARD_DETAIL
+    function renderRuntimeEventDetail(kind, event) {
+      try {
+        const v = event && typeof event === 'object' ? event : {};
+        if (kind === 'plan_execution_event') {
+          const rows = rtRow('node', v.node_id) + rtRow('task', v.task_id) +
+            (v.attempt ? rtRow('attempt', v.attempt) : '') +
+            (v.message ? rtRow('message', v.message) : '') +
+            (v.blocking_reason ? rtRow('blocked', v.blocking_reason) : '') +
+            (v.verification_gate ? rtRow('gate', v.verification_gate) : '');
+          const head = (v.kind ? rtPill(String(v.kind).replace(/_/g, ' '), runtimeEventTone(kind, event)) : '') +
+            (v.status ? rtPill(v.status, toneFromStatus(v.status)) : '');
+          return (head ? '<div class="rt-pills">' + head + '</div>' : '') + rows;
+        }
+        if (kind === 'task_ledger_event') {
+          const head = (v.event ? rtPill(String(v.event).replace(/_/g, ' '), runtimeEventTone(kind, event)) : '') +
+            (v.status ? rtPill(v.status, toneFromStatus(v.status)) : '');
+          return (head ? '<div class="rt-pills">' + head + '</div>' : '') +
+            rtRow('task', v.task_id) + (v.detail ? rtRow('detail', v.detail) : '');
+        }
+        if (kind === 'task_execution_event' || kind === 'task_execution') {
+          const o = v.outcome && typeof v.outcome === 'object' ? v.outcome : v;
+          const steps = Array.isArray(o.steps) ? o.steps : [];
+          const status = o.completed ? 'completed' : (o.blocked ? 'blocked' : 'running');
+          let out = '<div class="rt-pills">' + rtPill(status, toneFromStatus(status)) +
+            (steps.length ? rtPill(steps.length + ' step' + (steps.length === 1 ? '' : 's'), 'idle') : '') + '</div>' +
+            rtRow('task', o.task_id) + (o.message ? rtRow('message', o.message) : '');
+          if (steps.length) {
+            out += '<ol class="rt-steps">' + steps.slice(0, 6).map(function(s) {
+              const label = String((s && (s.kind || s.message)) || 'step').replace(/_/g, ' ');
+              return '<li>' + esc(label) + (s && s.node_id ? ' <span class="rt-muted">' + esc(s.node_id) + '</span>' : '') + '</li>';
+            }).join('') + '</ol>';
+            if (steps.length > 6) { out += '<div class="rt-muted">+' + (steps.length - 6) + ' more</div>'; }
+          }
+          return out;
+        }
+        // RUNTIME_EVENT_CARD_DETAIL_2
+        if (kind === 'model_route_event') {
+          let out = '<div class="rt-route">' +
+            (v.phase ? '<span class="rt-phase">' + esc(String(v.phase)) + '</span>' : '') +
+            '<span class="rt-arrow">→</span>' +
+            '<span class="rt-model">' + esc(String(v.model || 'model')) + '</span>' +
+            (v.provider ? '<span class="rt-muted">(' + esc(String(v.provider)) + ')</span>' : '') + '</div>';
+          if (typeof v.confidence === 'number') { out += rtConfidenceBar(v.confidence); }
+          if (v.fallback_model) { out += rtRow('fallback', v.fallback_model); }
+          if (v.reason) { out += rtRow('reason', v.reason); }
+          return out;
+        }
+        if (kind === 'recovery_event') {
+          const a = v.recovery_attempted && typeof v.recovery_attempted === 'object' ? v.recovery_attempted : null;
+          if (a) {
+            const result = a.result && typeof a.result === 'object' ? a.result : {};
+            let outcome = 'attempted', tone = 'run';
+            if (result.recovered) { outcome = 'recovered'; tone = 'ok'; }
+            else if (result.partial_recovery) { outcome = 'partial recovery'; tone = 'warn'; }
+            else if (result.escalation_required) { outcome = 'escalation required'; tone = 'err'; }
+            const steps = result.recovered && typeof result.recovered === 'object' ? result.recovered.steps_taken : undefined;
+            return '<div class="rt-pills">' + rtPill(outcome, tone) + '</div>' +
+              rtRow('scenario', a.scenario) + (steps != null ? rtRow('steps taken', steps) : '');
+          }
+          return '';
+        }
+        if (kind === 'recovery_action_event' || kind === 'task_recovery') {
+          const ex = v.execution && typeof v.execution === 'object' ? v.execution : v;
+          const results = Array.isArray(ex.results) ? ex.results : [];
+          let out = rtRow('task', ex.task_id);
+          if (results.length) {
+            out += '<ul class="rt-timeline">' + results.slice(0, 6).map(function(r) {
+              const ok = r && r.executed && !r.blocked;
+              const cls = r && r.blocked ? 'err' : (ok ? 'ok' : 'run');
+              const label = String((r && (r.action || r.reason)) || (ok ? 'executed' : 'pending'));
+              return '<li class="rt-tl-' + cls + '">' + esc(label) + '</li>';
+            }).join('') + '</ul>';
+            if (results.length > 6) { out += '<div class="rt-muted">+' + (results.length - 6) + ' more action(s)</div>'; }
+          }
+          return out;
+        }
+        if (kind === 'team_execution_event') {
+          const head = (v.kind ? rtPill(String(v.kind).replace(/_/g, ' '), toneFromStatus(v.kind)) : '') +
+            (v.role ? rtPill(v.role, 'idle') : '');
+          return (head ? '<div class="rt-pills">' + head + '</div>' : '') +
+            rtRow('team', v.team_id) + rtRow('task', v.task_id) + (v.message ? rtRow('message', v.message) : '');
+        }
+        if (kind === 'task_verification') {
+          const r = v.result && typeof v.result === 'object' ? v.result : v;
+          const status = r.passed === true ? 'passed' : (r.passed === false ? 'failed' : 'unknown');
+          return '<div class="rt-pills">' + rtPill(status, toneFromStatus(status)) + '</div>' +
+            rtRow('task', r.task_id) + (r.summary ? rtRow('summary', r.summary) : '');
+        }
+        if (kind === 'worker_supervisor_tick') {
+          const tick = v.tick && typeof v.tick === 'object' ? v.tick : v;
+          const cap = tick.capacity && typeof tick.capacity === 'object' ? tick.capacity : {};
+          return '<div class="rt-pills">' +
+            (tick.status ? rtPill(tick.status, toneFromStatus(tick.status)) : '') +
+            (tick.active_workers !== undefined ? rtPill(tick.active_workers + ' active', 'run') : '') +
+            (cap.available_slots !== undefined ? rtPill(cap.available_slots + ' free', 'idle') : '') + '</div>';
+        }
+        return '';
+      } catch (e) {
+        return '';
+      }
+    }
+
     function taskBoardInitialState() {
       return {
+        collapsed: true,
         tasks: {},
         taskOrder: [],
         currentNode: null,
+        planNodes: {},
+        planNodeOrder: [],
         recoveryEvents: [],
         workers: {},
         workerOrder: [],
@@ -3205,6 +4093,32 @@ export class HimalayaChatPanel {
       if (state.taskBoard.taskOrder.indexOf(taskId) < 0) {
         state.taskBoard.taskOrder.unshift(taskId);
       }
+    }
+
+    // Accumulate plan node states (by node_id) so the board can show DAG progress,
+    // not just the single most-recent node.
+    function rememberPlanNode(nodeId, status, kind) {
+      const id = String(nodeId || '').trim();
+      if (!id) { return; }
+      const prev = state.taskBoard.planNodes[id] || {};
+      state.taskBoard.planNodes[id] = {
+        nodeId: id,
+        status: status || prev.status || 'pending',
+        kind: kind || prev.kind
+      };
+      if (state.taskBoard.planNodeOrder.indexOf(id) < 0) {
+        state.taskBoard.planNodeOrder.push(id);
+      }
+    }
+
+    // Shared status→tone mapping (mirrors the runtime-event card tones).
+    function taskBoardTone(value) {
+      const v = String(value || '').toLowerCase();
+      if (/(fail|error|blocked|escalat|reject|denied|cancel)/.test(v)) { return 'err'; }
+      if (/(complete|success|passed|recovered|done|resolved|finished)/.test(v)) { return 'ok'; }
+      if (/(running|in_progress|started|retry|pending|resume|verifying|scheduled|queued)/.test(v)) { return 'run'; }
+      if (/(warn|partial|skip|degraded)/.test(v)) { return 'warn'; }
+      return 'idle';
     }
 
     function rememberTaskBoardWorker(worker) {
@@ -3326,6 +4240,7 @@ export class HimalayaChatPanel {
             blockingReason: value.blocking_reason,
             verificationGate: value.verification_gate
           };
+          rememberPlanNode(value.node_id, value.status, value.kind);
           if (value.task_id) { rememberTaskBoardTask({ task_id: value.task_id, last_event: value.kind || 'plan_execution_event' }); }
         } else if (kind === 'task_node_retry' || kind === 'task_node_verification') {
           state.taskBoard.currentNode = {
@@ -3336,6 +4251,7 @@ export class HimalayaChatPanel {
             attempt: value.attempt,
             blockingReason: value.command
           };
+          rememberPlanNode(value.node_id, kind === 'task_node_retry' ? 'retrying' : 'verifying', kind);
         } else if (kind === 'task_execution' || kind === 'task_execution_event') {
           const outcome = value.outcome && typeof value.outcome === 'object' ? value.outcome : value;
           if (outcome.task_id) {
@@ -3376,6 +4292,47 @@ export class HimalayaChatPanel {
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'updateTaskBoardFromRuntimeEvent failed: ' + String(e) }); } catch (_) {}
       }
+    }
+
+    // Aggregate task statuses into a progress bar + status-distribution chips.
+    function renderTaskBoardProgress(tasks) {
+      if (!tasks || !tasks.length) { return ''; }
+      const counts = { ok: 0, err: 0, run: 0, warn: 0, idle: 0 };
+      tasks.forEach(function(t) { counts[taskBoardTone(t.status)] += 1; });
+      const total = tasks.length;
+      const done = counts.ok;
+      const pct = Math.round((done / total) * 100);
+      const seg = function(tone) {
+        const n = counts[tone];
+        if (!n) { return ''; }
+        return '<div class="tb-bar-seg tb-seg-' + tone + '" style="width:' + Math.round((n / total) * 100) + '%"></div>';
+      };
+      const chips = ['ok', 'run', 'warn', 'err', 'idle'].map(function(tone) {
+        if (!counts[tone]) { return ''; }
+        const label = { ok: 'done', run: 'active', warn: 'partial', err: 'blocked', idle: 'pending' }[tone];
+        return '<span class="tb-chip tb-chip-' + tone + '">' + counts[tone] + ' ' + label + '</span>';
+      }).join('');
+      return '<div class="tb-progress">' +
+        '<div class="tb-progress-head"><span class="tb-progress-label">' + done + '/' + total + ' done</span>' +
+        '<span class="tb-progress-pct">' + pct + '%</span></div>' +
+        '<div class="tb-bar">' + seg('ok') + seg('run') + seg('warn') + seg('err') + seg('idle') + '</div>' +
+        '<div class="tb-chips">' + chips + '</div>' +
+      '</div>';
+    }
+
+    // Render accumulated plan nodes as a compact status dot grid + completion count.
+    function renderPlanNodeProgress() {
+      const order = state.taskBoard.planNodeOrder || [];
+      if (!order.length) { return ''; }
+      const nodes = order.map(function(id) { return state.taskBoard.planNodes[id]; }).filter(Boolean);
+      const done = nodes.filter(function(n) { return taskBoardTone(n.status) === 'ok'; }).length;
+      const dots = nodes.slice(-40).map(function(n) {
+        const tone = taskBoardTone(n.status);
+        return '<span class="tb-node-dot tb-seg-' + tone + '" title="' + esc(String(n.nodeId) + ' · ' + String(n.status || '')) + '"></span>';
+      }).join('');
+      return '<div class="tb-nodes"><div class="tb-nodes-head"><span class="task-board-panel-title">Plan nodes</span>' +
+        '<span class="tb-nodes-count">' + done + '/' + nodes.length + '</span></div>' +
+        '<div class="tb-node-grid">' + dots + '</div></div>';
     }
 
     function renderTaskBoardTask(task) {
@@ -3585,19 +4542,33 @@ export class HimalayaChatPanel {
           taskBoardSurface.innerHTML = '';
           return;
         }
+        const operationCount = [state.taskBoard.daemon, state.taskBoard.routeSummary, state.taskBoard.benchmark].filter(Boolean).length;
+        const collapsed = state.taskBoard.collapsed !== false;
+        const currentNodeStatus = state.taskBoard.currentNode && state.taskBoard.currentNode.status
+          ? 'node ' + String(state.taskBoard.currentNode.status)
+          : undefined;
+        const summaryParts = [
+          tasks.length + ' task' + (tasks.length === 1 ? '' : 's'),
+          hasWorkerState ? workers.length + ' worker' + (workers.length === 1 ? '' : 's') : undefined,
+          currentNodeStatus,
+          state.taskBoard.recoveryEvents.length ? state.taskBoard.recoveryEvents.length + ' recovery' : undefined,
+          operationCount ? operationCount + ' ops' : undefined
+        ].filter(Boolean);
         taskBoardSurface.hidden = false;
+        taskBoardSurface.classList.toggle('collapsed', collapsed);
         taskBoardSurface.innerHTML = '<div class="task-board-header">' +
-          '<div><div class="task-board-title">Task Board</div><div class="task-board-subtitle">Live task status, worker health, active node, and recovery timeline from stream events.</div></div>' +
+          '<button type="button" class="task-board-toggle" data-task-board-toggle="1" aria-label="' + (collapsed ? 'Expand task board' : 'Collapse task board') + '" aria-expanded="' + (collapsed ? 'false' : 'true') + '">' + (collapsed ? '▶' : '▼') + '</button>' +
+          '<div class="task-board-heading" data-task-board-toggle="1"><div class="task-board-title">Task Board</div><div class="task-board-summary">' + esc(summaryParts.join(' · ') || 'Runtime task status') + '</div>' + (collapsed ? '' : '<div class="task-board-subtitle">Live task status, worker health, active node, and recovery timeline from stream events.</div>') + '</div>' +
           '<div class="decisioning-badges">' + renderDecisioningSummaryBadge(tasks.length + ' task(s)', 'demo') + (hasWorkerState ? renderDecisioningSummaryBadge(workers.length + ' worker(s)', 'demo') : '') + '</div>' +
         '</div>' +
-        '<div class="task-board-grid">' +
-          '<div class="task-board-panel"><div class="task-board-panel-title">Tasks</div><div class="task-board-list">' +
+        '<div class="task-board-body"' + (collapsed ? ' hidden' : '') + '><div class="task-board-grid">' +
+          '<div class="task-board-panel"><div class="task-board-panel-title">Tasks</div>' + renderTaskBoardProgress(tasks) + '<div class="task-board-list">' +
             (tasks.length ? tasks.map(renderTaskBoardTask).join('') : '<div class="task-board-empty">No tasks yet.</div>') +
           '</div></div>' +
           '<div class="task-board-panel"><div class="task-board-panel-title">Workers</div>' + renderTaskBoardWorkerSupervisor() + '</div>' +
-          '<div class="task-board-panel"><div class="task-board-panel-title">Current Node</div>' + renderTaskBoardNode(state.taskBoard.currentNode) + '<div class="task-board-panel-title" style="margin-top:8px;">Recovery</div>' + renderTaskBoardRecovery() + '</div>' +
+          '<div class="task-board-panel"><div class="task-board-panel-title">Current Node</div>' + renderTaskBoardNode(state.taskBoard.currentNode) + renderPlanNodeProgress() + '<div class="task-board-panel-title" style="margin-top:8px;">Recovery</div>' + renderTaskBoardRecovery() + '</div>' +
           '<div class="task-board-panel"><div class="task-board-panel-title">Operations</div>' + renderTaskBoardOperations() + '</div>' +
-        '</div>';
+        '</div></div>';
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'updateTaskBoardSurface failed: ' + String(e) }); } catch (_) {}
       }
@@ -3610,12 +4581,17 @@ export class HimalayaChatPanel {
         const div = document.createElement('div');
         const normalizedKind = String(kind || 'runtime_event').replace(/_/g, ' ');
         const summary = runtimeEventSummary(kind, event);
-        const body = event && typeof event === 'object' ? JSON.stringify(event, null, 2) : String(event || '');
-        div.className = 'msg decisioning-step runtime-event';
-        div.innerHTML = '<div class="msg-role">Runtime · ' + esc(normalizedKind) + '</div>' +
-          '<div class="msg-body"><strong>' + esc(summary) + '</strong><details><summary>Raw event</summary><pre>' + esc(body) + '</pre></details></div>';
+        const detail = renderRuntimeEventDetail(kind, event);
+        const raw = event && typeof event === 'object' ? JSON.stringify(event, null, 2) : String(event || '');
+        const tone = runtimeEventTone(kind, event);
+        div.className = 'msg runtime-event tone-' + tone;
+        div.innerHTML = '<div class="rt-head"><span class="rt-dot"></span>' +
+          '<span class="rt-kind">' + esc(normalizedKind) + '</span>' +
+          '<span class="rt-summary">' + esc(summary) + '</span></div>' +
+          (detail ? '<div class="rt-detail">' + detail + '</div>' : '') +
+          '<details class="rt-raw"><summary>Raw event</summary><pre>' + esc(raw) + '</pre></details>';
         thread.appendChild(div);
-        scrollBottom();
+        smartScroll();
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'addRuntimeEvent failed: ' + String(e) }); } catch (_) {}
       }
@@ -3624,6 +4600,7 @@ export class HimalayaChatPanel {
     function addDecisioningEvent(event) {
       try {
         if (!event) { return; }
+        if (!state.showReasoning) { return; }
         if (!thread) { return; }
         const div = document.createElement('div');
         div.className = 'msg decisioning-step';
@@ -3703,6 +4680,18 @@ export class HimalayaChatPanel {
 
     /* ── event wiring ── */
     if (sendBtn) { sendBtn.addEventListener('click', submit); }
+    // Delegate clicks on clickable file paths inside tool cards.
+    if (thread) {
+      thread.addEventListener('click', function(event) {
+        const target = event.target && event.target.closest ? event.target.closest('[data-open-path]') : null;
+        if (!target) { return; }
+        event.preventDefault();
+        const path = target.getAttribute('data-open-path') || '';
+        const lineAttr = target.getAttribute('data-open-line') || '';
+        const line = lineAttr ? parseInt(lineAttr, 10) : null;
+        if (path) { vscode.postMessage({ type: 'openFile', path: path, line: line }); }
+      });
+    }
     if (stopBtn) {
       stopBtn.addEventListener('click', () => {
         try {
@@ -3772,6 +4761,13 @@ export class HimalayaChatPanel {
       });
     }
 
+    const btnSkillsEl = document.getElementById('btnSkills');
+    if (btnSkillsEl) {
+      btnSkillsEl.addEventListener('click', function() {
+        try { vscode.postMessage({ type: 'command', command: 'manageSkills' }); } catch (_) {}
+      });
+    }
+
     const btnReasoningEl = document.getElementById('btnReasoning');
     if (btnReasoningEl) {
       btnReasoningEl.addEventListener('click', function() {
@@ -3821,6 +4817,12 @@ export class HimalayaChatPanel {
       taskBoardSurface.addEventListener('click', function(e) {
         try {
           if (!(e.target instanceof Element)) { return; }
+          const toggle = e.target.closest('[data-task-board-toggle]');
+          if (toggle) {
+            state.taskBoard.collapsed = !state.taskBoard.collapsed;
+            updateTaskBoardSurface();
+            return;
+          }
           const worker = e.target.closest('[data-worker-id]');
           if (!worker) { return; }
           const workerId = worker.getAttribute('data-worker-id');
@@ -3907,6 +4909,10 @@ export class HimalayaChatPanel {
             setStatus('History deleted.', 'done');
           }
           break;
+        case 'historyDeleteCancelled':
+          renderHistory();
+          setStatus('Delete cancelled.', '');
+          break;
         case 'session-reset':
           state.messages = [];
           state.recoveryEvidence = [];
@@ -3922,6 +4928,22 @@ export class HimalayaChatPanel {
           updateModelBar();
           setStatus('Model updated: ' + state.model, 'done');
           break;
+        case 'insertComposerText': {
+          try {
+            const promptEl = document.getElementById('promptInput');
+            if (promptEl && typeof msg.text === 'string') {
+              const existing = promptEl.value || '';
+              promptEl.value = existing && !existing.endsWith(' ') && !existing.endsWith('\\n')
+                ? existing + ' ' + msg.text
+                : existing + msg.text;
+              promptEl.style.height = 'auto';
+              promptEl.style.height = Math.min(promptEl.scrollHeight, 160) + 'px';
+              promptEl.focus();
+              if (typeof updateSendButtonState === 'function') { updateSendButtonState(); }
+            }
+          } catch (_) {}
+          break;
+        }
         case 'sessionMeta': {
           const sessionId = msg.sessionId ? String(msg.sessionId) : '';
           if (sessionId) {
@@ -3951,19 +4973,7 @@ export class HimalayaChatPanel {
           appendStream(msg.text || '');
           break;
         case 'toolStep': {
-          const div = document.createElement('div');
-          const name = msg.name ? String(msg.name) : 'tool';
-          let bodyText = msg.text;
-          if (!bodyText && msg.step === 'use') {
-            bodyText = name + (msg.input ? ' input: ' + String(msg.input) : '');
-          } else if (!bodyText && msg.step === 'result') {
-            const output = String(msg.output || '');
-            bodyText = name + (msg.isError ? ' error: ' : ' output: ') + output.slice(0, 200);
-          }
-          div.className = 'msg tool-step';
-          div.innerHTML = '<div class="msg-role">Tool</div><div class="msg-body">' + esc(bodyText || '') + '</div>';
-          thread.appendChild(div);
-          scrollBottom();
+          renderToolCard(msg);
           break;
         }
         case 'permissionRequest': {
@@ -4001,6 +5011,17 @@ export class HimalayaChatPanel {
         }
         case 'runtimeEvent': {
           try { addRuntimeEvent(msg.kind, msg.event); } catch (_) {}
+          break;
+        }
+        case 'contextCompacted': {
+          try {
+            const removed = typeof msg.removed === 'number' ? msg.removed : undefined;
+            const body = msg.notice
+              ? String(msg.notice)
+              : 'Context auto-compacted to stay within the model window'
+                + (typeof removed === 'number' ? ' (removed ' + removed + ' message' + (removed === 1 ? '' : 's') + ')' : '') + '.';
+            addBubble('notice', body);
+          } catch (_) {}
           break;
         }
         case 'recoverySuggestion': {
@@ -4110,7 +5131,8 @@ export class HimalayaPanelManager {
       { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
       {
         enableScripts: true,
-        retainContextWhenHidden: true
+        retainContextWhenHidden: true,
+        localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]
       }
     );
 
@@ -4321,7 +5343,8 @@ export class HimalayaSidebarChatViewProvider implements vscode.WebviewViewProvid
   async resolveWebviewView(webviewView: vscode.WebviewView): Promise<void> {
     this.view = webviewView;
     webviewView.webview.options = {
-      enableScripts: true
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'media')]
     };
 
     let bootstrap: ChatBootstrap;

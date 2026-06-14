@@ -273,7 +273,7 @@ fn extract_pdf_with_pdftotext(path: &Path, page_count: Option<usize>) -> Option<
         .ok()
         .map(|text| text.trim_end().to_string())?;
     let nonempty_pages = count_nonempty_pdf_pages(&text);
-    (!text.trim().is_empty()).then(|| PdfTextCandidate {
+    (!text.trim().is_empty()).then_some(PdfTextCandidate {
         engine: "pdftotext",
         text,
         page_count,

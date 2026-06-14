@@ -898,6 +898,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut repl_mode = false;
+    let mut force_new_session = false;
     let mut wants_help = false;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
@@ -952,6 +953,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--repl" => {
                 repl_mode = true;
+                index += 1;
+            }
+            "--new" | "--new-session" => {
+                force_new_session = true;
                 index += 1;
             }
             "--model" => {
@@ -1116,7 +1121,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if repl_mode {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
         let resume_target = match rest.as_slice() {
-            [] => None,
+            // No explicit --resume: auto-resume the latest workspace session for
+            // conversational continuity, unless --new was passed. `Some(latest)`
+            // resolution falls back to a fresh session when none exists yet.
+            [] if force_new_session => None,
+            [] => Some(PathBuf::from(LATEST_SESSION_REFERENCE)),
             [flag] if flag == "--resume" => Some(PathBuf::from(LATEST_SESSION_REFERENCE)),
             [flag, target] if flag == "--resume" => Some(PathBuf::from(target)),
             [flag, ..] if flag == "--resume" => {
@@ -1165,7 +1174,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allowed_tools,
             permission_mode,
             allow_broad_cwd,
-            resume_target: None,
+            // Bare interactive launch: auto-resume the latest workspace session
+            // for continuity (falls back to fresh when none / when --new given).
+            resume_target: if force_new_session {
+                None
+            } else {
+                Some(PathBuf::from(LATEST_SESSION_REFERENCE))
+            },
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -6084,10 +6099,20 @@ fn run_repl_ndjson(
     resume_target: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::StreamJson)?;
-    let mut cli = if let Some(target) = resume_target {
-        LiveCli::from_existing_session(target, model.clone(), true, allowed_tools, permission_mode)?
-    } else {
-        LiveCli::new(model.clone(), true, allowed_tools, permission_mode)?
+    let mut cli = match resume_target {
+        Some(target) => match LiveCli::from_existing_session(
+            target,
+            model.clone(),
+            true,
+            allowed_tools.clone(),
+            permission_mode,
+        ) {
+            Ok(cli) => cli,
+            // No prior session to resume (e.g. fresh workspace) — start clean
+            // instead of failing the whole REPL.
+            Err(_) => LiveCli::new(model.clone(), true, allowed_tools, permission_mode)?,
+        },
+        None => LiveCli::new(model.clone(), true, allowed_tools, permission_mode)?,
     };
 
     // Signal readiness so the extension knows we're ready for prompts.
@@ -7143,6 +7168,16 @@ impl LiveCli {
         };
         self.replace_runtime(runtime)?;
         self.persist_session()?;
+        // Surface automatic context compaction so the VS Code webview can show
+        // when long-horizon memory trimming happened during the turn.
+        if let Some(event) = summary.auto_compaction {
+            print_stream_json_event(json!({
+                "type": "context_event",
+                "kind": "context_compact",
+                "removed_entries": event.removed_message_count,
+                "notice": format_auto_compaction_notice(event.removed_message_count),
+            }));
+        }
         // Emit any denied tool results as structured permission_denial events so
         // the VS Code extension can surface them to the user.
         for msg in &summary.tool_results {
@@ -13407,6 +13442,9 @@ fn build_runtime_with_plugin_state(
     runtime = runtime.with_task_registry(load_task_registry()?);
     if stream_json {
         runtime = runtime.with_runtime_event_reporter(CliRuntimeEventReporter);
+    } else if emit_output {
+        // Interactive (rich) mode: surface runtime progress as compact colorized lines.
+        runtime = runtime.with_runtime_event_reporter(CliRichRuntimeEventReporter);
     }
     let route_policy_dir = workspace_root.join(".Himalaya").join("routes");
     let mut model_routing_policy = feature_config.model_routing().to_policy(&model);
@@ -13505,6 +13543,35 @@ impl runtime::RuntimeEventReporter for CliRuntimeEventReporter {
                 });
                 attach_runtime_event_envelope(&mut payload, envelope.as_ref());
                 print_stream_json_event(payload);
+            }
+        }
+    }
+}
+
+/// Reporter for the interactive (rich) mode: renders runtime events as compact, colorized
+/// terminal lines on stderr instead of raw stream-json. Still persists the event log.
+struct CliRichRuntimeEventReporter;
+
+impl runtime::RuntimeEventReporter for CliRichRuntimeEventReporter {
+    fn emit_runtime_event(&self, event: &runtime::RuntimeEvent) {
+        if let Ok(envelope) = runtime::RuntimeEventEnvelope::from_runtime_event(event) {
+            persist_cli_runtime_event(&envelope);
+        }
+        let kind = event.event_type();
+        let value = match event {
+            runtime::RuntimeEvent::Decisioning(_)
+            | runtime::RuntimeEvent::TaskExecutionReport(_) => return,
+            runtime::RuntimeEvent::PlanExecution(v) => serde_json::to_value(v).ok(),
+            runtime::RuntimeEvent::TaskLedger(v) => serde_json::to_value(v).ok(),
+            runtime::RuntimeEvent::ModelRoute(v) => serde_json::to_value(v).ok(),
+            runtime::RuntimeEvent::TeamExecution(v) => serde_json::to_value(v).ok(),
+            runtime::RuntimeEvent::Recovery(v) => serde_json::to_value(v).ok(),
+            runtime::RuntimeEvent::RecoveryAction(v) => serde_json::to_value(v).ok(),
+            runtime::RuntimeEvent::TaskExecution(v) => serde_json::to_value(v).ok(),
+        };
+        if let Some(value) = value {
+            if let Some(line) = format_runtime_event_line(kind, &value) {
+                eprintln!("{line}");
             }
         }
     }
@@ -14444,6 +14511,165 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
         _ => format_generic_tool_result(icon, name, &parsed),
     }
 }
+
+/// Tone colors for runtime event lines (256-color ANSI), mirroring the webview tones.
+fn runtime_event_tone_color(tone: &str) -> &'static str {
+    match tone {
+        "ok" => "38;5;43",    // teal/green
+        "err" => "38;5;203",  // red
+        "warn" => "38;5;179", // amber
+        "run" => "38;5;75",   // blue
+        _ => "38;5;245",      // grey/idle
+    }
+}
+
+/// Classify a status/kind string into a visual tone, matching the webview's `toneFromStatus`.
+fn runtime_status_tone(value: &str) -> &'static str {
+    let v = value.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| v.contains(n));
+    if has(&["fail", "error", "blocked", "escalat", "reject", "denied", "cancel"]) {
+        "err"
+    } else if has(&["complete", "success", "passed", "recovered", "done", "resolved", "assigned"]) {
+        "ok"
+    } else if has(&["running", "in_progress", "started", "retry", "pending", "resume", "scheduled"])
+    {
+        "run"
+    } else if has(&["warn", "partial", "skip", "degraded"]) {
+        "warn"
+    } else {
+        "idle"
+    }
+}
+
+fn rt_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// Format a runtime event as a compact, colorized terminal line for the interactive (rich) mode.
+/// Returns `None` for events with no meaningful one-line representation.
+fn format_runtime_event_line(kind: &str, event: &serde_json::Value) -> Option<String> {
+    let tone_of = |s: &str| runtime_event_tone_color(s);
+    match kind {
+        "plan_execution_event" => {
+            let node = rt_str(event, "node_id").unwrap_or("node");
+            let status = rt_str(event, "status").unwrap_or("");
+            let step = rt_str(event, "kind").unwrap_or("").replace('_', " ");
+            let tone = runtime_status_tone(if status.is_empty() { &step } else { status });
+            let mut line = format!(
+                "\x1b[{}m◆ plan\x1b[0m \x1b[1m{}\x1b[0m \x1b[2m{}\x1b[0m",
+                tone_of(tone),
+                step.trim(),
+                node
+            );
+            if !status.is_empty() {
+                line.push_str(&format!(" \x1b[{}m{}\x1b[0m", tone_of(tone), status));
+            }
+            if let Some(reason) = rt_str(event, "blocking_reason") {
+                line.push_str(&format!(" \x1b[38;5;203m({reason})\x1b[0m"));
+            }
+            Some(line)
+        }
+        "task_ledger_event" => {
+            let label = rt_str(event, "event").unwrap_or("update").replace('_', " ");
+            let status = rt_str(event, "status").unwrap_or("");
+            let tone = runtime_status_tone(if status.is_empty() { &label } else { status });
+            let task = rt_str(event, "task_id").unwrap_or("");
+            Some(format!(
+                "\x1b[{}m◆ task\x1b[0m \x1b[1m{}\x1b[0m\x1b[2m{}{}\x1b[0m",
+                tone_of(tone),
+                label.trim(),
+                if task.is_empty() { "" } else { " · " },
+                task
+            ))
+        }
+        // RUNTIME_EVENT_LINE_REST
+        "model_route_event" => {
+            let phase = rt_str(event, "phase").unwrap_or("");
+            let model = rt_str(event, "model").unwrap_or("model");
+            let mut line = format!(
+                "\x1b[{}m◆ route\x1b[0m \x1b[2m{}{}\x1b[0m\x1b[1;36m{}\x1b[0m",
+                tone_of("run"),
+                phase,
+                if phase.is_empty() { "" } else { " → " },
+                model
+            );
+            if let Some(conf) = event.get("confidence").and_then(serde_json::Value::as_f64) {
+                let pct = (conf * 100.0).round().clamp(0.0, 100.0) as u32;
+                line.push_str(&format!(" \x1b[2m{pct}%\x1b[0m"));
+            }
+            if let Some(fallback) = rt_str(event, "fallback_model") {
+                line.push_str(&format!(" \x1b[2m(fallback {fallback})\x1b[0m"));
+            }
+            Some(line)
+        }
+        "recovery_event" => {
+            let attempted = event.get("recovery_attempted")?;
+            let scenario = rt_str(attempted, "scenario").unwrap_or("issue");
+            let result = attempted.get("result");
+            let (outcome, tone) = match result {
+                Some(r) if r.get("recovered").is_some() => ("recovered", "ok"),
+                Some(r) if r.get("partial_recovery").is_some() => ("partial recovery", "warn"),
+                Some(r) if r.get("escalation_required").is_some() => ("escalation required", "err"),
+                _ => ("attempted", "run"),
+            };
+            Some(format!(
+                "\x1b[{}m◆ recovery\x1b[0m \x1b[1m{}\x1b[0m \x1b[2m· {}\x1b[0m",
+                tone_of(tone),
+                outcome,
+                scenario
+            ))
+        }
+        "recovery_action_event" => {
+            let results = event.get("results").and_then(serde_json::Value::as_array);
+            let count = results.map_or(0, Vec::len);
+            let blocked = results.is_some_and(|rs| {
+                rs.iter()
+                    .any(|r| r.get("blocked").and_then(serde_json::Value::as_bool) == Some(true))
+            });
+            let tone = if blocked { "err" } else { "ok" };
+            Some(format!(
+                "\x1b[{}m◆ recovery action\x1b[0m \x1b[2m{} action(s)\x1b[0m",
+                tone_of(tone),
+                count
+            ))
+        }
+        "team_execution_event" => {
+            let role = rt_str(event, "role").unwrap_or("");
+            let label = rt_str(event, "kind").unwrap_or("event").replace('_', " ");
+            let tone = runtime_status_tone(&label);
+            Some(format!(
+                "\x1b[{}m◆ team\x1b[0m \x1b[1m{}\x1b[0m\x1b[2m{}{}\x1b[0m",
+                tone_of(tone),
+                label.trim(),
+                if role.is_empty() { "" } else { " · " },
+                role
+            ))
+        }
+        "task_execution_event" => {
+            let completed = event.get("completed").and_then(serde_json::Value::as_bool) == Some(true);
+            let blocked = event.get("blocked").and_then(serde_json::Value::as_bool) == Some(true);
+            let steps = event
+                .get("steps")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            let (status, tone) = if blocked {
+                ("blocked", "err")
+            } else if completed {
+                ("completed", "ok")
+            } else {
+                ("running", "run")
+            };
+            Some(format!(
+                "\x1b[{}m◆ exec\x1b[0m \x1b[1m{}\x1b[0m \x1b[2m{} step(s)\x1b[0m",
+                tone_of(tone),
+                status,
+                steps
+            ))
+        }
+        _ => None,
+    }
+}
+
 
 const DISPLAY_TRUNCATION_NOTICE: &str =
     "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
@@ -15702,7 +15928,7 @@ mod tests {
         format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
         format_issue_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
+        format_resume_report, format_status_report, format_runtime_event_line, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         load_files_as_content_blocks, maturity_matrix_value, merge_prompt_with_stdin,
@@ -16373,6 +16599,24 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: default_permission_mode_for_tests(),
                 allow_broad_cwd: false,
+                // Bare launch now auto-resumes the latest workspace session for
+                // conversational continuity (falls back to fresh when none).
+                resume_target: Some(PathBuf::from(LATEST_SESSION_REFERENCE)),
+            }
+        );
+    }
+
+    #[test]
+    fn new_flag_forces_a_fresh_repl_session() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_Himalaya_PERMISSION_MODE");
+        assert_eq!(
+            parse_args(&["--new".to_string()]).expect("args should parse"),
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: default_permission_mode_for_tests(),
+                allow_broad_cwd: false,
                 resume_target: None,
             }
         );
@@ -16906,7 +17150,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
                 allow_broad_cwd: false,
-                resume_target: None,
+                resume_target: Some(PathBuf::from(LATEST_SESSION_REFERENCE)),
             }
         );
     }
@@ -16926,7 +17170,7 @@ mod tests {
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 allow_broad_cwd: false,
-                resume_target: None,
+                resume_target: Some(PathBuf::from(LATEST_SESSION_REFERENCE)),
             }
         );
     }
@@ -16983,7 +17227,7 @@ mod tests {
                 ),
                 permission_mode: default_permission_mode_for_tests(),
                 allow_broad_cwd: false,
-                resume_target: None,
+                resume_target: Some(PathBuf::from(LATEST_SESSION_REFERENCE)),
             }
         );
     }
@@ -18303,6 +18547,66 @@ mod tests {
         assert!(report.contains("unknown slash command: /statsu"));
         assert!(report.contains("Did you mean"));
         assert!(report.contains("Use /help"));
+    }
+
+    #[test]
+    fn runtime_event_line_renders_plan_execution() {
+        let event = serde_json::json!({
+            "seq": 1, "task_id": "t1", "node_id": "node-7",
+            "kind": "node_started", "status": "running"
+        });
+        let line = format_runtime_event_line("plan_execution_event", &event).expect("line");
+        assert!(line.contains("plan"));
+        assert!(line.contains("node started"));
+        assert!(line.contains("node-7"));
+        assert!(line.contains("running"));
+        // running → blue tone
+        assert!(line.contains("38;5;75"));
+    }
+
+    #[test]
+    fn runtime_event_line_renders_model_route_with_confidence() {
+        let event = serde_json::json!({
+            "phase": "coding", "model": "sonnet", "reason": "r", "confidence": 0.83
+        });
+        let line = format_runtime_event_line("model_route_event", &event).expect("line");
+        assert!(line.contains("route"));
+        assert!(line.contains("coding"));
+        assert!(line.contains("sonnet"));
+        assert!(line.contains("83%"));
+    }
+
+    #[test]
+    fn runtime_event_line_recovery_outcome_tone() {
+        let recovered = serde_json::json!({
+            "recovery_attempted": { "scenario": "compile_failure", "result": { "recovered": { "steps_taken": 1 } } }
+        });
+        let line = format_runtime_event_line("recovery_event", &recovered).expect("line");
+        assert!(line.contains("recovered"));
+        assert!(line.contains("compile_failure"));
+        assert!(line.contains("38;5;43")); // ok tone
+
+        let escalated = serde_json::json!({
+            "recovery_attempted": { "scenario": "x", "result": { "escalation_required": true } }
+        });
+        let line = format_runtime_event_line("recovery_event", &escalated).expect("line");
+        assert!(line.contains("escalation required"));
+        assert!(line.contains("38;5;203")); // err tone
+    }
+
+    #[test]
+    fn runtime_event_line_skips_unknown_and_noisy_kinds() {
+        assert!(format_runtime_event_line("decisioning_event", &serde_json::json!({})).is_none());
+        assert!(format_runtime_event_line("some_future_kind", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn runtime_status_tone_classifies_states() {
+        assert_eq!(super::runtime_status_tone("node_failed"), "err");
+        assert_eq!(super::runtime_status_tone("completed"), "ok");
+        assert_eq!(super::runtime_status_tone("running"), "run");
+        assert_eq!(super::runtime_status_tone("partial_recovery"), "warn");
+        assert_eq!(super::runtime_status_tone("mystery"), "idle");
     }
 
     #[test]

@@ -30,6 +30,14 @@ export interface HimalayaRunResult {
 
 export type BinarySource = 'setting' | 'workspace' | 'path' | 'bundled' | 'downloaded';
 
+export interface HimalayaSkillInfo {
+  name: string;
+  description: string;
+  source: string;
+  path: string;
+  shadowed: boolean;
+}
+
 export interface ResolvedBinary {
   path: string;
   source: BinarySource;
@@ -129,6 +137,7 @@ export class HimalayaCli {
     permissionMode?: string;
     cwd?: string;
     resumeTarget?: string;
+    forceNewSession?: boolean;
     allowBroadCwd?: boolean;
     env?: NodeJS.ProcessEnv;
     onEvent?: (event: any) => void;
@@ -149,6 +158,9 @@ export class HimalayaCli {
     ];
     if (options.resumeTarget) {
       args.push('--resume', options.resumeTarget);
+    } else if (options.forceNewSession) {
+      // Explicit new session: prevent the CLI from auto-resuming the latest one.
+      args.push('--new');
     }
     if (options.allowBroadCwd) {
       args.push('--allow-broad-cwd');
@@ -350,6 +362,50 @@ export class HimalayaCli {
       this.output.appendLine(`[exit ${result.exitCode}]`);
       throw new Error(`Himalaya exited with code ${result.exitCode}`);
     }
+  }
+
+  /// List skills discovered in the workspace (.Himalaya/skills + user skills),
+  /// by shelling out to `Himalaya skills list --output-format json`.
+  async listSkills(cwd?: string): Promise<HimalayaSkillInfo[]> {
+    try {
+      const result = await this.run(['skills', 'list', '--output-format', 'json'], { cwd, silent: true });
+      if (result.exitCode !== 0) { return []; }
+      const parsed = JSON.parse(result.stdout) as { skills?: unknown };
+      if (!parsed || !Array.isArray(parsed.skills)) { return []; }
+      return parsed.skills
+        .map((entry): HimalayaSkillInfo | null => {
+          if (!entry || typeof entry !== 'object') { return null; }
+          const skill = entry as Record<string, unknown>;
+          const name = typeof skill.name === 'string' ? skill.name : '';
+          if (!name) { return null; }
+          return {
+            name,
+            description: typeof skill.description === 'string' ? skill.description : '',
+            source: typeof skill.source === 'string' ? skill.source : (typeof skill.origin === 'string' ? skill.origin : ''),
+            path: typeof skill.path === 'string' ? skill.path : '',
+            shadowed: Boolean(skill.shadowed_by)
+          };
+        })
+        .filter((s): s is HimalayaSkillInfo => s !== null);
+    } catch {
+      return [];
+    }
+  }
+
+  /// Install a skill from a local path (directory with SKILL.md or a .md file)
+  /// via `Himalaya skills install <path> --output-format json`.
+  async installSkill(sourcePath: string, cwd?: string): Promise<{ ok: boolean; message: string }> {
+    const result = await this.run(['skills', 'install', sourcePath, '--output-format', 'json'], { cwd, silent: true });
+    let message = result.stdout.trim();
+    try {
+      const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+      if (typeof parsed.message === 'string') { message = parsed.message; }
+      else if (parsed.result && typeof parsed.result === 'object') {
+        const r = parsed.result as Record<string, unknown>;
+        message = typeof r.invocation_name === 'string' ? `Installed ${r.invocation_name}` : message;
+      }
+    } catch { /* keep raw stdout */ }
+    return { ok: result.exitCode === 0, message: message || (result.exitCode === 0 ? 'Installed.' : 'Install failed.') };
   }
 
   async listLocalModels(options: { force?: boolean } = {}): Promise<string[]> {

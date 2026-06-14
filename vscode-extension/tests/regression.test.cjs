@@ -154,7 +154,10 @@ test('compiled chat webview inline script is valid JavaScript', () => {
         TreeItem: class {},
         TreeItemCollapsibleState: { None: 0 },
         commands: { executeCommand: async () => undefined },
-        Uri: { file: (filePath) => ({ fsPath: filePath }) },
+        Uri: {
+          file: (filePath) => ({ fsPath: filePath }),
+          joinPath: (base, ...segments) => ({ fsPath: [base && base.fsPath, ...segments].filter(Boolean).join('/') }),
+        },
       };
     }
     return oldLoad(request, parent, isMain);
@@ -167,6 +170,7 @@ test('compiled chat webview inline script is valid JavaScript', () => {
         onDidReceiveMessage: () => ({ dispose() {} }),
         postMessage: () => undefined,
         cspSource: 'vscode-resource',
+        asWebviewUri: (uri) => ({ toString: () => 'vscode-resource://' + ((uri && uri.fsPath) || '') }),
       },
       onDidDispose: () => ({ dispose() {} }),
     };
@@ -192,7 +196,10 @@ test('compiled chat webview inline script is valid JavaScript', () => {
     };
     const panel = new HimalayaChatPanel(context, {}, { appendLine() {} }, {}, host, bootstrap);
     const html = panel.buildClaudeLikeHtml(host.webview, bootstrap, {});
-    const script = html.match(/<script[^>]*>([\s\S]*?)<\/script>/)?.[1];
+    // Skip external <script src> tags (e.g. the bundled marked loader) and grab the inline body.
+    const script = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)]
+      .map((m) => m[1])
+      .find((body) => body && body.trim().length > 0);
     assert.ok(script, 'chat webview script should be present');
     assert.doesNotThrow(() => new vm.Script(script, { filename: 'chat-webview-inline.js' }));
   } finally {
@@ -219,7 +226,10 @@ test('chat panel replays stream-json transcripts through webview messages', asyn
     TreeItem: class {},
     TreeItemCollapsibleState: { None: 0 },
     commands: { executeCommand: async () => undefined },
-    Uri: { file: (filePath) => ({ fsPath: filePath }) },
+    Uri: {
+      file: (filePath) => ({ fsPath: filePath }),
+      joinPath: (base, ...segments) => ({ fsPath: [base && base.fsPath, ...segments].filter(Boolean).join('/') }),
+    },
     ViewColumn: { Beside: 2 },
   };
 
@@ -315,6 +325,7 @@ test('chat panel replays stream-json transcripts through webview messages', asyn
         onDidReceiveMessage: () => ({ dispose() {} }),
         postMessage: (message) => { posted.push(message); return Promise.resolve(true); },
         cspSource: 'vscode-resource',
+        asWebviewUri: (uri) => ({ toString: () => 'vscode-resource://' + ((uri && uri.fsPath) || '') }),
       },
       onDidDispose: () => ({ dispose() {} }),
     };
@@ -422,6 +433,29 @@ test('task board surfaces worker supervisor state', () => {
   assert.match(chatPanelSource, /Worker Detail/);
   assert.match(chatPanelSource, /kind === 'worker_supervisor_tick'/);
   assert.match(chatPanelSource, /Live task status, worker health, active node, and recovery timeline/);
+});
+
+test('task board is collapsible to preserve chat space', () => {
+  assert.match(chatPanelSource, /collapsed:\s*true/);
+  assert.match(chatPanelSource, /task-board-toggle/);
+  assert.match(chatPanelSource, /data-task-board-toggle="1"/);
+  assert.match(chatPanelSource, /taskBoardSurface\.classList\.toggle\('collapsed', collapsed\)/);
+  assert.match(chatPanelSource, /state\.taskBoard\.collapsed = !state\.taskBoard\.collapsed/);
+  assert.match(chatPanelSource, /class="task-board-body"/);
+  assert.match(chatPanelSource, /aria-expanded/);
+  assert.match(chatPanelSource, /task-board-summary/);
+});
+
+test('context auto-compaction is surfaced as a notice in the thread', () => {
+  // Extension host forwards the runtime context_event to the webview.
+  assert.match(chatPanelSource, /case 'context_event':/);
+  assert.match(chatPanelSource, /kind === 'context_compact'/);
+  assert.match(chatPanelSource, /type:\s*'contextCompacted'/);
+  // Webview renders a notice bubble for the compaction.
+  assert.match(chatPanelSource, /case 'contextCompacted':/);
+  assert.match(chatPanelSource, /addBubble\('notice'/);
+  assert.match(chatPanelSource, /Context auto-compacted/);
+  assert.match(chatPanelSource, /role === 'notice'\s*\?\s*'msg notice'/);
 });
 test('assistant placeholder message is created before streaming chunks', () => {
   assert.match(chatPanelSource, /await this\.history\.appendMessage\(record\.id,\s*\{\s*role:\s*'assistant',\s*text:\s*''/s);
@@ -778,11 +812,40 @@ test('permission request stream events render structured fields', () => {
 });
 test('tool and permission webview events render structured fields', () => {
   assert.match(chatPanelSource, /case 'toolStep': \{/);
-  assert.match(chatPanelSource, /msg\.step === 'use'/);
+  assert.match(chatPanelSource, /renderToolCard\(msg\)/);
+  assert.match(chatPanelSource, /function renderToolCard\(msg\)/);
   assert.match(chatPanelSource, /msg\.step === 'result'/);
   assert.match(chatPanelSource, /case 'permissionDenial': \{/);
   assert.match(chatPanelSource, /Permission denied for/);
 });
+
+test('rich tool cards render per-tool fields, diffs, and clickable paths', () => {
+  // Per-tool icon/label metadata + structured input dispatch.
+  assert.match(chatPanelSource, /function toolMeta\(name\)/);
+  assert.match(chatPanelSource, /function toolUseBody\(name, input\)/);
+  assert.match(chatPanelSource, /function parseToolInput\(msg\)/);
+  // edit_file renders a diff preview.
+  assert.match(chatPanelSource, /function renderDiff\(oldStr, newStr\)/);
+  assert.match(chatPanelSource, /diff-add/);
+  assert.match(chatPanelSource, /diff-del/);
+  // bash/code gets token highlighting.
+  assert.match(chatPanelSource, /function highlightCode\(code, lang\)/);
+  assert.match(chatPanelSource, /tok-cmd/);
+  // Clickable file path chips post openFile back to the host.
+  assert.match(chatPanelSource, /function filePathChip\(rawPath\)/);
+  assert.match(chatPanelSource, /data-open-path/);
+  assert.match(chatPanelSource, /type: 'openFile'/);
+  // Results attach to the originating use-card and collapse long output.
+  assert.match(chatPanelSource, /const pendingToolCards = \{\}/);
+  assert.match(chatPanelSource, /function buildResultBlock\(output, isError\)/);
+  // CLI forwards structured input alongside the legacy JSON string.
+  assert.match(chatPanelSource, /inputData: event\.input \?\? null/);
+  // Extension host opens the file (with optional line) on request.
+  assert.match(chatPanelSource, /case 'openFile':/);
+  assert.match(chatPanelSource, /private async openFileFromCard\(rawPath: string, line: number \| null\)/);
+  assert.match(chatPanelSource, /vscode\.window\.showTextDocument\(doc, options\)/);
+});
+
 
 test('decisioning visualization hooks remain wired', () => {
   assert.match(chatPanelSource, /case 'decisioning_event'/);
@@ -827,9 +890,31 @@ test('runtime execution stream events render through the webview', () => {
   assert.match(chatPanelSource, /return \[label, execution\.task_id, results\]/);
   assert.match(chatPanelSource, /const label = kind === 'task_execution_event' \? 'Task execution event' : 'Task execution'/);
   assert.match(chatPanelSource, /return \[label, outcome\.task_id, status, stepCount, outcome\.message\]/);
-  assert.match(chatPanelSource, /Runtime · /);
+  assert.match(chatPanelSource, /Raw event/);
   assert.match(chatPanelSource, /case 'runtimeEvent': \{/);
 });
+
+test('runtime events render as structured cards, not single-line text', () => {
+  // New rich rendering path replaces the old "Runtime · kind" one-liner.
+  assert.match(chatPanelSource, /function renderRuntimeEventDetail\(kind, event\)/);
+  assert.match(chatPanelSource, /function runtimeEventTone\(kind, event\)/);
+  assert.match(chatPanelSource, /function toneFromStatus\(s\)/);
+  assert.match(chatPanelSource, /const detail = renderRuntimeEventDetail\(kind, event\)/);
+  assert.match(chatPanelSource, /div\.className = 'msg runtime-event tone-' \+ tone/);
+  // model_route renders a confidence bar + phase→model route line.
+  assert.match(chatPanelSource, /function rtConfidenceBar\(conf\)/);
+  assert.match(chatPanelSource, /class="rt-route"/);
+  // recovery_action renders a timeline.
+  assert.match(chatPanelSource, /class="rt-timeline"/);
+  // task_execution renders an ordered step list.
+  assert.match(chatPanelSource, /class="rt-steps"/);
+  // status pills with tone classes.
+  assert.match(chatPanelSource, /function rtPill\(text, tone\)/);
+  assert.match(chatPanelSource, /rt-pill-/);
+  // Raw event remains available for debugging.
+  assert.match(chatPanelSource, /<details class="rt-raw">/);
+});
+
 
 test('task board MVP renders task status, node, and recovery events', () => {
   assert.match(chatPanelSource, /task-board-surface/);
@@ -846,6 +931,27 @@ test('task board MVP renders task status, node, and recovery events', () => {
   assert.match(chatPanelSource, /function renderTaskBoardRecovery\(\)/);
   assert.match(chatPanelSource, /rememberTaskBoardRecovery\('recoverySuggestion', msg\)/);
   assert.match(chatPanelSource, /Live task status, worker health, active node, and recovery timeline from stream events/);
+});
+
+test('task board visualizes task progress and plan node DAG', () => {
+  // Task progress bar + status distribution.
+  assert.match(chatPanelSource, /function renderTaskBoardProgress\(tasks\)/);
+  assert.match(chatPanelSource, /renderTaskBoardProgress\(tasks\)/);
+  assert.match(chatPanelSource, /class="tb-progress"/);
+  assert.match(chatPanelSource, /class="tb-bar"/);
+  assert.match(chatPanelSource, /done \+ '\/' \+ total \+ ' done<\/span>'/);
+  // Shared tone mapping.
+  assert.match(chatPanelSource, /function taskBoardTone\(value\)/);
+  // Plan node accumulation + dot-grid progress.
+  assert.match(chatPanelSource, /function rememberPlanNode\(nodeId, status, kind\)/);
+  assert.match(chatPanelSource, /rememberPlanNode\(value\.node_id, value\.status, value\.kind\)/);
+  assert.match(chatPanelSource, /planNodes:\s*\{\}/);
+  assert.match(chatPanelSource, /planNodeOrder:\s*\[\]/);
+  assert.match(chatPanelSource, /function renderPlanNodeProgress\(\)/);
+  assert.match(chatPanelSource, /class="tb-node-grid"/);
+  assert.match(chatPanelSource, /class="tb-node-dot/);
+  // Progress CSS present.
+  assert.match(chatPanelSource, /\.tb-seg-ok \{ background: #4ec9b0; \}/);
 });
 
 
@@ -898,9 +1004,14 @@ test('history drawer can delete records and deprecated decisioning demo is remov
   assert.match(historySource, /async remove\(recordId:\s*string\):\s*Promise<void>/);
   assert.match(historySource, /deleteRecordBody\(recordId\)/);
   assert.match(chatPanelSource, /typedMessage\.action === 'delete' && typedMessage\.historyId/);
+  assert.match(chatPanelSource, /vscode\.window\.showWarningMessage/);
   assert.match(chatPanelSource, /class="history-delete"/);
+  assert.match(chatPanelSource, /Confirm deletion in VS Code/);
   assert.match(chatPanelSource, /type:\s*'historyDeleted'/);
+  assert.match(chatPanelSource, /type:\s*'historyDeleteCancelled'/);
   assert.match(chatPanelSource, /case 'historyDeleted':/);
+  assert.match(chatPanelSource, /case 'historyDeleteCancelled':/);
+  assert.doesNotMatch(chatPanelSource, /window\.confirm\(/);
   assert.doesNotMatch(chatPanelSource, /btnDemo|showDecisioningDemo|toggle-decisioning-demo|decisioning-demo/);
 });
 
@@ -974,6 +1085,122 @@ test('webview message labels follow user-declared identity', () => {
   assert.match(chatPanelSource, /\.msg\.user \.msg-role \{ color: var\(--accent-text\); text-transform: none; \}/);
   assert.match(chatPanelSource, /\.msg\.assistant \.msg-role \{ color: var\(--success\); text-transform: none; \}/);
 });
+
+test('assistant output renders markdown via the bundled marked script', () => {
+  // marked.umd.js is loaded into the live webview (not the deleted media/webview.js).
+  assert.match(chatPanelSource, /asWebviewUri\(\s*[\s\S]*?'media',\s*'marked\.umd\.js'/);
+  assert.match(chatPanelSource, /<script nonce="\$\{nonce\}" src="\$\{markedUri\}"><\/script>/);
+  // CSP must allow the bundled script source alongside the nonce.
+  assert.match(chatPanelSource, /script-src 'nonce-\$\{nonce\}' \$\{webview\.cspSource\}/);
+  assert.match(chatPanelSource, /localResourceRoots:\s*\[vscode\.Uri\.joinPath\(this\.context\.extensionUri,\s*'media'\)\]/);
+  // The inline renderer parses markdown and degrades gracefully without marked.
+  assert.match(chatPanelSource, /function renderMarkdown\(md\)/);
+  assert.match(chatPanelSource, /marked\.parse\(String\(md == null \? '' : md\)/);
+  // Streaming buffers text and renders incrementally at a safe fence boundary.
+  assert.match(chatPanelSource, /function findSafeRenderBoundary\(text\)/);
+  assert.match(chatPanelSource, /streamBuffer \+= \(text == null \? '' : text\)/);
+  assert.match(chatPanelSource, /body\.innerHTML = renderMarkdown\(streamBuffer\)/);
+  // History-replayed assistant bubbles render markdown too.
+  assert.match(chatPanelSource, /role === 'assistant' \? renderMarkdown\(text \|\| ''\) : esc\(text \|\| ''\)/);
+  // Rendered markdown bodies override the pre-wrap whitespace of raw bubbles.
+  assert.match(chatPanelSource, /\.msg\.assistant \.msg-body \{ white-space: normal/);
+  assert.match(chatPanelSource, /\.msg\.assistant \.msg-body pre \{/);
+});
+
+test('orphaned standalone webview assets are removed in favor of the inline UI', () => {
+  const mediaDir = path.join(root, 'media');
+  assert.ok(!fs.existsSync(path.join(mediaDir, 'webview.js')), 'media/webview.js should be deleted');
+  assert.ok(!fs.existsSync(path.join(mediaDir, 'webview.css')), 'media/webview.css should be deleted');
+  assert.ok(fs.existsSync(path.join(mediaDir, 'marked.umd.js')), 'media/marked.umd.js must still ship');
+});
+
+test('reasoning visualization is fully gated by the showReasoning toggle', () => {
+  // #2: decisioning events carry chain-of-thought; must NOT leak when toggle off.
+  assert.match(chatPanelSource, /event\.decisioning_event && Boolean\(this\.currentOptions\.showReasoning\)/);
+  // reasoning_step forwarding stays gated too.
+  assert.match(chatPanelSource, /const show = Boolean\(this\.currentOptions\.showReasoning\)/);
+  // Defense in depth: webview render also checks state.showReasoning.
+  assert.match(chatPanelSource, /function addDecisioningEvent\(event\)\s*\{[\s\S]*?if \(!state\.showReasoning\) \{ return; \}/);
+});
+
+test('new chat auto-resumes latest session unless explicitly new', () => {
+  // #1: extension tracks an explicit "new session" intent and passes --new.
+  assert.match(chatPanelSource, /private forceNewSession = false/);
+  assert.match(chatPanelSource, /this\.forceNewSession = true/);
+  assert.match(chatPanelSource, /const startFresh = this\.forceNewSession && !effectiveResumeTarget/);
+  assert.match(chatPanelSource, /forceNewSession: startFresh/);
+  // cli.ts adds --new only when no resume target and forceNewSession set.
+  assert.match(cliSource, /forceNewSession\?: boolean/);
+  assert.match(cliSource, /else if \(options\.forceNewSession\)\s*\{[\s\S]*?args\.push\('--new'\)/);
+});
+
+test('skills are surfaced in the extension (list, install, invoke)', () => {
+  // #3: cli.ts exposes skill backend calls.
+  assert.match(cliSource, /async listSkills\(cwd\?: string\): Promise<HimalayaSkillInfo\[\]>/);
+  assert.match(cliSource, /async installSkill\(sourcePath: string, cwd\?: string\)/);
+  assert.match(cliSource, /'skills', 'list', '--output-format', 'json'/);
+  assert.match(cliSource, /'skills', 'install', sourcePath, '--output-format', 'json'/);
+  // chatPanel wires a Skills button + manager + composer insertion.
+  assert.match(chatPanelSource, /id="btnSkills"/);
+  assert.match(chatPanelSource, /command === 'manageSkills'/);
+  assert.match(chatPanelSource, /async manageSkills\(\): Promise<void>/);
+  assert.match(chatPanelSource, /type: 'insertComposerText', text: '\$' \+ picked\.skillName/);
+  assert.match(chatPanelSource, /case 'insertComposerText':/);
+});
+
+test('cloud model config is unified with the CLI provider.json format', () => {
+  const os = require('node:os');
+  const providerConfig = require(path.join(root, 'out', 'providerConfig.js'));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'himalaya-pc-'));
+  const credHome = path.join(tmp, 'cfghome');
+  const prevHome = process.env.Himalaya_CONFIG_HOME;
+  process.env.Himalaya_CONFIG_HOME = credHome;
+  try {
+    providerConfig.saveProviderSelection(tmp, {
+      model: 'gpt-4o',
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'sk-test-xyz'
+    });
+
+    // provider.json must be byte-compatible with the CLI (.Himalaya/provider.json,
+    // model + base_url, NO api_key in the project file).
+    const cfgPath = path.join(tmp, '.Himalaya', 'provider.json');
+    assert.ok(fs.existsSync(cfgPath), 'provider.json should be written');
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    assert.equal(cfg.model, 'gpt-4o');
+    assert.equal(cfg.base_url, 'https://api.example.com/v1');
+    assert.ok(!('api_key' in cfg), 'api key must not be in project provider.json');
+
+    // API key goes to the credentials file under the config home.
+    const credPath = path.join(credHome, 'provider_credentials.json');
+    assert.ok(fs.existsSync(credPath), 'credentials file should be written');
+    assert.equal(JSON.parse(fs.readFileSync(credPath, 'utf8')).api_key, 'sk-test-xyz');
+
+    // Round-trip load returns the full selection.
+    const loaded = providerConfig.loadProviderSelection(tmp);
+    assert.equal(loaded.model, 'gpt-4o');
+    assert.equal(loaded.baseUrl, 'https://api.example.com/v1');
+    assert.equal(loaded.apiKey, 'sk-test-xyz');
+
+    // listProviderProfiles always exposes a "default" profile.
+    const profiles = providerConfig.listProviderProfiles(tmp);
+    assert.ok(profiles.default, 'default profile present');
+    assert.equal(profiles.default.model, 'gpt-4o');
+  } finally {
+    if (prevHome === undefined) { delete process.env.Himalaya_CONFIG_HOME; }
+    else { process.env.Himalaya_CONFIG_HOME = prevHome; }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('cloud model wizard mirrors selection into the shared provider.json', () => {
+  assert.match(chatPanelSource, /import \{ loadProviderSelection, saveProviderSelection \} from '\.\/providerConfig'/);
+  assert.match(chatPanelSource, /saveProviderSelection\(workspaceRoot, \{/);
+  assert.match(chatPanelSource, /const savedSelection = workspaceRoot \? loadProviderSelection\(workspaceRoot\) : null/);
+  // Reuse persisted key when the user leaves the field blank.
+  assert.match(chatPanelSource, /const effectiveApiKey = cloudApiKey\.trim\(\) \|\| savedSelection\?\.apiKey \|\| ''/);
+});
+
 test('execution gate blocks run callback when danger confirmation is denied', async () => {
   const { executeWithPermissionGate } = require(executionGatePath);
 
