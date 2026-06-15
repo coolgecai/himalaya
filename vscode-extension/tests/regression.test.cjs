@@ -405,12 +405,13 @@ test('chat panel replays stream-json transcripts through webview messages', asyn
     assert.equal(runtimeEvents.find((message) => message.kind === 'benchmark_run').event.run.summary.total_tasks, 1);
     assert.equal(runtimeEvents.find((message) => message.kind === 'worker_spawn').event.worker.process.pid, 123);
     assert.equal(runtimeEvents.find((message) => message.kind === 'worker_supervisor_tick').event.tick.active_workers, 1);
-    assert.equal(posted.find((message) => message.type === 'recoverySuggestion').failureClass, 'trust_gate');
+    const recoveryMessage = posted.find((message) => message.type === 'recoverySuggestion');
+    assert.equal(recoveryMessage.failureClass, 'trust_gate');
     assert.equal(posted.find((message) => message.type === 'permissionRequest').requiredMode, 'workspace-write');
     assert.equal(posted.at(-1).type, 'assistantDone');
     assert.equal(records[0].resumeTarget, 'golden-session');
     assert.equal(records[0].messages.at(-1).text, 'Golden replay');
-    assert.equal(records[0].recoveryEvidence[0].failureClass, 'trust_gate');
+    assert.equal(records[0].recoveryEvidence.find((e) => e.failureClass === 'trust_gate')?.failureClass, 'trust_gate');
     assert.equal(outputLines.length, 0);
   } finally {
     Module._load = oldLoad;
@@ -766,8 +767,9 @@ test('chat panel preserves cli session metadata across turns', () => {
 });
 
 test('chat panel appends follow-up turns to active history record', () => {
-  assert.match(chatPanelSource, /const existingRecord = this\.selectedHistoryId\s*\? this\.history\.records\(\)\.find\(\(item\) => item\.id === this\.selectedHistoryId\)\s*:\s*undefined/s);
-  assert.match(chatPanelSource, /input\.resumeTarget\?\.trim\(\) \|\| existingRecord\?\.resumeTarget\?\.trim\(\) \|\| this\.selectedCliSessionId \|\| undefined/);
+  assert.match(chatPanelSource, /const selectedRecord = this\.selectedHistoryId\s*\? this\.history\.records\(\)\.find\(\(item\) => item\.id === this\.selectedHistoryId\)\s*:\s*undefined/s);
+  assert.match(chatPanelSource, /const existingRecord = startFreshForTask \? undefined : selectedRecord/);
+  assert.match(chatPanelSource, /: input\.resumeTarget\?\.trim\(\) \|\| existingRecord\?\.resumeTarget\?\.trim\(\) \|\| this\.selectedCliSessionId \|\| undefined/);
   assert.match(chatPanelSource, /const record = existingRecord \?\? await this\.history\.createDraft\(/);
   assert.match(chatPanelSource, /await this\.history\.setActiveRecord\(existingRecord\.id\)/);
   assert.match(chatPanelSource, /resumeTarget: INIT\.resumeTarget \|\| ACTIVE_RECORD\.resumeTarget \|\| ''/);
@@ -840,7 +842,8 @@ test('rich tool cards render per-tool fields, diffs, and clickable paths', () =>
   assert.match(chatPanelSource, /data-open-path/);
   assert.match(chatPanelSource, /type: 'openFile'/);
   // Results attach to the originating use-card and collapse long output.
-  assert.match(chatPanelSource, /const pendingToolCards = \{\}/);
+  assert.match(chatPanelSource, /const pendingToolCardsById = \{\}/);
+  assert.match(chatPanelSource, /const pendingToolCardsByName = \{\}/);
   assert.match(chatPanelSource, /function buildResultBlock\(output, isError\)/);
   // CLI forwards structured input alongside the legacy JSON string.
   assert.match(chatPanelSource, /inputData: event\.input \?\? null/);
@@ -1062,6 +1065,8 @@ test('chat bootstrap carries memory-derived identity labels', () => {
 
 test('chat submissions preserve preferred interaction language across turns', () => {
   assert.match(chatPanelSource, /function\s+detectPreferredResponseLanguage\(text:\s*string\):\s*string \| undefined/);
+  assert.match(chatPanelSource, /function\s+detectDominantResponseLanguage\(text:\s*string\):\s*string \| undefined/);
+  assert.match(chatPanelSource, /function\s+resolvePreferredResponseLanguage\(prompt:\s*string,\s*storedLanguage:\s*string \| undefined\):\s*string \| undefined/);
   assert.match(chatPanelSource, /'请用中文'/);
   assert.match(chatPanelSource, /'中文交流'/);
   assert.match(chatPanelSource, /return 'Chinese'/);
@@ -1074,6 +1079,7 @@ test('chat submissions preserve preferred interaction language across turns', ()
   assert.match(chatPanelSource, /Persistent interaction language: respond to the user in Chinese/);
   assert.match(chatPanelSource, /prose headings and explanations must be Chinese/);
   assert.match(chatPanelSource, /const cliPrompt = applyLanguagePreferenceToPrompt\(prompt, preferredLanguage\)/);
+  assert.match(chatPanelSource, /detectDominantResponseLanguage\(prompt\) \?\? storedLanguage/);
   assert.match(chatPanelSource, /role:\s*'user',\s*\n\s*text:\s*prompt/);
   assert.match(chatPanelSource, /args\.push\('prompt', prompt\)/);
 });
@@ -1138,18 +1144,121 @@ test('new chat auto-resumes latest session unless explicitly new', () => {
   assert.match(cliSource, /else if \(options\.forceNewSession\)\s*\{[\s\S]*?args\.push\('--new'\)/);
 });
 
+test('attachment-backed document generation starts a fresh session', () => {
+  assert.match(chatPanelSource, /function\s+shouldStartFreshForAttachmentDocumentTask\(prompt:\s*string,\s*hasAttachment:\s*boolean\):\s*boolean/);
+  assert.match(chatPanelSource, /依据附件\|根据附件\|基于附件/);
+  assert.match(chatPanelSource, /pptx\?\|powerpoint\|幻灯片\|演示文稿\|答辩/);
+  assert.match(chatPanelSource, /生成\|制作\|创建\|输出\|导出\|整理/);
+  assert.match(chatPanelSource, /const startFreshForTask = shouldStartFreshForAttachmentDocumentTask\(prompt, attachmentPaths\.length > 0\)/);
+  assert.match(chatPanelSource, /this\.selectedCliSessionId = null/);
+  assert.match(chatPanelSource, /this\.forceNewSession = true/);
+  assert.match(chatPanelSource, /const existingRecord = startFreshForTask \? undefined : selectedRecord/);
+  assert.match(chatPanelSource, /const resumeTarget = startFreshForTask[\s\S]*?\? undefined[\s\S]*?: input\.resumeTarget\?\.trim\(\)/);
+});
+
 test('skills are surfaced in the extension (list, install, invoke)', () => {
   // #3: cli.ts exposes skill backend calls.
   assert.match(cliSource, /async listSkills\(cwd\?: string\): Promise<HimalayaSkillInfo\[\]>/);
   assert.match(cliSource, /async installSkill\(sourcePath: string, cwd\?: string\)/);
   assert.match(cliSource, /'skills', 'list', '--output-format', 'json'/);
   assert.match(cliSource, /'skills', 'install', sourcePath, '--output-format', 'json'/);
+  assert.match(cliSource, /const sourceValue = skill\.source/);
+  assert.match(cliSource, /sourceValue && typeof sourceValue === 'object'/);
+  assert.match(cliSource, /typeof parsed\.invocation_name === 'string'/);
   // chatPanel wires a Skills button + manager + composer insertion.
   assert.match(chatPanelSource, /id="btnSkills"/);
   assert.match(chatPanelSource, /command === 'manageSkills'/);
   assert.match(chatPanelSource, /async manageSkills\(\): Promise<void>/);
   assert.match(chatPanelSource, /type: 'insertComposerText', text: '\$' \+ picked\.skillName/);
+  assert.match(chatPanelSource, /CLI resolves `\$skill args` on submit/);
   assert.match(chatPanelSource, /case 'insertComposerText':/);
+});
+
+test('HimalayaCli parses structured skill list and install JSON', async () => {
+  const oldLoad = Module._load;
+  Module._load = (request, parent, isMain) => {
+    if (request === 'vscode') {
+      return {
+        workspace: {
+          getConfiguration: () => ({ get: () => '' }),
+          workspaceFolders: []
+        }
+      };
+    }
+    return oldLoad.call(Module, request, parent, isMain);
+  };
+  try {
+    const cliPath = path.join(root, 'out', 'cli.js');
+    delete require.cache[require.resolve(cliPath)];
+    const { HimalayaCli } = require(cliPath);
+    const cli = new HimalayaCli({}, { appendLine() {}, append() {}, show() {} });
+    const calls = [];
+    cli.run = async (args, options) => {
+      calls.push({ args, options });
+      if (args[1] === 'list') {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            skills: [
+              {
+                name: 'demo',
+                description: 'Demo skill',
+                path: '/workspace/.Himalaya/skills/demo/SKILL.md',
+                source: { id: 'project-Himalaya', label: 'Project roots' },
+                origin: { id: 'skills_dir', detail_label: null },
+                shadowed_by: null
+              },
+              {
+                name: 'legacy',
+                path: '/home/user/.Himalaya/commands/legacy.md',
+                origin: { id: 'legacy_commands_dir', detail_label: 'legacy /commands' },
+                shadowed_by: { id: 'project-Himalaya', label: 'Project roots' }
+              },
+              { description: 'ignored without a name' }
+            ]
+          }),
+          stderr: ''
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          kind: 'skills',
+          action: 'install',
+          result: 'installed',
+          invocation_name: 'demo'
+        }),
+        stderr: ''
+      };
+    };
+
+    assert.deepEqual(await cli.listSkills('/workspace'), [
+      {
+        name: 'demo',
+        description: 'Demo skill',
+        source: 'Project roots',
+        path: '/workspace/.Himalaya/skills/demo/SKILL.md',
+        shadowed: false
+      },
+      {
+        name: 'legacy',
+        description: '',
+        source: 'legacy /commands',
+        path: '/home/user/.Himalaya/commands/legacy.md',
+        shadowed: true
+      }
+    ]);
+    assert.deepEqual(await cli.installSkill('/tmp/demo', '/workspace'), {
+      ok: true,
+      message: 'Installed demo'
+    });
+    assert.deepEqual(calls[0].args, ['skills', 'list', '--output-format', 'json']);
+    assert.equal(calls[0].options.cwd, '/workspace');
+    assert.deepEqual(calls[1].args, ['skills', 'install', '/tmp/demo', '--output-format', 'json']);
+    assert.equal(calls[1].options.cwd, '/workspace');
+  } finally {
+    Module._load = oldLoad;
+  }
 });
 
 test('cloud model config is unified with the CLI provider.json format', () => {
@@ -1203,16 +1312,17 @@ test('cloud model wizard fetches real model catalogue from provider', () => {
   assert.match(cliSource, /\`\$\{cleanBase\}\/models\`/);
   assert.match(cliSource, /Authorization.*Bearer.*apiKey/);
   // configureCloudModelRoute merges provider models into the picker
-  assert.match(chatPanelSource, /this\.cli\.listCloudModels\(cloudBaseUrl\.trim\(\), effectiveApiKey\)/);
+  assert.match(chatPanelSource, /this\.cli\.listCloudModels\(baseUrl, apiKey\)/);
   assert.match(chatPanelSource, /seen\.has\(alias\)/);
 });
 
 test('cloud model wizard mirrors selection into the shared provider.json', () => {
   // Still mirrors to CLI-compatible provider.json (from #4).
-  assert.match(chatPanelSource, /import \{ loadProviderSelection, saveProviderSelection \} from '\.\/providerConfig'/);
+  assert.match(chatPanelSource, /import \{.*loadProviderSelection.*saveProviderSelection.*\} from '\.\/providerConfig'/);
   assert.match(chatPanelSource, /saveProviderSelection\(workspaceRoot, \{/);
   assert.match(chatPanelSource, /const savedSelection = workspaceRoot \? loadProviderSelection\(workspaceRoot\) : null/);
-  assert.match(chatPanelSource, /const effectiveApiKey = cloudApiKey\.trim\(\) \|\| savedSelection\?\.apiKey \|\| ''/);
+  assert.match(chatPanelSource, /let effectiveApiKey = savedSelection\?\.apiKey \|\| ''/);
+  assert.match(chatPanelSource, /const effectiveApiKey = cloudApiKey\.trim\(\) \|\| apiKey/);
 });
 
 

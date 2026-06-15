@@ -54,6 +54,73 @@ pub struct NodeVerificationGate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeExecutionArtifact {
+    pub node_id: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands_run: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_questions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_reason: Option<String>,
+    /// Stored as percent to keep equality deterministic across snapshots.
+    pub confidence_percent: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<String>,
+}
+
+impl NodeExecutionArtifact {
+    #[must_use]
+    pub fn new(node_id: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self {
+            node_id: node_id.into(),
+            summary: summary.into(),
+            evidence: Vec::new(),
+            changed_files: Vec::new(),
+            commands_run: Vec::new(),
+            open_questions: Vec::new(),
+            blocking_reason: None,
+            confidence_percent: 50,
+            producer: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_evidence(mut self, evidence: Vec<String>) -> Self {
+        self.evidence = evidence;
+        self
+    }
+
+    #[must_use]
+    pub fn with_commands_run(mut self, commands_run: Vec<String>) -> Self {
+        self.commands_run = commands_run;
+        self
+    }
+
+    #[must_use]
+    pub fn with_confidence_percent(mut self, confidence_percent: u8) -> Self {
+        self.confidence_percent = confidence_percent.min(100);
+        self
+    }
+
+    #[must_use]
+    pub fn with_producer(mut self, producer: impl Into<String>) -> Self {
+        self.producer = Some(producer.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_blocking_reason(mut self, reason: impl Into<String>) -> Self {
+        self.blocking_reason = Some(reason.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanNodeExecution {
     pub node_id: String,
     pub status: PlanNodeStatus,
@@ -61,6 +128,8 @@ pub struct PlanNodeExecution {
     pub output_summary: Option<String>,
     pub failure_class: Option<String>,
     pub retry_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<NodeExecutionArtifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,6 +173,7 @@ impl PlanExecution {
                     output_summary: None,
                     failure_class: None,
                     retry_count: 0,
+                    artifact: None,
                     verification_gate: None,
                     worker_id: None,
                 },
@@ -189,6 +259,7 @@ impl PlanExecution {
         node.retry_count = node.retry_count.saturating_add(1);
         node.failure_class = None;
         node.worker_id = None;
+        node.artifact = None;
         self.reset_skipped_dependents(dag, node_id);
         self.push_event(
             node_id,
@@ -250,6 +321,12 @@ impl PlanExecution {
                 node.status = PlanNodeStatus::Failed;
                 node.worker_id = None;
                 node.failure_class = Some("node_verification".to_string());
+                node.artifact = Some(
+                    NodeExecutionArtifact::new(node_id, summary.clone())
+                        .with_evidence(vec!["node verification failed".to_string()])
+                        .with_confidence_percent(0)
+                        .with_producer("verification"),
+                );
             }
             node.status
         };
@@ -328,6 +405,22 @@ impl PlanExecution {
         node_id: &str,
         output_summary: Option<String>,
     ) -> Result<(), String> {
+        let artifact = output_summary.as_ref().map(|summary| {
+            NodeExecutionArtifact::new(node_id, summary.clone())
+                .with_evidence(vec!["node reported completion".to_string()])
+                .with_confidence_percent(50)
+                .with_producer("runtime")
+        });
+        self.succeed_node_with_artifact(dag, node_id, output_summary, artifact)
+    }
+
+    pub fn succeed_node_with_artifact(
+        &mut self,
+        dag: &PlanDag,
+        node_id: &str,
+        output_summary: Option<String>,
+        artifact: Option<NodeExecutionArtifact>,
+    ) -> Result<(), String> {
         let node = self
             .nodes
             .get_mut(node_id)
@@ -341,6 +434,14 @@ impl PlanExecution {
         node.status = PlanNodeStatus::Succeeded;
         node.worker_id = None;
         node.output_summary = output_summary.clone();
+        node.artifact = artifact.or_else(|| {
+            output_summary.as_ref().map(|summary| {
+                NodeExecutionArtifact::new(node_id, summary.clone())
+                    .with_evidence(vec!["node reported completion".to_string()])
+                    .with_confidence_percent(50)
+                    .with_producer("runtime")
+            })
+        });
         self.push_event(
             node_id,
             PlanExecutionEventKind::NodeSucceeded,
@@ -365,6 +466,13 @@ impl PlanExecution {
         node.status = PlanNodeStatus::Failed;
         node.worker_id = None;
         node.failure_class = Some(failure_class.clone());
+        node.artifact = Some(
+            NodeExecutionArtifact::new(node_id, failure_class.clone())
+                .with_evidence(vec!["node failed".to_string()])
+                .with_blocking_reason(failure_class.clone())
+                .with_confidence_percent(0)
+                .with_producer("runtime"),
+        );
         self.push_event(
             node_id,
             PlanExecutionEventKind::NodeFailed,

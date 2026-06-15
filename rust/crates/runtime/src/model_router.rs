@@ -36,6 +36,18 @@ pub struct ModelRoute {
     pub cost_weight: u8,
     pub latency_weight: u8,
     pub quality_weight: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(default = "default_schema_reliability")]
+    pub schema_reliability: u8,
+    #[serde(default = "default_planning_score")]
+    pub planning_score: u8,
+    #[serde(default = "default_verification_score")]
+    pub verification_score: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_task_complexity: Option<u8>,
+    #[serde(default)]
+    pub requires_supervisor: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,19 +84,23 @@ impl MoERoutingPolicy {
                         ModelCapability::Planning,
                         ModelCapability::LongContext,
                     ])
-                    .with_weights(1, 1, 5),
+                    .with_weights(1, 1, 5)
+                    .with_model_profile(85, 90, 70, None, false),
                 ModelRoute::new(ModelRoutePhase::Coding, default_model.clone())
                     .with_capabilities(vec![ModelCapability::Coding, ModelCapability::Refactor])
-                    .with_weights(2, 2, 5),
+                    .with_weights(2, 2, 5)
+                    .with_model_profile(75, 65, 65, None, false),
                 ModelRoute::new(ModelRoutePhase::Verification, default_model.clone())
                     .with_capabilities(vec![
                         ModelCapability::Verification,
                         ModelCapability::TestGeneration,
                     ])
-                    .with_weights(2, 2, 5),
+                    .with_weights(2, 2, 5)
+                    .with_model_profile(80, 65, 90, None, false),
                 ModelRoute::new(ModelRoutePhase::Summarization, default_model.clone())
                     .with_capabilities(vec![ModelCapability::Summarization, ModelCapability::Cheap])
-                    .with_weights(5, 3, 2),
+                    .with_weights(5, 3, 2)
+                    .with_model_profile(80, 70, 50, Some(3), false),
             ],
             default_model,
             adaptive: default_adaptive_routing(),
@@ -119,6 +135,18 @@ fn default_switch_failure_threshold_percent() -> u8 {
     50
 }
 
+fn default_schema_reliability() -> u8 {
+    60
+}
+
+fn default_planning_score() -> u8 {
+    50
+}
+
+fn default_verification_score() -> u8 {
+    50
+}
+
 impl ModelRoute {
     #[must_use]
     pub fn new(role: ModelRoutePhase, model: impl Into<String>) -> Self {
@@ -131,6 +159,12 @@ impl ModelRoute {
             cost_weight: 1,
             latency_weight: 1,
             quality_weight: 1,
+            context_window: None,
+            schema_reliability: default_schema_reliability(),
+            planning_score: default_planning_score(),
+            verification_score: default_verification_score(),
+            max_task_complexity: None,
+            requires_supervisor: false,
         }
     }
 
@@ -151,6 +185,29 @@ impl ModelRoute {
         self.cost_weight = cost_weight;
         self.latency_weight = latency_weight;
         self.quality_weight = quality_weight;
+        self
+    }
+
+    #[must_use]
+    pub fn with_context_window(mut self, context_window: u32) -> Self {
+        self.context_window = Some(context_window);
+        self
+    }
+
+    #[must_use]
+    pub fn with_model_profile(
+        mut self,
+        schema_reliability: u8,
+        planning_score: u8,
+        verification_score: u8,
+        max_task_complexity: Option<u8>,
+        requires_supervisor: bool,
+    ) -> Self {
+        self.schema_reliability = schema_reliability.min(100);
+        self.planning_score = planning_score.min(100);
+        self.verification_score = verification_score.min(100);
+        self.max_task_complexity = max_task_complexity.map(|value| value.clamp(1, 5));
+        self.requires_supervisor = requires_supervisor;
         self
     }
 }
@@ -660,6 +717,7 @@ fn route_weight_score(route: &ModelRoute) -> f32 {
     f32::from(route.quality_weight) * 2.0
         + f32::from(route.latency_weight)
         + f32::from(route.cost_weight)
+        + model_profile_score(route)
 }
 
 /// Like [`route_weight_score`], but tilts the weighting toward quality as task
@@ -675,6 +733,35 @@ fn complexity_weighted_score(route: &ModelRoute, complexity: Option<u8>) -> f32 
     let efficiency_multiplier = 1.0 - tilt * 0.5; // 1.0 → 0.5
     f32::from(route.quality_weight) * quality_multiplier
         + (f32::from(route.latency_weight) + f32::from(route.cost_weight)) * efficiency_multiplier
+        + model_profile_score(route) * (1.0 + tilt)
+        - complexity_limit_penalty(route, complexity)
+}
+
+fn model_profile_score(route: &ModelRoute) -> f32 {
+    let role_score = match route.role {
+        ModelRoutePhase::Planning => route.planning_score,
+        ModelRoutePhase::Verification => route.verification_score,
+        ModelRoutePhase::Summarization => route.schema_reliability.max(route.planning_score / 2),
+        ModelRoutePhase::Coding | ModelRoutePhase::Vision | ModelRoutePhase::LocalFast => {
+            route.schema_reliability
+        }
+    };
+    f32::from(role_score.min(100)) / 25.0
+}
+
+fn complexity_limit_penalty(route: &ModelRoute, complexity: Option<u8>) -> f32 {
+    let Some(complexity) = complexity else {
+        return 0.0;
+    };
+    let Some(max_task_complexity) = route.max_task_complexity else {
+        return 0.0;
+    };
+    if complexity <= max_task_complexity {
+        0.0
+    } else {
+        f32::from(complexity - max_task_complexity) * 4.0
+            + if route.requires_supervisor { 2.0 } else { 0.0 }
+    }
 }
 
 fn average_metric(values: impl Iterator<Item = f32>) -> Option<f32> {
@@ -1003,5 +1090,26 @@ mod tests {
         // panics and returns a configured route.
         let neutral = router.select_with_feedback_and_context(ModelRoutePhase::Coding, &[], None);
         assert!(neutral.model == "high-quality" || neutral.model == "cheap-fast");
+    }
+
+    #[test]
+    fn complexity_limit_profile_steers_hard_tasks_away_from_small_models() {
+        let policy = MoERoutingPolicy::new(
+            "default",
+            vec![
+                ModelRoute::new(ModelRoutePhase::Coding, "small-fast")
+                    .with_weights(5, 5, 4)
+                    .with_model_profile(65, 45, 45, Some(2), true),
+                ModelRoute::new(ModelRoutePhase::Coding, "frontier")
+                    .with_weights(1, 1, 5)
+                    .with_model_profile(90, 90, 85, None, false),
+            ],
+        );
+        let router = ModelRouter::new(policy);
+
+        let decision =
+            router.select_with_feedback_and_context(ModelRoutePhase::Coding, &[], Some(5));
+
+        assert_eq!(decision.model, "frontier");
     }
 }

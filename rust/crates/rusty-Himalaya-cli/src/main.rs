@@ -44,9 +44,11 @@ use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
     handle_skills_slash_command, handle_skills_slash_command_json, is_stub_slash_command,
-    render_slash_command_help, render_slash_command_help_filtered, resolve_skill_invocation,
-    resume_supported_slash_commands, slash_command_specs, slash_command_status,
-    validate_slash_command_input, SkillSlashDispatch, SlashCommand, SlashCommandStatus,
+    parse_skill_invocation_prompt, render_loaded_skill_prompt, render_slash_command_help,
+    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
+    skill_invocation_from_args, slash_command_specs, slash_command_status,
+    validate_slash_command_input, SkillInvocation, SkillSlashDispatch, SlashCommand,
+    SlashCommandStatus,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -285,6 +287,80 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
+fn render_skill_invocation_prompt_for_current_dir(
+    invocation: SkillInvocation,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let requested = invocation.skill.clone();
+    match commands::load_skill_invocation(&cwd, invocation) {
+        Ok(skill) => Ok(render_loaded_skill_prompt(&skill)),
+        Err(error) => {
+            let mut message = format!("Unknown skill: {requested} ({error})");
+            if let Ok(skills) = commands::discover_skills(&cwd) {
+                let names = skills
+                    .into_iter()
+                    .filter(|skill| skill.active)
+                    .map(|skill| skill.name)
+                    .collect::<Vec<_>>();
+                if !names.is_empty() {
+                    message.push_str(&format!("\n  Available skills: {}", names.join(", ")));
+                }
+            }
+            message.push_str("\n  Usage: $skill [args] or /skills <skill> [args]");
+            Err(std::io::Error::new(error.kind(), message).into())
+        }
+    }
+}
+
+fn is_document_generation_request(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    let mentions_document_format = [
+        "ppt",
+        "pptx",
+        "powerpoint",
+        "幻灯片",
+        "演示文稿",
+        "答辩",
+        "word",
+        "docx",
+        "pdf",
+        "excel",
+        "xlsx",
+        "电子文档",
+        "表格",
+        "spreadsheet",
+        "slides",
+        "deck",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if !mentions_document_format {
+        return false;
+    }
+
+    [
+        "生成",
+        "制作",
+        "创建",
+        "输出",
+        "导出",
+        "整理",
+        "撰写",
+        "编写",
+        "做一份",
+        "转换",
+        "generate",
+        "create",
+        "make",
+        "build",
+        "export",
+        "produce",
+        "draft",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
@@ -380,7 +456,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
-            let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
+            let rendered_skill_prompt = parse_skill_invocation_prompt(&prompt)
+                .map(render_skill_invocation_prompt_for_current_dir)
+                .transpose()?;
+            let prompt = rendered_skill_prompt.as_deref().unwrap_or(&prompt);
+            let effective_prompt = merge_prompt_with_stdin(prompt, stdin_context.as_deref());
             let mut cli = LiveCli::from_existing_session(
                 session_path,
                 model.clone(),
@@ -427,6 +507,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
+            let mut cli = LiveCli::new(model.clone(), true, allowed_tools, permission_mode)?;
+            cli.set_reasoning_effort(reasoning_effort);
+            if !file_paths.is_empty() {
+                let blocks = load_files_as_content_blocks(&file_paths, &model)
+                    .map_err(Box::<dyn std::error::Error>::from)?;
+                cli.inject_file_blocks(blocks)?;
+            }
+            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
+        }
+        CliAction::SkillPrompt {
+            invocation,
+            model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+            compact,
+            base_commit,
+            reasoning_effort,
+            allow_broad_cwd,
+            file_paths,
+        } => {
+            enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
+            run_stale_base_preflight(base_commit.as_deref());
+            let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
+                read_piped_stdin()
+            } else {
+                None
+            };
+            let rendered_skill_prompt = render_skill_invocation_prompt_for_current_dir(invocation)?;
+            let effective_prompt =
+                merge_prompt_with_stdin(&rendered_skill_prompt, stdin_context.as_deref());
             let mut cli = LiveCli::new(model.clone(), true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             if !file_paths.is_empty() {
@@ -566,6 +677,18 @@ enum CliAction {
     },
     Prompt {
         prompt: String,
+        model: String,
+        output_format: CliOutputFormat,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        compact: bool,
+        base_commit: Option<String>,
+        reasoning_effort: Option<String>,
+        allow_broad_cwd: bool,
+        file_paths: Vec<PathBuf>,
+    },
+    SkillPrompt {
+        invocation: SkillInvocation,
         model: String,
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
@@ -1211,6 +1334,21 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }
 
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
+    let joined_rest = rest.join(" ");
+    if let Some(invocation) = parse_skill_invocation_prompt(&joined_rest) {
+        return Ok(CliAction::SkillPrompt {
+            invocation,
+            model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+            compact,
+            base_commit,
+            reasoning_effort: reasoning_effort.clone(),
+            allow_broad_cwd,
+            file_paths: file_paths.clone(),
+        });
+    }
 
     match rest[0].as_str() {
         "dump-manifests" => Ok(CliAction::DumpManifests { output_format }),
@@ -1240,11 +1378,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
             output_format,
         }),
-        "skills" => {
+        "skills" | "skill" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
-                SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
-                    prompt,
+                SkillSlashDispatch::Invoke(_) => Ok(CliAction::SkillPrompt {
+                    invocation: skill_invocation_from_args(args.as_deref().unwrap_or_default())
+                        .ok_or_else(|| "skills command requires a skill name".to_string())?,
                     model,
                     output_format,
                     allowed_tools,
@@ -2722,8 +2861,9 @@ fn parse_direct_slash_cli_action(
         }),
         Ok(Some(SlashCommand::Skills { args })) => {
             match classify_skills_slash_command(args.as_deref()) {
-                SkillSlashDispatch::Invoke(prompt) => Ok(CliAction::Prompt {
-                    prompt,
+                SkillSlashDispatch::Invoke(_) => Ok(CliAction::SkillPrompt {
+                    invocation: skill_invocation_from_args(args.as_deref().unwrap_or_default())
+                        .ok_or_else(|| "/skills requires a skill name".to_string())?,
                     model,
                     output_format,
                     allowed_tools,
@@ -6263,9 +6403,13 @@ fn run_repl(
                     if let Ok(SkillSlashDispatch::Invoke(prompt)) =
                         resolve_skill_invocation(&cwd, Some(&trimmed))
                     {
+                        let Some(invocation) = parse_skill_invocation_prompt(&prompt) else {
+                            eprintln!("unable to parse skill invocation: {prompt}");
+                            continue;
+                        };
                         editor.push_history(input);
                         cli.record_prompt_history(&trimmed);
-                        cli.run_turn(&prompt)?;
+                        cli.run_skill_invocation(invocation)?;
                         continue;
                     }
                 }
@@ -7063,6 +7207,14 @@ impl LiveCli {
         }
     }
 
+    fn run_skill_invocation(
+        &mut self,
+        invocation: SkillInvocation,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let prompt = render_skill_invocation_prompt_for_current_dir(invocation)?;
+        self.run_turn(&prompt)
+    }
+
     fn run_turn_with_output(
         &mut self,
         input: &str,
@@ -7071,16 +7223,24 @@ impl LiveCli {
     ) -> Result<(), Box<dyn std::error::Error>> {
         match output_format {
             CliOutputFormat::Text if compact => self.run_prompt_compact(input),
-            CliOutputFormat::Text => self.run_turn(input),
+            CliOutputFormat::Text => {
+                let input = self
+                    .render_known_skill_prompt(input)?
+                    .unwrap_or_else(|| input.to_string());
+                self.run_turn(&input)
+            }
             CliOutputFormat::Json => self.run_prompt_json(input),
             CliOutputFormat::StreamJson => self.run_prompt_stream_json(input),
         }
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let input = self
+            .render_known_skill_prompt(input)?
+            .unwrap_or_else(|| input.to_string());
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(&input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = match result {
             Ok(summary) => summary,
@@ -7097,9 +7257,12 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let input = self
+            .render_known_skill_prompt(input)?
+            .unwrap_or_else(|| input.to_string());
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(&input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = match result {
             Ok(summary) => summary,
@@ -7141,6 +7304,9 @@ impl LiveCli {
     }
 
     fn run_prompt_stream_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let input = self
+            .render_known_skill_prompt(input)?
+            .unwrap_or_else(|| input.to_string());
         // Host-driven mode: AskUserQuestion exchanges a structured user_question
         // NDJSON event + a single-line answer (so a VS Code webview can render
         // options) instead of printing a human stdin prompt.
@@ -7155,7 +7321,7 @@ impl LiveCli {
             "model": self.model,
         }));
         print_stream_json_event(json!({"type":"message_start"}));
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result = runtime.run_turn(&input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = match result {
             Ok(summary) => summary,
@@ -7204,6 +7370,37 @@ impl LiveCli {
         }
         print_stream_json_event(json!({"type":"done","iterations":summary.iterations}));
         Ok(())
+    }
+
+    fn render_known_skill_prompt(
+        &self,
+        input: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        if input.contains("Use the local Himalaya skill `")
+            && input.contains("<skill_instructions>")
+        {
+            return Ok(None);
+        }
+
+        if let Some(invocation) = parse_skill_invocation_prompt(input) {
+            let cwd = env::current_dir()?;
+            return match commands::load_skill_invocation(&cwd, invocation) {
+                Ok(skill) => Ok(Some(render_loaded_skill_prompt(&skill))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(Box::new(error)),
+            };
+        }
+
+        if is_document_generation_request(input) {
+            let cwd = env::current_dir()?;
+            return match commands::load_skill(&cwd, "document-generator", Some(input.to_string())) {
+                Ok(skill) => Ok(Some(render_loaded_skill_prompt(&skill))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(Box::new(error)),
+            };
+        }
+
+        Ok(None)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7317,7 +7514,17 @@ impl LiveCli {
             }
             SlashCommand::Skills { args } => {
                 match classify_skills_slash_command(args.as_deref()) {
-                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
+                    SkillSlashDispatch::Invoke(_) => {
+                        let invocation =
+                            skill_invocation_from_args(args.as_deref().unwrap_or_default())
+                                .ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::InvalidInput,
+                                        "/skills requires a skill name",
+                                    )
+                                })?;
+                        self.run_skill_invocation(invocation)?;
+                    }
                     SkillSlashDispatch::Local => {
                         Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
                     }
@@ -14566,12 +14773,29 @@ fn runtime_event_tone_color(tone: &str) -> &'static str {
 fn runtime_status_tone(value: &str) -> &'static str {
     let v = value.to_ascii_lowercase();
     let has = |needles: &[&str]| needles.iter().any(|n| v.contains(n));
-    if has(&["fail", "error", "blocked", "escalat", "reject", "denied", "cancel"]) {
+    if has(&[
+        "fail", "error", "blocked", "escalat", "reject", "denied", "cancel",
+    ]) {
         "err"
-    } else if has(&["complete", "success", "passed", "recovered", "done", "resolved", "assigned"]) {
+    } else if has(&[
+        "complete",
+        "success",
+        "passed",
+        "recovered",
+        "done",
+        "resolved",
+        "assigned",
+    ]) {
         "ok"
-    } else if has(&["running", "in_progress", "started", "retry", "pending", "resume", "scheduled"])
-    {
+    } else if has(&[
+        "running",
+        "in_progress",
+        "started",
+        "retry",
+        "pending",
+        "resume",
+        "scheduled",
+    ]) {
         "run"
     } else if has(&["warn", "partial", "skip", "degraded"]) {
         "warn"
@@ -14685,7 +14909,8 @@ fn format_runtime_event_line(kind: &str, event: &serde_json::Value) -> Option<St
             ))
         }
         "task_execution_event" => {
-            let completed = event.get("completed").and_then(serde_json::Value::as_bool) == Some(true);
+            let completed =
+                event.get("completed").and_then(serde_json::Value::as_bool) == Some(true);
             let blocked = event.get("blocked").and_then(serde_json::Value::as_bool) == Some(true);
             let steps = event
                 .get("steps")
@@ -14708,7 +14933,6 @@ fn format_runtime_event_line(kind: &str, event: &serde_json::Value) -> Option<St
         _ => None,
     }
 }
-
 
 const DISPLAY_TRUNCATION_NOTICE: &str =
     "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
@@ -15967,9 +16191,10 @@ mod tests {
         format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
         format_issue_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_runtime_event_line, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
+        format_resume_report, format_runtime_event_line, format_status_report,
+        format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message,
+        format_user_visible_api_error, is_document_generation_request,
         load_files_as_content_blocks, maturity_matrix_value, merge_prompt_with_stdin,
         normalize_permission_mode, parse_args, parse_benchmark_cli_command, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
@@ -15978,7 +16203,8 @@ mod tests {
         push_output_block, render_config_report, render_diff_report, render_diff_report_for,
         render_governed_policy_apply_text, render_maturity_matrix_text, render_memory_report,
         render_policy_apply_plan_text, render_policy_replay_text, render_prompt_history_report,
-        render_repl_help, render_resume_usage, render_session_markdown, resolve_model_alias,
+        render_repl_help, render_resume_usage, render_session_markdown,
+        render_skill_invocation_prompt_for_current_dir, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
         response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, slash_command_status, status_context,
@@ -15997,6 +16223,7 @@ mod tests {
         render_autonomous_preflight_blocked_text, render_autonomous_replay_text,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use commands::SkillInvocation;
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -17997,8 +18224,11 @@ mod tests {
                 "overview".to_string()
             ])
             .expect("skills help overview should invoke"),
-            CliAction::Prompt {
-                prompt: "$help overview".to_string(),
+            CliAction::SkillPrompt {
+                invocation: SkillInvocation {
+                    skill: "help".to_string(),
+                    args: Some("overview".to_string()),
+                },
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -18452,8 +18682,11 @@ mod tests {
                 "overview".to_string()
             ])
             .expect("/skills help overview should invoke"),
-            CliAction::Prompt {
-                prompt: "$help overview".to_string(),
+            CliAction::SkillPrompt {
+                invocation: SkillInvocation {
+                    skill: "help".to_string(),
+                    args: Some("overview".to_string()),
+                },
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -18480,8 +18713,30 @@ mod tests {
         assert_eq!(
             parse_args(&["/skills".to_string(), "/test".to_string()])
                 .expect("/skills /test should normalize to a single skill prompt prefix"),
-            CliAction::Prompt {
-                prompt: "$test".to_string(),
+            CliAction::SkillPrompt {
+                invocation: SkillInvocation {
+                    skill: "test".to_string(),
+                    args: None,
+                },
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: crate::default_permission_mode(),
+                compact: false,
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+                file_paths: Vec::new(),
+            }
+        );
+        assert_eq!(
+            parse_args(&["$help".to_string(), "overview".to_string()])
+                .expect("$help overview should parse as a skill invocation"),
+            CliAction::SkillPrompt {
+                invocation: SkillInvocation {
+                    skill: "help".to_string(),
+                    args: Some("overview".to_string()),
+                },
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
@@ -18561,6 +18816,51 @@ mod tests {
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
         assert!(error.contains("Himalaya --resume SESSION.jsonl /status"));
+    }
+
+    #[test]
+    fn renders_skill_invocation_prompt_from_current_workspace() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        let skill_dir = workspace.join(".Himalaya").join("skills").join("demo");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill\n---\n\n# Demo\nUse demo guidance.\n",
+        )
+        .expect("write skill");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+
+        let rendered = render_skill_invocation_prompt_for_current_dir(SkillInvocation {
+            skill: "demo".to_string(),
+            args: Some("arg one".to_string()),
+        })
+        .expect("skill prompt should render");
+
+        assert!(rendered.contains("Use the local Himalaya skill `demo`"));
+        assert!(rendered.contains("- Invocation: $demo"));
+        assert!(rendered.contains("- Arguments: arg one"));
+        assert!(rendered.contains("Use demo guidance."));
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn detects_document_generation_requests_for_auto_skill_routing() {
+        assert!(is_document_generation_request(
+            "请依据附件中的学位论文，整理生成一份答辩用高质量的ppt电子文档。"
+        ));
+        assert!(is_document_generation_request(
+            "Create an Excel workbook with formulas and charts from this data."
+        ));
+        assert!(!is_document_generation_request(
+            "请阅读这篇论文并总结主要观点。"
+        ));
+        assert!(!is_document_generation_request(
+            "请检查文档生成代码是否完善。"
+        ));
     }
 
     #[test]

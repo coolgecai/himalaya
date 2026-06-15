@@ -416,17 +416,25 @@ fn memory_query_tokens(query: &str) -> BTreeSet<String> {
 struct TurnTaskState {
     objective: String,
     requires_workspace_analysis: bool,
+    requires_document_generation: bool,
     required_evidence: Vec<&'static str>,
+    source_attachments: Vec<AttachmentEvidence>,
     observed_tools: BTreeSet<String>,
     observed_files: BTreeSet<String>,
     read_file_calls: usize,
+    generated_document: bool,
     failed_tools: Vec<String>,
     evidence_gate_prompts: usize,
+    document_generation_gate_prompts: usize,
     output_language: Option<String>,
 }
 
 impl TurnTaskState {
-    fn new(user_input: &str, requires_workspace_analysis: bool) -> Self {
+    fn new(
+        user_input: &str,
+        requires_workspace_analysis: bool,
+        requires_document_generation: bool,
+    ) -> Self {
         let required_evidence = if requires_workspace_analysis {
             vec![
                 "directory/file discovery",
@@ -440,18 +448,26 @@ impl TurnTaskState {
         Self {
             objective: user_input.trim().chars().take(240).collect(),
             requires_workspace_analysis,
+            requires_document_generation,
             required_evidence,
+            source_attachments: Vec::new(),
             observed_tools: BTreeSet::new(),
             observed_files: BTreeSet::new(),
             read_file_calls: 0,
+            generated_document: false,
             failed_tools: Vec::new(),
             evidence_gate_prompts: 0,
+            document_generation_gate_prompts: 0,
             output_language: None,
         }
     }
 
     fn set_output_language(&mut self, language: Option<String>) {
         self.output_language = language;
+    }
+
+    fn set_source_attachments(&mut self, source_attachments: Vec<AttachmentEvidence>) {
+        self.source_attachments = source_attachments;
     }
 
     fn record_tool_use(&mut self, tool_name: &str, input: &str) {
@@ -474,6 +490,8 @@ impl TurnTaskState {
                 "{tool_name}: {}",
                 output.chars().take(160).collect::<String>()
             ));
+        } else if is_generate_file_tool(tool_name) {
+            self.generated_document = true;
         }
         for file in extract_file_candidates(output).into_iter().take(12) {
             self.observed_files.insert(file);
@@ -508,6 +526,21 @@ impl TurnTaskState {
         true
     }
 
+    fn document_generation_complete(&self) -> bool {
+        !self.requires_document_generation || self.generated_document
+    }
+
+    fn should_prompt_for_document_generation(&mut self) -> bool {
+        if !self.requires_document_generation
+            || self.document_generation_complete()
+            || self.document_generation_gate_prompts >= 2
+        {
+            return false;
+        }
+        self.document_generation_gate_prompts += 1;
+        true
+    }
+
     fn format_context(&self) -> String {
         let mut lines = vec![
             "# Structured task state".to_string(),
@@ -524,6 +557,32 @@ impl TurnTaskState {
                 self.required_evidence.join("; ")
             ));
             lines.push(format!("- Evidence complete: {}", self.evidence_complete()));
+        }
+        if self.requires_document_generation {
+            lines.push("- Task class: binary document generation".to_string());
+            lines.push(
+                "- Required deliverable before final answer: successful generate_file tool result"
+                    .to_string(),
+            );
+            if !self.source_attachments.is_empty() {
+                lines.push(format!(
+                    "- User-provided source attachments: {}",
+                    self.source_attachments
+                        .iter()
+                        .take(8)
+                        .map(AttachmentEvidence::summary)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+                lines.push(
+                    "- Attachment contract: the source document is already available in conversation context; do not ask the user to upload or paste it again."
+                        .to_string(),
+                );
+            }
+            lines.push(format!(
+                "- Document generation complete: {}",
+                self.document_generation_complete()
+            ));
         }
         if !self.observed_tools.is_empty() {
             lines.push(format!(
@@ -556,6 +615,25 @@ impl TurnTaskState {
             );
         }
         lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachmentEvidence {
+    label: String,
+    kind: &'static str,
+    extracted_chars: Option<usize>,
+}
+
+impl AttachmentEvidence {
+    fn summary(&self) -> String {
+        match (self.kind, self.extracted_chars) {
+            ("text", Some(chars)) => {
+                format!("{} (extracted text: {chars} chars)", self.label)
+            }
+            ("image", _) => format!("{} (image)", self.label),
+            _ => self.label.clone(),
+        }
     }
 }
 
@@ -672,8 +750,183 @@ fn workspace_evidence_tools_available(available_tool_names: &BTreeSet<String>) -
     has_search && has_read
 }
 
+fn user_requests_document_generation(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    let mentions_document_format = [
+        "ppt",
+        "pptx",
+        "powerpoint",
+        "幻灯片",
+        "演示文稿",
+        "答辩",
+        "word",
+        "docx",
+        "pdf",
+        "excel",
+        "xlsx",
+        "电子文档",
+        "表格",
+        "spreadsheet",
+        "slides",
+        "deck",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if !mentions_document_format {
+        return false;
+    }
+
+    [
+        "生成",
+        "制作",
+        "创建",
+        "输出",
+        "导出",
+        "整理",
+        "撰写",
+        "编写",
+        "做一份",
+        "转换",
+        "generate",
+        "create",
+        "make",
+        "build",
+        "export",
+        "produce",
+        "draft",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn is_generate_file_tool(tool_name: &str) -> bool {
+    matches!(
+        normalize_tool_key(tool_name).as_str(),
+        "generatefile" | "functiongeneratefile"
+    )
+}
+
+fn document_generation_tool_available(available_tool_names: &BTreeSet<String>) -> bool {
+    available_tool_names
+        .iter()
+        .any(|name| is_generate_file_tool(name))
+}
+
 fn workspace_evidence_gate_prompt() -> &'static str {
     "Workspace analysis is not allowed to finish from the injected navigation snapshot. Use local evidence tools now: run glob_search or grep_search to discover relevant files/entry points, read root manifests with read_file, read at least three relevant source files with read_file, then answer only from those observations. Preserve the active output-language contract from the system prompt."
+}
+
+fn document_generation_gate_prompt(
+    user_input: &str,
+    source_attachments: &[AttachmentEvidence],
+) -> String {
+    if matches!(
+        detect_input_language(user_input).as_deref(),
+        Some("Chinese")
+    ) {
+        let attachments = gate_attachment_lines(source_attachments, "本轮已有附件/源材料");
+        format!(
+            "# 文档生成完成门禁\n当前任务明确要求生成 PPT/Word/PDF/Excel 等电子文档，但上一轮没有成功调用 `generate_file`，不能用论文分析、摘要或大纲作为最终交付。{attachments}\n请继续执行：基于附件或会话中已经提取的 `[File: ...]` 内容，整理为适合目标文档的结构化 `document_spec`，调用 `generate_file` 输出实际文件；检查工具返回的 `manifestPath` 和 `quality`，可修复的问题先修复。不要要求用户再次上传附件、粘贴论文正文或提供文档内容。生成文件成功之前不要给最终答复。"
+        )
+    } else {
+        let attachments = gate_attachment_lines(
+            source_attachments,
+            "Attached/source material already available",
+        );
+        format!(
+            "# Document generation completion gate\nThis task explicitly requires a PPT/Word/PDF/Excel document file, but the previous attempt did not successfully call `generate_file`. A prose analysis, summary, or outline is not the deliverable.{attachments}\nContinue now: base the document on the attached source material or the already-extracted `[File: ...]` content in the conversation, organize it into a structured `document_spec`, call `generate_file` to create the actual file, inspect the returned `manifestPath` and `quality`, and fix any actionable issues before the final response. Do not ask the user to upload the attachment again, paste the source document, or provide document content. Do not finish until file generation succeeds."
+        )
+    }
+}
+
+fn gate_attachment_lines(source_attachments: &[AttachmentEvidence], heading: &str) -> String {
+    if source_attachments.is_empty() {
+        return String::new();
+    }
+    let items = source_attachments
+        .iter()
+        .take(8)
+        .map(|attachment| format!("\n- {}", attachment.summary()))
+        .collect::<String>();
+    format!("\n{heading}:{items}")
+}
+
+fn format_attachment_context_prompt(
+    source_attachments: &[AttachmentEvidence],
+    language: Option<&str>,
+) -> Option<String> {
+    if source_attachments.is_empty() {
+        return None;
+    }
+    let items = source_attachments
+        .iter()
+        .take(8)
+        .map(|attachment| format!("\n- {}", attachment.summary()))
+        .collect::<String>();
+    if matches!(language, Some("Chinese")) {
+        Some(format!(
+            "# 附件上下文（强制）\n用户已经为当前任务提供了以下附件/源材料：{items}\n必须基于这些附件或会话中已经提取的 `[File: ...]` 内容完成任务。不要要求用户再次上传附件、粘贴论文正文或补充文档内容；如果需要更细节，优先使用会话里的附件内容或可用的文件读取工具。"
+        ))
+    } else {
+        Some(format!(
+            "# Attachment Context (Mandatory)\nThe user has already provided the following attachment/source material for this task:{items}\nBase the work on these attachments or the already-extracted `[File: ...]` content in the conversation. Do not ask the user to upload the attachment again, paste the document, or provide its contents; if more detail is needed, use the conversation's attachment content or available file-reading tools first."
+        ))
+    }
+}
+
+fn collect_attachment_evidence_from_messages(
+    messages: &[ConversationMessage],
+) -> Vec<AttachmentEvidence> {
+    let mut evidence = messages
+        .iter()
+        .flat_map(|message| collect_attachment_evidence_from_blocks(&message.blocks))
+        .collect::<Vec<_>>();
+    evidence.sort_by(|left, right| left.label.cmp(&right.label).then(left.kind.cmp(right.kind)));
+    evidence.dedup_by(|left, right| left.label == right.label && left.kind == right.kind);
+    evidence
+}
+
+fn collect_attachment_evidence_from_blocks(blocks: &[ContentBlock]) -> Vec<AttachmentEvidence> {
+    blocks
+        .iter()
+        .flat_map(|block| match block {
+            ContentBlock::Text { text } => extract_file_attachment_markers(text),
+            ContentBlock::Image { media_type, .. } => vec![AttachmentEvidence {
+                label: format!("image attachment ({media_type})"),
+                kind: "image",
+                extracted_chars: None,
+            }],
+            ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. } => Vec::new(),
+        })
+        .collect()
+}
+
+fn extract_file_attachment_markers(text: &str) -> Vec<AttachmentEvidence> {
+    let mut evidence = Vec::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find("[File: ") {
+        let after_marker = &remaining[start + "[File: ".len()..];
+        let Some(end) = after_marker.find(']') else {
+            break;
+        };
+        let label = after_marker[..end].trim();
+        if !label.is_empty() {
+            let after_label = &after_marker[end + 1..];
+            let body = after_label.strip_prefix('\n').unwrap_or(after_label);
+            let body_end = body.find("\n[File: ").unwrap_or(body.len());
+            let extracted_chars = body[..body_end].trim().chars().count();
+            evidence.push(AttachmentEvidence {
+                label: label.to_string(),
+                kind: "text",
+                extracted_chars: (extracted_chars > 0).then_some(extracted_chars),
+            });
+        }
+        remaining = &after_marker[end + 1..];
+    }
+    evidence
 }
 
 /// Build the user-facing guidance injected when a turn re-drives after a failed
@@ -960,6 +1213,7 @@ fn detect_language_preference(text: &str) -> Option<&'static str> {
     .any(|marker| text.contains(marker))
         || [
             "respond in chinese",
+            "respond to the user in chinese",
             "answer in chinese",
             "use chinese",
             "speak chinese",
@@ -983,6 +1237,7 @@ fn detect_language_preference(text: &str) -> Option<&'static str> {
     .any(|marker| text.contains(marker))
         || [
             "respond in english",
+            "respond to the user in english",
             "answer in english",
             "use english",
             "speak english",
@@ -1345,7 +1600,8 @@ fn is_interesting_file_candidate(candidate: &str) -> bool {
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
             [
-                "rs", "ts", "tsx", "js", "jsx", "json", "toml", "yaml", "yml", "md",
+                "rs", "ts", "tsx", "js", "jsx", "json", "toml", "yaml", "yml", "md", "txt", "csv",
+                "pdf", "docx", "pptx", "xlsx", "xls",
             ]
             .iter()
             .any(|expected| extension.eq_ignore_ascii_case(expected))
@@ -1394,6 +1650,7 @@ fn tool_alias_key(normalized_key: &str) -> Option<&'static str> {
         "functionwebfetch" | "fetchurl" | "urlfetch" => Some("webfetch"),
         "read" | "readfile" | "functionreadfile" => Some("readfile"),
         "write" | "writefile" | "functionwritefile" => Some("writefile"),
+        "generate" | "generatefile" | "functiongeneratefile" => Some("generatefile"),
         "edit" | "editfile" | "functioneditfile" => Some("editfile"),
         "grep" | "grepsearch" | "functiongrepsearch" => Some("grepsearch"),
         "glob" | "globsearch" | "functionglobsearch" => Some("globsearch"),
@@ -1543,10 +1800,7 @@ fn latest_language_preference(memory: &LongTermMemory) -> Option<String> {
         .map(|entry| entry.note.clone())
 }
 
-fn active_language_preference(
-    facts: &[(MemoryKind, String, String)],
-    memory: &LongTermMemory,
-) -> Option<String> {
+fn active_language_preference(facts: &[(MemoryKind, String, String)]) -> Option<String> {
     facts
         .iter()
         .rev()
@@ -1556,7 +1810,6 @@ fn active_language_preference(
                 && !note.trim().is_empty()
         })
         .map(|(_, _, note)| note.clone())
-        .or_else(|| latest_language_preference(memory))
 }
 
 fn format_user_memory_override(facts: &[(MemoryKind, String, String)]) -> Option<String> {
@@ -2307,7 +2560,12 @@ where
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
         let requires_workspace_analysis = user_requests_current_workspace_analysis(&user_input);
-        let mut task_state = TurnTaskState::new(&user_input, requires_workspace_analysis);
+        let requires_document_generation = user_requests_document_generation(&user_input);
+        let mut task_state = TurnTaskState::new(
+            &user_input,
+            requires_workspace_analysis,
+            requires_document_generation,
+        );
         let runtime_task = if let Some(task_id) = self.resume_task_id.take() {
             self.task_registry
                 .resume(&task_id)
@@ -2356,6 +2614,9 @@ where
                 usage: None,
             })
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        task_state.set_source_attachments(collect_attachment_evidence_from_messages(
+            &self.session.messages,
+        ));
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -2417,10 +2678,13 @@ where
             effective_system_prompt.push(memory_override);
         }
         let memory = LongTermMemory::load_for_workspace(self.session.workspace_root());
-        // Explicit user/stored preference wins; otherwise default the output
-        // language to match the language the user wrote their prompt in.
-        let active_language = active_language_preference(&user_memory_facts, &memory)
-            .or_else(|| detect_input_language(&user_input));
+        // Explicit language declarations win. Otherwise default to the
+        // language the user used in this turn, and only fall back to stored
+        // language memory for language-ambiguous prompts (for example short
+        // code-only follow-ups).
+        let active_language = active_language_preference(&user_memory_facts)
+            .or_else(|| detect_input_language(&user_input))
+            .or_else(|| latest_language_preference(&memory));
         task_state.set_output_language(active_language.clone());
         if let Some(language) = &active_language {
             // Insert at the FRONT of the system prompt for maximum salience —
@@ -2448,6 +2712,14 @@ where
             format_relevant_memory_context(&memory.relevant_entries(&user_input, 12))
         {
             effective_system_prompt.push(relevant_memory);
+        }
+        if task_state.requires_document_generation {
+            if let Some(attachment_context) = format_attachment_context_prompt(
+                &task_state.source_attachments,
+                active_language.as_deref(),
+            ) {
+                effective_system_prompt.push(attachment_context);
+            }
         }
         effective_system_prompt.push(task_state.format_context());
 
@@ -2539,6 +2811,34 @@ where
                 }
                 let error = RuntimeError::new(
                     "workspace analysis required local search/read evidence, but the assistant did not request the required workspace tools before answering",
+                );
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
+            if pending_tool_uses.is_empty()
+                && task_state.requires_document_generation
+                && !task_state.document_generation_complete()
+            {
+                if !document_generation_tool_available(&available_tool_names) {
+                    let error = RuntimeError::new(
+                        "document generation request requires the generate_file tool, but generate_file is not available",
+                    );
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
+                if task_state.should_prompt_for_document_generation() {
+                    self.session
+                        .push_message(ConversationMessage::user_text(
+                            document_generation_gate_prompt(
+                                &user_input,
+                                &task_state.source_attachments,
+                            ),
+                        ))
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    continue;
+                }
+                let error = RuntimeError::new(
+                    "document generation request required a successful generate_file result, but the assistant stopped without generating the requested file",
                 );
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
@@ -3752,14 +4052,40 @@ where
                 match result {
                     NodeRunResult::Succeeded { summary } => {
                         reports.push(format!("- {} ({}): {}", node.id, node.title, summary));
-                        crate::structured_execution::NodeExecutionResult::success(summary)
+                        let artifact = crate::NodeExecutionArtifact::new(&node.id, summary.clone())
+                            .with_evidence(vec![
+                                "structured node sub-turn completed".to_string(),
+                                if node_acceptance.is_empty() {
+                                    "acceptance skipped: no node command".to_string()
+                                } else {
+                                    "acceptance satisfied".to_string()
+                                },
+                            ])
+                            .with_commands_run(node_acceptance.clone())
+                            .with_confidence_percent(if node_acceptance.is_empty() {
+                                60
+                            } else {
+                                90
+                            })
+                            .with_producer("structured-node");
+                        crate::structured_execution::NodeExecutionResult::success_with_artifact(
+                            summary, artifact,
+                        )
                     }
                     NodeRunResult::Failed { reason } => {
                         reports.push(format!(
                             "- {} ({}): FAILED — {}",
                             node.id, node.title, reason
                         ));
-                        crate::structured_execution::NodeExecutionResult::failure(reason)
+                        let artifact = crate::NodeExecutionArtifact::new(&node.id, reason.clone())
+                            .with_evidence(vec!["structured node failed".to_string()])
+                            .with_commands_run(node_acceptance.clone())
+                            .with_blocking_reason(reason.clone())
+                            .with_confidence_percent(0)
+                            .with_producer("structured-node");
+                        crate::structured_execution::NodeExecutionResult::failure_with_artifact(
+                            reason, artifact,
+                        )
                     }
                 }
             });
@@ -4210,6 +4536,8 @@ where
         let has_specific_memory = context.similar_count > 0
             || !context.successful_acceptance_tests.is_empty()
             || !context.common_failure_classes.is_empty()
+            || context.current_handoff_summary.is_some()
+            || !context.current_node_handoffs.is_empty()
             || context
                 .recovery_actions
                 .iter()
@@ -4221,6 +4549,39 @@ where
             "- Task memory type: {} ({} similar task(s))",
             context.task_type, context.similar_count
         )];
+        if let Some(summary) = context.current_handoff_summary.as_ref() {
+            lines.push(format!("- Current task handoff: {summary}"));
+        }
+        if let Some(next_node) = context.next_node_hint.as_ref() {
+            lines.push(format!("- Resume from next node: {next_node}"));
+        }
+        if !context.current_node_handoffs.is_empty() {
+            let handoffs = context
+                .current_node_handoffs
+                .iter()
+                .rev()
+                .take(5)
+                .filter_map(|artifact| {
+                    artifact.summary.as_ref().map(|summary| {
+                        format!(
+                            "{} [{}; confidence={}]: {}",
+                            artifact.node_id,
+                            artifact.status,
+                            artifact
+                                .confidence_percent
+                                .map_or_else(|| "n/a".to_string(), |value| value.to_string()),
+                            summary
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !handoffs.is_empty() {
+                lines.push(format!(
+                    "- Completed/current node artifacts: {}",
+                    handoffs.join("; ")
+                ));
+            }
+        }
         if !context.successful_acceptance_tests.is_empty() {
             lines.push(format!(
                 "- Reuse or adapt successful acceptance tests: {}",
@@ -4679,11 +5040,12 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, AlternativeApproach, ApiClient,
-        ApiRequest, AssistantEvent, AutoCompactionEvent, ChainOfThought, ConversationRuntime,
-        DecisioningEvent, DecisioningEventReporter, LongTermMemory, MemoryEntry, MemoryKind,
-        PromptCacheEvent, ReasoningStep, RuntimeError, StaticToolExecutor, ToolExecutor,
-        TurnSummary, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        build_assistant_message, parse_auto_compaction_threshold,
+        user_requests_document_generation, AlternativeApproach, ApiClient, ApiRequest,
+        AssistantEvent, AutoCompactionEvent, ChainOfThought, ConversationRuntime, DecisioningEvent,
+        DecisioningEventReporter, LongTermMemory, MemoryEntry, MemoryKind, PromptCacheEvent,
+        ReasoningStep, RuntimeError, StaticToolExecutor, ToolExecutor, TurnSummary,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{DecisioningConfig, RuntimeFeatureConfig, RuntimeHookConfig};
@@ -5009,6 +5371,122 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn document_generation_request_redrives_until_generate_file_succeeds() {
+        struct DocumentGenerationApiClient {
+            call_count: usize,
+        }
+
+        impl ApiClient for DocumentGenerationApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                match self.call_count {
+                    1 => {
+                        let attachment_context = request
+                            .system_prompt
+                            .iter()
+                            .find(|item| item.contains("附件上下文"))
+                            .cloned()
+                            .unwrap_or_default();
+                        assert!(
+                            attachment_context.contains("thesis.pdf"),
+                            "expected attachment context in system prompt, got: {attachment_context}"
+                        );
+                        assert!(
+                            attachment_context.contains("不要要求用户再次上传附件"),
+                            "expected no-reupload contract, got: {attachment_context}"
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta(
+                                "这是一篇关于复杂网络瓦解的论文分析。".to_string(),
+                            ),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    2 => {
+                        let last_user_text = request
+                            .messages
+                            .last()
+                            .and_then(|message| message.blocks.first())
+                            .and_then(|block| match block {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        assert!(last_user_text.contains("文档生成完成门禁"));
+                        assert!(last_user_text.contains("thesis.pdf"));
+                        assert!(last_user_text.contains("不要要求用户再次上传附件"));
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "generate-1".to_string(),
+                                name: "function:generate_file".to_string(),
+                                input: r#"{"path":"output/defense.pptx","format":"pptx","document_spec":{"title":"集群对抗下的多层复杂网络建模与瓦解方法","blocks":[{"type":"heading","text":"答辩汇报"}]}}"#.to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "已生成答辩 PPT：output/defense.pptx".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            DocumentGenerationApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("generate_file", |_input| {
+                Ok(r#"{"filePath":"output/defense.pptx","format":"pptx","manifestPath":"output/defense.pptx.manifest.json","quality":{"warnings":[]}}"#.to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        runtime
+            .inject_user_blocks(vec![ContentBlock::Text {
+                text: "[File: /tmp/thesis.pdf]\n论文正文：多层复杂网络建模与瓦解方法。".to_string(),
+            }])
+            .expect("attachment blocks should inject");
+
+        let summary = runtime
+            .run_turn(
+                "请依据附件中的学位论文，整理生成一份答辩用高质量的ppt电子文档。",
+                None,
+            )
+            .expect("document generation should be re-driven until generate_file succeeds");
+
+        assert!(
+            summary.iterations >= 3,
+            "expected initial prose, tool call, and final response iterations"
+        );
+        assert!(summary.tool_results.iter().any(|message| matches!(
+            &message.blocks[0],
+            ContentBlock::ToolResult {
+                tool_name,
+                is_error: false,
+                ..
+            } if tool_name == "generate_file"
+        )));
+    }
+
+    #[test]
+    fn document_generation_detector_avoids_code_quality_review_requests() {
+        assert!(user_requests_document_generation(
+            "请依据附件中的学位论文，整理生成一份答辩用高质量的ppt电子文档。"
+        ));
+        assert!(user_requests_document_generation(
+            "Create an Excel workbook with formulas and charts from this data."
+        ));
+        assert!(!user_requests_document_generation(
+            "请阅读这篇论文并总结主要观点。"
+        ));
+        assert!(!user_requests_document_generation(
+            "请检查文档生成代码是否完善。"
+        ));
+    }
+
     struct UnsupportedToolApiClient {
         call_count: usize,
     }
@@ -5320,6 +5798,63 @@ mod tests {
     }
 
     #[test]
+    fn current_chinese_input_overrides_stored_english_language_preference() {
+        struct LangProbeApi {
+            saw_chinese_contract: std::rc::Rc<std::cell::Cell<bool>>,
+        }
+        impl ApiClient for LangProbeApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let system = request.system_prompt.join("\n");
+                if system.contains("Output-language contract: respond to the user in Chinese") {
+                    self.saw_chinese_contract.set(true);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("好的".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "himalaya-lang-current-wins-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join(".Himalaya")).expect("workspace");
+        let mut memory = LongTermMemory::load_for_workspace(Some(&root));
+        memory.add_typed_entry(
+            MemoryKind::LanguagePreference,
+            "language_preference",
+            "English",
+            0.99,
+        );
+
+        let saw = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut runtime = ConversationRuntime::new(
+            Session::new().with_workspace_root(root.clone()),
+            LangProbeApi {
+                saw_chinese_contract: saw.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let _ = runtime.run_turn(
+            "请依据附件中的学位论文，整理生成一份答辩用高质量的ppt电子文档。",
+            None,
+        );
+        assert!(
+            saw.get(),
+            "current Chinese input should override stale stored English preference"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn language_preference_persists_as_output_contract_across_turns() {
         struct InspectingLanguageApi {
             call_count: usize,
@@ -5401,6 +5936,15 @@ mod tests {
                 && note == "拉雅"
         }));
         assert!(facts.iter().any(|(kind, topic, note)| {
+            *kind == MemoryKind::LanguagePreference
+                && topic == "language_preference"
+                && note == "Chinese"
+        }));
+
+        let prefixed = super::extract_user_memory_facts(
+            "[Persistent interaction language: respond to the user in Chinese unless they explicitly change language.]\n\n请生成一份PPT。",
+        );
+        assert!(prefixed.iter().any(|(kind, topic, note)| {
             *kind == MemoryKind::LanguagePreference
                 && topic == "language_preference"
                 && note == "Chinese"
@@ -7285,7 +7829,7 @@ mod tests {
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
                     return Ok(vec![
                         AssistantEvent::TextDelta(
-                            "{\"steps\":[{\"id\":\"design\",\"title\":\"Design\"},{\"id\":\"impl\",\"title\":\"Implement\",\"depends_on\":[\"design\"]}],\"notes\":[\"plan\"]}".to_string(),
+                            "{\"steps\":[{\"id\":\"design\",\"title\":\"Design\"},{\"id\":\"impl\",\"title\":\"Implement\",\"depends_on\":[\"design\"],\"acceptance\":[\"python3 --version\"]}],\"notes\":[\"plan\"]}".to_string(),
                         ),
                         AssistantEvent::MessageStop,
                     ]);
@@ -7356,7 +7900,7 @@ mod tests {
                 if phase == "Planning" {
                     return Ok(vec![
                         AssistantEvent::TextDelta(
-                            "{\"steps\":[{\"id\":\"first\",\"title\":\"First\"},{\"id\":\"second\",\"title\":\"Second\",\"depends_on\":[\"first\"]}]}".to_string(),
+                            "{\"steps\":[{\"id\":\"first\",\"title\":\"First\"},{\"id\":\"second\",\"title\":\"Second\",\"depends_on\":[\"first\"],\"acceptance\":[\"python3 --version\"]}]}".to_string(),
                         ),
                         AssistantEvent::MessageStop,
                     ]);
@@ -7442,9 +7986,9 @@ mod tests {
         )
         .expect("script");
 
-        // Planning returns a one-node plan with an acceptance command. The node
-        // sub-turn (Coding) creates the marker only on its SECOND invocation, so
-        // the first acceptance check fails and the node must re-drive.
+        // Planning returns a small chain with a leaf acceptance command. The
+        // build node creates the marker only on its SECOND invocation, so the
+        // first acceptance check fails and the node must re-drive.
         #[derive(Clone)]
         struct NodeRedriveApi {
             node_calls: Arc<Mutex<usize>>,
@@ -7460,7 +8004,7 @@ mod tests {
                     .unwrap_or_default();
                 if phase == "Planning" {
                     let json = format!(
-                        "{{\"steps\":[{{\"id\":\"build\",\"title\":\"Build\",\"acceptance\":[{}]}}]}}",
+                        "{{\"steps\":[{{\"id\":\"analyze\",\"title\":\"Analyze\"}},{{\"id\":\"build\",\"title\":\"Build\",\"depends_on\":[\"analyze\"],\"acceptance\":[{}]}}]}}",
                         serde_json::to_string(&self.accept_cmd).unwrap()
                     );
                     return Ok(vec![
@@ -7477,7 +8021,9 @@ mod tests {
                         _ => None,
                     })
                     .collect::<String>();
-                if user_text.contains("Focus only on this step") {
+                if user_text.contains("Focus only on this step")
+                    && user_text.contains("- id: build")
+                {
                     let mut calls = self
                         .node_calls
                         .lock()
@@ -7557,10 +8103,10 @@ mod tests {
                     .map(|r| format!("{:?}", r.phase))
                     .unwrap_or_default();
                 if phase == "Planning" {
-                    // One node with high estimated_effort.
+                    // High estimated_effort on the leaf node.
                     return Ok(vec![
                         AssistantEvent::TextDelta(
-                            "{\"steps\":[{\"id\":\"hard\",\"title\":\"Hard step\",\"estimated_effort\":5}]}".to_string(),
+                            "{\"steps\":[{\"id\":\"prep\",\"title\":\"Prep\"},{\"id\":\"hard\",\"title\":\"Hard step\",\"depends_on\":[\"prep\"],\"estimated_effort\":5,\"acceptance\":[\"python3 --version\"]}]}".to_string(),
                         ),
                         AssistantEvent::MessageStop,
                     ]);
@@ -7667,10 +8213,11 @@ mod tests {
                 // Planning is used for the structured plan AND the architect.
                 // Distinguish by the architect role marker in the prompt.
                 if phase == "Planning" && !user_text.contains("Role: architect") {
-                    // Structured plan: one high-effort node.
+                    // Structured plan: a prep step followed by one high-effort
+                    // leaf node.
                     return Ok(vec![
                         AssistantEvent::TextDelta(
-                            "{\"steps\":[{\"id\":\"core\",\"title\":\"Core work\",\"estimated_effort\":5}]}".to_string(),
+                            "{\"steps\":[{\"id\":\"prep\",\"title\":\"Prep\"},{\"id\":\"core\",\"title\":\"Core work\",\"depends_on\":[\"prep\"],\"estimated_effort\":5,\"acceptance\":[\"python3 --version\"]}]}".to_string(),
                         ),
                         AssistantEvent::MessageStop,
                     ]);
@@ -7800,7 +8347,7 @@ mod tests {
                 if phase == "Planning" && !user_text.contains("Role: architect") {
                     return Ok(vec![
                         AssistantEvent::TextDelta(
-                            "{\"steps\":[{\"id\":\"core\",\"title\":\"Core\",\"estimated_effort\":5}]}".to_string(),
+                            "{\"steps\":[{\"id\":\"prep\",\"title\":\"Prep\"},{\"id\":\"core\",\"title\":\"Core\",\"depends_on\":[\"prep\"],\"estimated_effort\":5,\"acceptance\":[\"python3 --version\"]}]}".to_string(),
                         ),
                         AssistantEvent::MessageStop,
                     ]);
@@ -7922,7 +8469,7 @@ mod tests {
                 if phase == "Planning" && !user_text.contains("Role: architect") {
                     return Ok(vec![
                         AssistantEvent::TextDelta(
-                            "{\"steps\":[{\"id\":\"core\",\"title\":\"Core\",\"estimated_effort\":5}]}".to_string(),
+                            "{\"steps\":[{\"id\":\"prep\",\"title\":\"Prep\"},{\"id\":\"core\",\"title\":\"Core\",\"depends_on\":[\"prep\"],\"estimated_effort\":5,\"acceptance\":[\"python3 --version\"]}]}".to_string(),
                         ),
                         AssistantEvent::MessageStop,
                     ]);

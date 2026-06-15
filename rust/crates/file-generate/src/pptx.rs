@@ -283,6 +283,94 @@ fn render_body_xml(blocks: &[&Block]) -> String {
                     .expect("bullet XML write should succeed");
                 }
             }
+            Block::Table(table) => {
+                if let Some(caption) = &table.caption {
+                    write!(
+                        &mut paras,
+                        r#"<a:p><a:r><a:rPr lang="zh-CN" sz="1700" b="1"/><a:t>{}</a:t></a:r></a:p>"#,
+                        xml_escape(caption)
+                    )
+                    .expect("table caption XML write should succeed");
+                }
+                if !table.headers.is_empty() {
+                    write!(
+                        &mut paras,
+                        r#"<a:p><a:r><a:rPr lang="zh-CN" sz="1500" b="1"/><a:t>{}</a:t></a:r></a:p>"#,
+                        xml_escape(&table.headers.join(" | "))
+                    )
+                    .expect("table header XML write should succeed");
+                }
+                for row in &table.rows {
+                    write!(
+                        &mut paras,
+                        r#"<a:p><a:r><a:rPr lang="zh-CN" sz="1450"/><a:t>{}</a:t></a:r></a:p>"#,
+                        xml_escape(&row.join(" | "))
+                    )
+                    .expect("table row XML write should succeed");
+                }
+            }
+            Block::Formula(formula) => {
+                write!(
+                    &mut paras,
+                    r#"<a:p><a:r><a:rPr lang="zh-CN" sz="1700" i="1"/><a:t>{}</a:t></a:r></a:p>"#,
+                    xml_escape(&format!("Formula: {formula}"))
+                )
+                .expect("formula XML write should succeed");
+            }
+            Block::Chart(chart) => {
+                write!(
+                    &mut paras,
+                    r#"<a:p><a:r><a:rPr lang="zh-CN" sz="1700" b="1"/><a:t>{}</a:t></a:r></a:p>"#,
+                    xml_escape(&format!("Chart: {} ({})", chart.title, chart.kind))
+                )
+                .expect("chart title XML write should succeed");
+                let max_value = chart
+                    .series
+                    .iter()
+                    .flat_map(|series| &series.values)
+                    .filter_map(|value| value.parse::<f64>().ok())
+                    .fold(0.0_f64, f64::max);
+                for (idx, label) in chart.labels.iter().enumerate() {
+                    let value = chart
+                        .series
+                        .first()
+                        .and_then(|series| series.values.get(idx))
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .unwrap_or_default();
+                    let bar_len = if max_value > 0.0 {
+                        ((value / max_value) * 24.0).round() as usize
+                    } else {
+                        0
+                    };
+                    write!(
+                        &mut paras,
+                        r#"<a:p><a:r><a:rPr lang="zh-CN" sz="1450"/><a:t>{}</a:t></a:r></a:p>"#,
+                        xml_escape(&format!("{label}: {} {:.2}", "#".repeat(bar_len), value))
+                    )
+                    .expect("chart row XML write should succeed");
+                }
+            }
+            Block::Image(image) => {
+                write!(
+                    &mut paras,
+                    r#"<a:p><a:r><a:rPr lang="zh-CN" sz="1450"/><a:t>{}</a:t></a:r></a:p>"#,
+                    xml_escape(&format!(
+                        "Image: {}{}{}",
+                        image.path,
+                        image
+                            .alt
+                            .as_ref()
+                            .map(|alt| format!(" | Alt: {alt}"))
+                            .unwrap_or_default(),
+                        image
+                            .caption
+                            .as_ref()
+                            .map(|caption| format!(" | Caption: {caption}"))
+                            .unwrap_or_default()
+                    ))
+                )
+                .expect("image XML write should succeed");
+            }
         }
     }
     format!(

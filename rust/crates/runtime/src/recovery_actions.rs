@@ -580,6 +580,9 @@ mod tests {
                 success_rate: 1.0,
             }],
             route_failure_rate: None,
+            current_node_handoffs: Vec::new(),
+            current_handoff_summary: None,
+            next_node_hint: None,
             recommendations: Vec::new(),
         };
 

@@ -379,8 +379,49 @@ cd rust
 ./target/debug/Himalaya agents
 ./target/debug/Himalaya mcp
 ./target/debug/Himalaya skills
+./target/debug/Himalaya skills show demo
+./target/debug/Himalaya skills doctor
 ./target/debug/Himalaya system-prompt --cwd .. --date 2026-04-04
 ```
+
+### Document generation
+
+The agent can generate professional binary documents through the `generate_file` tool:
+
+- Word reports: `docx`
+- PowerPoint decks: `pptx` or `ppt`
+- Printable documents: `pdf`
+- Excel workbooks: `xlsx` or `xls`
+
+For quick drafts, ask for markdown-style content. For richer output, ask the agent to use a structured `document_spec` with headings, tables, LaTeX formulas, chart data, images, workbook sheets, and Excel formulas. Every generated file also gets a sibling quality manifest such as `report.docx.manifest.json`.
+
+Example prompt:
+
+```text
+Use $document-generator to create docs/investment-report.docx with an executive summary, a metrics table, an NPV formula, a revenue chart, and a quality manifest.
+```
+
+### Skills
+
+Skills are local instruction packs stored as `SKILL.md` files:
+
+```text
+.Himalaya/skills/<name>/SKILL.md
+```
+
+Each skill can include frontmatter:
+
+```markdown
+---
+name: demo
+description: Demo workflow guidance
+---
+
+# Demo
+Follow this workflow when invoked.
+```
+
+Invoke a skill with `$demo args`, `/skills demo args`, or the bare skill name in the REPL. `Himalaya skills list --output-format json` includes `path`, `invoke_as`, `source`, `origin`, and `shadowed_by` fields. Project skills take precedence over user roots; shadowed lower-priority skills remain visible for debugging. Use `Himalaya skills show <skill>` for one skill and `Himalaya skills doctor` for duplicate or missing-description checks.
 
 
 ## Durable task scheduler daemon

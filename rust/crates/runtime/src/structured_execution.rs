@@ -13,8 +13,13 @@
 //! calls into it. Nothing here changes behavior unless the gate is on.
 
 use crate::decisioning::{ExecutionMode, Subtask, TaskPlan};
-use crate::{PlanDag, PlanDagEdge, PlanDagEdgeKind, PlanDagNode, PlanNodeKind};
+use crate::{
+    NodeExecutionArtifact, PlanDag, PlanDagEdge, PlanDagEdgeKind, PlanDagNode, PlanNodeKind,
+};
 use serde::Deserialize;
+
+const MIN_STRUCTURED_PLAN_STEPS: usize = 2;
+const MAX_STRUCTURED_PLAN_STEPS: usize = 7;
 
 /// Why a turn did or did not take the structured execution path. Recorded so
 /// callers (and tests) can assert the gating decision without reaching into
@@ -181,6 +186,59 @@ pub struct ValidatedStructuredPlan {
     pub plan: TaskPlan,
     pub dependencies: Vec<(String, String)>,
     pub acceptance: Vec<(String, Vec<String>)>,
+    pub quality: PlanQualityReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanQualitySeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanQualityIssue {
+    pub severity: PlanQualitySeverity,
+    pub node_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlanQualityReport {
+    pub issues: Vec<PlanQualityIssue>,
+}
+
+impl PlanQualityReport {
+    #[must_use]
+    pub fn has_errors(&self) -> bool {
+        self.issues
+            .iter()
+            .any(|issue| issue.severity == PlanQualitySeverity::Error)
+    }
+
+    #[must_use]
+    pub fn error_messages(&self) -> Vec<String> {
+        self.issues
+            .iter()
+            .filter(|issue| issue.severity == PlanQualitySeverity::Error)
+            .map(|issue| issue.message.clone())
+            .collect()
+    }
+
+    fn push_error(&mut self, node_id: Option<String>, message: impl Into<String>) {
+        self.issues.push(PlanQualityIssue {
+            severity: PlanQualitySeverity::Error,
+            node_id,
+            message: message.into(),
+        });
+    }
+
+    fn push_warning(&mut self, node_id: Option<String>, message: impl Into<String>) {
+        self.issues.push(PlanQualityIssue {
+            severity: PlanQualitySeverity::Warning,
+            node_id,
+            message: message.into(),
+        });
+    }
 }
 
 /// Parse and validate a model-produced structured plan JSON string into a
@@ -191,7 +249,9 @@ pub struct ValidatedStructuredPlan {
 #[must_use]
 pub fn parse_structured_plan(task_id: &str, json: &str) -> Option<ValidatedStructuredPlan> {
     let parsed: StructuredPlan = serde_json::from_str(json.trim()).ok()?;
-    if parsed.steps.is_empty() {
+    if parsed.steps.len() < MIN_STRUCTURED_PLAN_STEPS
+        || parsed.steps.len() > MAX_STRUCTURED_PLAN_STEPS
+    {
         return None;
     }
     let mut ids = std::collections::BTreeSet::new();
@@ -215,6 +275,10 @@ pub fn parse_structured_plan(task_id: &str, json: &str) -> Option<ValidatedStruc
             }
             dependencies.push((dep.to_string(), step.id.trim().to_string()));
         }
+    }
+    let quality = review_structured_plan_quality(&parsed, &dependencies);
+    if quality.has_errors() {
+        return None;
     }
 
     let steps = parsed
@@ -263,7 +327,102 @@ pub fn parse_structured_plan(task_id: &str, json: &str) -> Option<ValidatedStruc
         plan,
         dependencies,
         acceptance,
+        quality,
     })
+}
+
+#[must_use]
+pub fn review_structured_plan_quality(
+    parsed: &StructuredPlan,
+    dependencies: &[(String, String)],
+) -> PlanQualityReport {
+    let mut report = PlanQualityReport::default();
+    if parsed.steps.len() < MIN_STRUCTURED_PLAN_STEPS {
+        report.push_error(
+            None,
+            format!("structured plan needs at least {MIN_STRUCTURED_PLAN_STEPS} executable steps"),
+        );
+    }
+    if parsed.steps.len() > MAX_STRUCTURED_PLAN_STEPS {
+        report.push_error(
+            None,
+            format!("structured plan exceeds {MAX_STRUCTURED_PLAN_STEPS} executable steps"),
+        );
+    }
+
+    let ids = parsed
+        .steps
+        .iter()
+        .map(|step| step.id.trim().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    let dependents = dependencies
+        .iter()
+        .map(|(from, _to)| from.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for step in &parsed.steps {
+        let id = step.id.trim().to_string();
+        if !step.acceptance.iter().any(|item| !item.trim().is_empty()) && !dependents.contains(&id)
+        {
+            report.push_error(
+                Some(id),
+                "leaf structured-plan step must declare at least one acceptance command",
+            );
+        }
+        if step.estimated_effort.unwrap_or(1) > 5 {
+            report.push_warning(
+                Some(step.id.trim().to_string()),
+                "structured-plan step effort is high; prefer smaller child steps",
+            );
+        }
+    }
+
+    if has_dependency_cycle(&ids, dependencies) {
+        report.push_error(None, "structured plan dependencies contain a cycle");
+    }
+
+    report
+}
+
+fn has_dependency_cycle(
+    ids: &std::collections::BTreeSet<String>,
+    dependencies: &[(String, String)],
+) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum VisitState {
+        Visiting,
+        Done,
+    }
+
+    let mut graph = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for id in ids {
+        graph.entry(id.clone()).or_default();
+    }
+    for (from, to) in dependencies {
+        graph.entry(from.clone()).or_default().push(to.clone());
+    }
+    let mut state = std::collections::BTreeMap::<String, VisitState>::new();
+
+    fn visit(
+        node: &str,
+        graph: &std::collections::BTreeMap<String, Vec<String>>,
+        state: &mut std::collections::BTreeMap<String, VisitState>,
+    ) -> bool {
+        match state.get(node).copied() {
+            Some(VisitState::Visiting) => return true,
+            Some(VisitState::Done) => return false,
+            None => {}
+        }
+        state.insert(node.to_string(), VisitState::Visiting);
+        for child in graph.get(node).into_iter().flatten() {
+            if visit(child, graph, state) {
+                return true;
+            }
+        }
+        state.insert(node.to_string(), VisitState::Done);
+        false
+    }
+
+    ids.iter().any(|id| visit(id, &graph, &mut state))
 }
 
 /// Build a `PlanDag` from a validated structured plan, honoring the explicit
@@ -327,6 +486,7 @@ pub struct NodeExecutionResult {
     pub succeeded: bool,
     /// Short human-readable outcome (success summary or failure class).
     pub summary: String,
+    pub artifact: Option<NodeExecutionArtifact>,
 }
 
 impl NodeExecutionResult {
@@ -335,6 +495,19 @@ impl NodeExecutionResult {
         Self {
             succeeded: true,
             summary: summary.into(),
+            artifact: None,
+        }
+    }
+
+    #[must_use]
+    pub fn success_with_artifact(
+        summary: impl Into<String>,
+        artifact: NodeExecutionArtifact,
+    ) -> Self {
+        Self {
+            succeeded: true,
+            summary: summary.into(),
+            artifact: Some(artifact),
         }
     }
 
@@ -343,6 +516,19 @@ impl NodeExecutionResult {
         Self {
             succeeded: false,
             summary: summary.into(),
+            artifact: None,
+        }
+    }
+
+    #[must_use]
+    pub fn failure_with_artifact(
+        summary: impl Into<String>,
+        artifact: NodeExecutionArtifact,
+    ) -> Self {
+        Self {
+            succeeded: false,
+            summary: summary.into(),
+            artifact: Some(artifact),
         }
     }
 }
@@ -420,10 +606,21 @@ where
             dispatched += 1;
             let result = execute_node(&node);
             if result.succeeded {
-                let _ = execution.succeed_node(dag, &node_id, Some(result.summary));
+                let _ = execution.succeed_node_with_artifact(
+                    dag,
+                    &node_id,
+                    Some(result.summary),
+                    result.artifact,
+                );
                 completed.push(node_id);
             } else {
-                let _ = execution.fail_node(dag, &node_id, result.summary);
+                let summary = result.summary;
+                let _ = execution.fail_node(dag, &node_id, summary);
+                if let Some(artifact) = result.artifact {
+                    if let Some(node) = execution.nodes.get_mut(&node_id) {
+                        node.artifact = Some(artifact);
+                    }
+                }
                 failed.push(node_id);
             }
         }
@@ -588,9 +785,15 @@ mod tests {
 
     #[test]
     fn rejects_plan_with_unknown_or_self_dependency() {
-        let unknown = r#"{"steps":[{"id":"a","title":"A","depends_on":["ghost"]}]}"#;
+        let unknown = r#"{"steps":[
+            {"id":"a","title":"A","depends_on":["ghost"],"acceptance":["cargo test"]},
+            {"id":"b","title":"B","depends_on":["a"],"acceptance":["cargo test"]}
+        ]}"#;
         assert!(parse_structured_plan("t", unknown).is_none());
-        let self_dep = r#"{"steps":[{"id":"a","title":"A","depends_on":["a"]}]}"#;
+        let self_dep = r#"{"steps":[
+            {"id":"a","title":"A","depends_on":["a"],"acceptance":["cargo test"]},
+            {"id":"b","title":"B","depends_on":["a"],"acceptance":["cargo test"]}
+        ]}"#;
         assert!(parse_structured_plan("t", self_dep).is_none());
     }
 
@@ -598,10 +801,31 @@ mod tests {
     fn rejects_malformed_or_empty_or_duplicate_plan() {
         assert!(parse_structured_plan("t", "not json").is_none());
         assert!(parse_structured_plan("t", r#"{"steps":[]}"#).is_none());
-        let dup = r#"{"steps":[{"id":"a","title":"A"},{"id":"a","title":"B"}]}"#;
+        let dup = r#"{"steps":[
+            {"id":"a","title":"A","acceptance":["cargo test"]},
+            {"id":"a","title":"B","acceptance":["cargo test"]}
+        ]}"#;
         assert!(parse_structured_plan("t", dup).is_none());
-        let blank = r#"{"steps":[{"id":"  ","title":"A"}]}"#;
+        let blank = r#"{"steps":[
+            {"id":"  ","title":"A","acceptance":["cargo test"]},
+            {"id":"b","title":"B","acceptance":["cargo test"]}
+        ]}"#;
         assert!(parse_structured_plan("t", blank).is_none());
+    }
+
+    #[test]
+    fn rejects_cycles_and_leaf_steps_without_acceptance() {
+        let cycle = r#"{"steps":[
+            {"id":"a","title":"A","depends_on":["b"],"acceptance":["cargo test"]},
+            {"id":"b","title":"B","depends_on":["a"],"acceptance":["cargo test"]}
+        ]}"#;
+        assert!(parse_structured_plan("t", cycle).is_none());
+
+        let missing_leaf_acceptance = r#"{"steps":[
+            {"id":"a","title":"A"},
+            {"id":"b","title":"B","depends_on":["a"]}
+        ]}"#;
+        assert!(parse_structured_plan("t", missing_leaf_acceptance).is_none());
     }
 
     #[test]
@@ -609,7 +833,7 @@ mod tests {
         let json = r#"{
             "steps": [
                 {"id": "a", "title": "A"},
-                {"id": "b", "title": "B", "depends_on": ["a"]}
+                {"id": "b", "title": "B", "depends_on": ["a"], "acceptance": ["cargo test"]}
             ]
         }"#;
         let validated = parse_structured_plan("task-9", json).expect("valid");
@@ -634,7 +858,7 @@ mod tests {
         let json = r#"{"steps":[
             {"id":"a","title":"A"},
             {"id":"b","title":"B","depends_on":["a"]},
-            {"id":"c","title":"C","depends_on":["b"]}
+            {"id":"c","title":"C","depends_on":["b"],"acceptance":["cargo test"]}
         ]}"#;
         parse_structured_plan("task", json).expect("valid chain")
     }

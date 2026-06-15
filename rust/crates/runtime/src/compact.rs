@@ -3,7 +3,7 @@ use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 const COMPACT_CONTINUATION_PREAMBLE: &str =
     "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
 const COMPACT_RECENT_MESSAGES_NOTE: &str = "Recent messages are preserved verbatim.";
-const COMPACT_DIRECT_RESUME_INSTRUCTION: &str = "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, and do not preface with continuation text.";
+const COMPACT_DIRECT_RESUME_INSTRUCTION: &str = "Continue the conversation from where it left off without asking the user any further questions. The summary is private continuity context: never quote it, append it, or present headings such as Active Objective, Decisions Made, Tool Results, or Pending Next Steps as user-facing output. Resume directly — do not acknowledge the summary, do not recap what was happening, and do not preface with continuation text.";
 
 /// Thresholds controlling when and how a session is compacted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +268,7 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
     let active_objective = infer_active_objective(messages);
     let pending_work = infer_pending_work(messages);
     let key_files = collect_key_files(messages);
+    let source_attachments = collect_source_attachments(messages);
     let current_work = infer_current_work(messages);
     let (successful_tools, failed_tools) = collect_tool_result_summaries(messages);
     let evidence_sources = collect_evidence_sources(messages);
@@ -294,6 +295,13 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
 
     if !key_files.is_empty() {
         lines.push(format!("- Key files referenced: {}.", key_files.join(", ")));
+    }
+
+    if !source_attachments.is_empty() {
+        lines.push(format!(
+            "- User-provided attachments before compaction: {}.",
+            source_attachments.join(", ")
+        ));
     }
 
     if !evidence_sources.is_empty() {
@@ -558,6 +566,43 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
     files.into_iter().take(8).collect()
 }
 
+fn collect_source_attachments(messages: &[ConversationMessage]) -> Vec<String> {
+    let mut attachments = messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .flat_map(|block| match block {
+            ContentBlock::Text { text } => extract_file_attachment_labels(text),
+            ContentBlock::Image { media_type, .. } => {
+                vec![format!("image attachment ({media_type})")]
+            }
+            ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. } => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    attachments.sort();
+    attachments.dedup();
+    attachments.into_iter().take(8).collect()
+}
+
+fn extract_file_attachment_labels(content: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut remaining = content;
+    while let Some(start) = remaining.find("[File: ") {
+        let after_marker = &remaining[start + "[File: ".len()..];
+        let Some(end) = after_marker.find(']') else {
+            break;
+        };
+        let label = after_marker[..end].trim();
+        if !label.is_empty() {
+            labels.push(label.to_string());
+        }
+        remaining = &after_marker[end + 1..];
+    }
+    labels
+}
+
 fn infer_current_work(messages: &[ConversationMessage]) -> Option<String> {
     messages
         .iter()
@@ -585,7 +630,8 @@ fn has_interesting_extension(candidate: &str) -> bool {
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
             [
-                "rs", "ts", "tsx", "js", "jsx", "json", "toml", "yaml", "yml", "md",
+                "rs", "ts", "tsx", "js", "jsx", "json", "toml", "yaml", "yml", "md", "txt", "csv",
+                "pdf", "docx", "pptx", "xlsx", "xls",
             ]
             .iter()
             .any(|expected| extension.eq_ignore_ascii_case(expected))
@@ -982,6 +1028,30 @@ mod tests {
         )]);
         assert!(files.contains(&"rust/crates/runtime/src/compact.rs".to_string()));
         assert!(files.contains(&"rust/crates/rusty-Himalaya-cli/src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn compaction_summary_preserves_user_provided_attachment_names() {
+        let mut session = large_session();
+        session.messages.insert(
+            0,
+            ConversationMessage::user_text("[File: /tmp/thesis.pdf]\n论文正文 ".repeat(200)),
+        );
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 1,
+                max_estimated_tokens: 1,
+            },
+        );
+
+        assert!(
+            result
+                .formatted_summary
+                .contains("User-provided attachments before compaction: /tmp/thesis.pdf."),
+            "expected attachment provenance in summary, got: {}",
+            result.formatted_summary
+        );
     }
 
     /// Regression: compaction must not split an assistant(ToolUse) /

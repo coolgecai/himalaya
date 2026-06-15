@@ -382,10 +382,22 @@ export class HimalayaCli {
           const skill = entry as Record<string, unknown>;
           const name = typeof skill.name === 'string' ? skill.name : '';
           if (!name) { return null; }
+          const sourceValue = skill.source;
+          const originValue = skill.origin;
+          const source =
+            typeof sourceValue === 'string'
+              ? sourceValue
+              : sourceValue && typeof sourceValue === 'object'
+                ? String((sourceValue as Record<string, unknown>).label ?? (sourceValue as Record<string, unknown>).id ?? '')
+                : originValue && typeof originValue === 'object'
+                  ? String((originValue as Record<string, unknown>).detail_label ?? (originValue as Record<string, unknown>).id ?? '')
+                  : typeof originValue === 'string'
+                    ? originValue
+                    : '';
           return {
             name,
             description: typeof skill.description === 'string' ? skill.description : '',
-            source: typeof skill.source === 'string' ? skill.source : (typeof skill.origin === 'string' ? skill.origin : ''),
+            source,
             path: typeof skill.path === 'string' ? skill.path : '',
             shadowed: Boolean(skill.shadowed_by)
           };
@@ -404,7 +416,9 @@ export class HimalayaCli {
     try {
       const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
       if (typeof parsed.message === 'string') { message = parsed.message; }
-      else if (parsed.result && typeof parsed.result === 'object') {
+      else if (typeof parsed.invocation_name === 'string') {
+        message = `Installed ${parsed.invocation_name}`;
+      } else if (parsed.result && typeof parsed.result === 'object') {
         const r = parsed.result as Record<string, unknown>;
         message = typeof r.invocation_name === 'string' ? `Installed ${r.invocation_name}` : message;
       }

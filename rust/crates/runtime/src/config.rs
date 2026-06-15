@@ -1536,6 +1536,9 @@ fn parse_model_route_config(value: &JsonValue, context: &str) -> Result<ModelRou
     if let Some(max_tokens) = optional_u32(object, "maxTokens", context)? {
         route.max_tokens = Some(max_tokens);
     }
+    if let Some(context_window) = optional_u32(object, "contextWindow", context)? {
+        route = route.with_context_window(context_window);
+    }
     let cost_weight =
         optional_u16(object, "costWeight", context)?.unwrap_or(u16::from(route.cost_weight));
     let latency_weight =
@@ -1546,6 +1549,23 @@ fn parse_model_route_config(value: &JsonValue, context: &str) -> Result<ModelRou
         cost_weight as u8,
         latency_weight as u8,
         quality_weight as u8,
+    );
+    let schema_reliability = optional_u16(object, "schemaReliability", context)?
+        .unwrap_or(u16::from(route.schema_reliability));
+    let planning_score =
+        optional_u16(object, "planningScore", context)?.unwrap_or(u16::from(route.planning_score));
+    let verification_score = optional_u16(object, "verificationScore", context)?
+        .unwrap_or(u16::from(route.verification_score));
+    let max_task_complexity =
+        optional_u16(object, "maxTaskComplexity", context)?.map(|value| value.clamp(1, 5) as u8);
+    let requires_supervisor =
+        optional_bool(object, "requiresSupervisor", context)?.unwrap_or(route.requires_supervisor);
+    route = route.with_model_profile(
+        schema_reliability as u8,
+        planning_score as u8,
+        verification_score as u8,
+        max_task_complexity,
+        requires_supervisor,
     );
     Ok(route)
 }
@@ -2099,7 +2119,13 @@ mod tests {
                     "capabilities": ["verification", "test_generation"],
                     "qualityWeight": 8,
                     "latencyWeight": 2,
-                    "costWeight": 1
+                    "costWeight": 1,
+                    "contextWindow": 200000,
+                    "schemaReliability": 91,
+                    "planningScore": 70,
+                    "verificationScore": 96,
+                    "maxTaskComplexity": 5,
+                    "requiresSupervisor": true
                   }
                 ]
               }
@@ -2117,6 +2143,12 @@ mod tests {
         assert_eq!(routing.routes()[0].role, ModelRoutePhase::Verification);
         assert_eq!(routing.routes()[0].model, "opus");
         assert_eq!(routing.routes()[0].quality_weight, 8);
+        assert_eq!(routing.routes()[0].context_window, Some(200_000));
+        assert_eq!(routing.routes()[0].schema_reliability, 91);
+        assert_eq!(routing.routes()[0].planning_score, 70);
+        assert_eq!(routing.routes()[0].verification_score, 96);
+        assert_eq!(routing.routes()[0].max_task_complexity, Some(5));
+        assert!(routing.routes()[0].requires_supervisor);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

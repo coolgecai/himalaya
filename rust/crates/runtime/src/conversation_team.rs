@@ -12,7 +12,6 @@ use super::{
     current_time_millis, ApiClient, ApiRequest, AssistantEvent, ConversationMessage,
     ConversationRuntime, ModelRouteDecision, NodeRunResult, NodeVerifyOutcome, ToolExecutor,
 };
-use crate::TeamExecutionLedger;
 
 pub(super) const TEAM_ARCHITECT_SYSTEM_PROMPT: &str = "You are the Architect in a multi-role coding team. For the given step, produce a short, concrete approach brief: the intended solution shape, key decisions, and risks to watch. Do not implement; just set direction in a few sentences.";
 
@@ -149,11 +148,19 @@ where
         kind: crate::TeamExecutionEventKind,
         message: String,
     ) {
-        let mut ledger = TeamExecutionLedger::new(
-            format!("team-{}", self.session.session_id),
-            task_id.to_string(),
-        );
-        let event = ledger.push(role, kind, None, Some(message));
+        let seq = self
+            .task_registry
+            .get(task_id)
+            .map_or(1, |task| task.team_events.len() as u64 + 1);
+        let event = crate::TeamExecutionEvent {
+            seq,
+            team_id: format!("team-{}", self.session.session_id),
+            task_id: task_id.to_string(),
+            role,
+            kind,
+            model_route: None,
+            message: Some(message),
+        };
         self.emit_team_execution_event_for_task(task_id, event);
     }
 
@@ -233,7 +240,9 @@ where
             Some(context),
         );
         match review {
-            None => crate::team_convergence::ReviewVerdict::Approve,
+            None => crate::team_convergence::ReviewVerdict::RequestChanges {
+                reasons: "reviewer produced no verdict".to_string(),
+            },
             Some((text, _route)) => {
                 let upper = text.to_ascii_uppercase();
                 if upper.contains("REQUEST_CHANGES") || upper.contains("CHANGES NEEDED") {

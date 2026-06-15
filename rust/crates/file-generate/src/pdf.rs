@@ -132,6 +132,135 @@ pub fn generate_pdf(path: &Path, blocks: &[Block]) -> Result<(), GenerateError> 
                 }
                 y -= SIZE_BODY * 0.4;
             }
+            Block::Table(table) => {
+                if let Some(caption) = &table.caption {
+                    y = emit_wrapped_block(
+                        &mut doc,
+                        &mut ops,
+                        &mut page_ids,
+                        resources_id,
+                        pages_id,
+                        y,
+                        "F2",
+                        SIZE_BODY,
+                        caption,
+                    );
+                }
+                if !table.headers.is_empty() {
+                    y = emit_wrapped_block(
+                        &mut doc,
+                        &mut ops,
+                        &mut page_ids,
+                        resources_id,
+                        pages_id,
+                        y,
+                        "F2",
+                        SIZE_BODY,
+                        &table.headers.join(" | "),
+                    );
+                }
+                for row in &table.rows {
+                    y = emit_wrapped_block(
+                        &mut doc,
+                        &mut ops,
+                        &mut page_ids,
+                        resources_id,
+                        pages_id,
+                        y,
+                        "F1",
+                        SIZE_BODY,
+                        &row.join(" | "),
+                    );
+                }
+                y -= SIZE_BODY * 0.4;
+            }
+            Block::Formula(formula) => {
+                y = emit_wrapped_block(
+                    &mut doc,
+                    &mut ops,
+                    &mut page_ids,
+                    resources_id,
+                    pages_id,
+                    y,
+                    "F2",
+                    SIZE_BODY,
+                    &format!("Formula: {formula}"),
+                );
+            }
+            Block::Chart(chart) => {
+                y = emit_wrapped_block(
+                    &mut doc,
+                    &mut ops,
+                    &mut page_ids,
+                    resources_id,
+                    pages_id,
+                    y,
+                    "F2",
+                    SIZE_BODY,
+                    &format!("Chart: {} ({})", chart.title, chart.kind),
+                );
+                let max_value = chart
+                    .series
+                    .iter()
+                    .flat_map(|series| &series.values)
+                    .filter_map(|value| value.parse::<f64>().ok())
+                    .fold(0.0_f64, f64::max);
+                for (idx, label) in chart.labels.iter().enumerate() {
+                    let value = chart
+                        .series
+                        .first()
+                        .and_then(|series| series.values.get(idx))
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .unwrap_or_default();
+                    let bar_w = if max_value > 0.0 {
+                        (TEXT_W * 0.55) * (value / max_value)
+                    } else {
+                        0.0
+                    };
+                    let line_h = SIZE_BODY * LINE_H_FACTOR;
+                    if y - line_h < MARGIN_B {
+                        new_page(&mut doc, &mut ops, &mut page_ids, resources_id, pages_id);
+                        y = PAGE_H - MARGIN_T;
+                    }
+                    y -= line_h;
+                    emit_text(&mut ops, "F1", SIZE_BODY, MARGIN_L, y, label);
+                    emit_rect(&mut ops, MARGIN_L + 120.0, y - 2.0, bar_w, 8.0);
+                    emit_text(
+                        &mut ops,
+                        "F1",
+                        SIZE_BODY,
+                        MARGIN_L + 130.0 + bar_w,
+                        y,
+                        &format!("{value:.2}"),
+                    );
+                }
+            }
+            Block::Image(image) => {
+                y = emit_wrapped_block(
+                    &mut doc,
+                    &mut ops,
+                    &mut page_ids,
+                    resources_id,
+                    pages_id,
+                    y,
+                    "F1",
+                    SIZE_BODY,
+                    &format!(
+                        "Image: {}{}{}",
+                        image.path,
+                        image
+                            .alt
+                            .as_ref()
+                            .map(|alt| format!(" | Alt: {alt}"))
+                            .unwrap_or_default(),
+                        image
+                            .caption
+                            .as_ref()
+                            .map(|caption| format!(" | Caption: {caption}"))
+                            .unwrap_or_default()
+                    ),
+                );
+            }
         }
     }
 
@@ -160,6 +289,42 @@ pub fn generate_pdf(path: &Path, blocks: &[Block]) -> Result<(), GenerateError> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_wrapped_block(
+    doc: &mut Document,
+    ops: &mut Vec<Operation>,
+    page_ids: &mut Vec<Object>,
+    resources_id: lopdf::ObjectId,
+    pages_id: lopdf::ObjectId,
+    mut y: f64,
+    font: &str,
+    size: f64,
+    text: &str,
+) -> f64 {
+    for chunk in wrap_text(text, TEXT_W, size) {
+        let line_h = size * LINE_H_FACTOR;
+        if y - line_h < MARGIN_B {
+            let content = Content {
+                operations: std::mem::take(ops),
+            };
+            let stream = Stream::new(dictionary! {}, content.encode().unwrap_or_default());
+            let content_id = doc.add_object(stream);
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), Object::Real(PAGE_W as f32), Object::Real(PAGE_H as f32)],
+                "Contents" => content_id,
+                "Resources" => resources_id,
+            });
+            page_ids.push(page_id.into());
+            y = PAGE_H - MARGIN_T;
+        }
+        y -= line_h;
+        emit_text(ops, font, size, MARGIN_L, y, &chunk);
+    }
+    y - size * 0.3
+}
+
 fn emit_text(ops: &mut Vec<Operation>, font: &str, size: f64, x: f64, y: f64, text: &str) {
     // Encode text as Latin-1 (WinAnsiEncoding) — non-ASCII chars become '?'
     let encoded: Vec<u8> = text
@@ -174,6 +339,20 @@ fn emit_text(ops: &mut Vec<Operation>, font: &str, size: f64, x: f64, y: f64, te
         vec![Object::String(encoded, lopdf::StringFormat::Literal)],
     ));
     ops.push(Operation::new("ET", vec![]));
+}
+
+fn emit_rect(ops: &mut Vec<Operation>, x: f64, y: f64, w: f64, h: f64) {
+    ops.push(Operation::new("q", vec![]));
+    ops.push(Operation::new(
+        "rg",
+        vec![0.18.into(), 0.45.into(), 0.75.into()],
+    ));
+    ops.push(Operation::new(
+        "re",
+        vec![x.into(), y.into(), w.into(), h.into()],
+    ));
+    ops.push(Operation::new("f", vec![]));
+    ops.push(Operation::new("Q", vec![]));
 }
 
 /// Wrap text to fit within `max_width` points at the given font size.

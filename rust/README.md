@@ -82,7 +82,8 @@ Primary artifacts:
 | Anthropic / OpenAI-compatible provider flows + streaming | ✅ |
 | OAuth login/logout | ✅ |
 | Interactive REPL (rustyline) | ✅ |
-| Tool system (bash, read, write, edit, grep, glob) | ✅ |
+| Tool system (bash, read, write, edit, grep, glob, generate_file) | ✅ |
+| Document generation (DOCX, PPTX, PDF, XLSX + quality manifests) | ✅ |
 | Web tools (search, fetch) | ✅ |
 | Sub-agent / agent surfaces | ✅ |
 | Todo tracking | ✅ |
@@ -165,7 +166,7 @@ The REPL now exposes a much broader surface than the original minimal shell:
 - plugin management: `/plugin` (with aliases `/plugins`, `/marketplace`)
 
 Notable Himalaya-first surfaces now available directly in slash form:
-- `/skills [list|install <path>|help]`
+- `/skills [list|install <path>|show <skill>|doctor|help|<skill> [args]]` and `$skill [args]`
 - `/agents [list|help]`
 - `/mcp [list|show <server>|help]`
 - `/doctor`
@@ -202,7 +203,7 @@ rust/
 - **runtime** — `ConversationRuntime`, config loading, session persistence, permission policy, MCP client lifecycle, system prompt assembly, usage tracking
 - **rusty-Himalaya-cli** — REPL, one-shot prompt, direct CLI subcommands, streaming display, tool call rendering, CLI argument parsing
 - **telemetry** — session trace events and supporting telemetry payloads
-- **tools** — tool specs + execution: Bash, ReadFile, WriteFile, EditFile, GlobSearch, GrepSearch, WebSearch, WebFetch, Agent, TodoWrite, NotebookEdit, Skill, ToolSearch, and runtime-facing tool discovery
+- **tools** — tool specs + execution: Bash, ReadFile, WriteFile, EditFile, GenerateFile, GlobSearch, GrepSearch, WebSearch, WebFetch, Agent, TodoWrite, NotebookEdit, Skill, ToolSearch, and runtime-facing tool discovery
 
 ## Stats
 

@@ -5,12 +5,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     build_verification_request, evaluate_verification_result, infer_verification_policy,
     FailureClassification, FailureClassifier, ModelRouteDecision, ModelRouteFeedback,
-    ModelRoutePhase, PermissionMode, PlanDag, PlanDagNode, PlanExecution, PlanNodeKind,
-    PlanNodeStatus, RecoveryActionEngine, RecoveryActionExecution, RecoveryOrchestrator,
-    RecoveryOrchestratorOutcome, TaskMemoryContext, TaskMemoryStore, TaskPacket, TaskRegistry,
-    TaskStatus, TeamCoordinator, VerificationCommandResult, VerificationDecision,
-    VerificationRequest, VerificationResult, VerificationRunner, Worker, WorkerRegistry,
-    WorkerStatus,
+    ModelRoutePhase, NodeExecutionArtifact, PermissionMode, PlanDag, PlanDagNode, PlanExecution,
+    PlanNodeKind, PlanNodeStatus, RecoveryActionEngine, RecoveryActionExecution,
+    RecoveryOrchestrator, RecoveryOrchestratorOutcome, TaskMemoryContext, TaskMemoryStore,
+    TaskPacket, TaskRegistry, TaskStatus, TeamCoordinator, VerificationCommandResult,
+    VerificationDecision, VerificationRequest, VerificationResult, VerificationRunner, Worker,
+    WorkerRegistry, WorkerStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -757,10 +757,12 @@ impl TaskExecutionEngine {
     ) -> Result<bool, String> {
         match worker.status {
             WorkerStatus::Finished => {
-                execution.succeed_node(
+                let artifact = worker_completion_artifact(node_id, &worker);
+                execution.succeed_node_with_artifact(
                     dag,
                     node_id,
                     Some(format!("worker {} finished", worker.worker_id)),
+                    Some(artifact),
                 )?;
                 steps.push(TaskExecutionStep {
                     task_id: task_id.to_string(),
@@ -834,6 +836,42 @@ impl TaskExecutionEngine {
     fn dag_node<'a>(&self, dag: &'a PlanDag, node_id: &str) -> Option<&'a PlanDagNode> {
         dag.nodes.iter().find(|node| node.id == node_id)
     }
+}
+
+fn worker_completion_artifact(node_id: &str, worker: &Worker) -> NodeExecutionArtifact {
+    let mut evidence = vec![format!("worker_status={}", worker.status)];
+    if let Some(event) = worker.events.last() {
+        evidence.push(format!("last_worker_event={:?}", event.kind));
+        if let Some(detail) = event.detail.as_ref() {
+            evidence.push(format!("last_worker_detail={detail}"));
+        }
+    }
+    if let Some(prompt) = worker.last_prompt.as_ref() {
+        evidence.push(format!(
+            "prompt_preview={}",
+            prompt_preview_for_artifact(prompt)
+        ));
+    }
+    NodeExecutionArtifact::new(
+        node_id,
+        format!("worker {} finished node", worker.worker_id),
+    )
+    .with_evidence(evidence)
+    .with_confidence_percent(70)
+    .with_producer(format!("worker:{}", worker.worker_id))
+}
+
+fn prompt_preview_for_artifact(prompt: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 120;
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = collapsed
+        .chars()
+        .take(MAX_PREVIEW_CHARS)
+        .collect::<String>();
+    if collapsed.chars().count() > MAX_PREVIEW_CHARS {
+        preview.push_str("...");
+    }
+    preview
 }
 
 #[allow(dead_code)]
@@ -1244,9 +1282,23 @@ mod tests {
         let second = engine.execute(&task_id, None).expect("second execute");
 
         assert!(second.completed);
+        let completed_task = registry.get(&task_id).expect("task");
+        assert_eq!(completed_task.status, TaskStatus::Completed);
+        let completed_plan = completed_task.plan.expect("plan");
+        let artifact = completed_plan
+            .execution
+            .nodes
+            .get("node-1")
+            .and_then(|node| node.artifact.as_ref())
+            .expect("worker completion artifact should be recorded");
+        assert!(artifact
+            .evidence
+            .iter()
+            .any(|item| item == "worker_status=finished"));
+        let expected_producer = format!("worker:{worker_id}");
         assert_eq!(
-            registry.get(&task_id).expect("task").status,
-            TaskStatus::Completed
+            artifact.producer.as_deref(),
+            Some(expected_producer.as_str())
         );
     }
 

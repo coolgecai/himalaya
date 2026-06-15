@@ -209,11 +209,11 @@
     "compile": "tsc -p .",
     "watch": "tsc -watch -p .",
     "test": "npm run test:regression",
-    "vscode:prepublish": "npm run prepackage",
     "test:regression": "npm run compile && node --test tests/*.test.cjs",
     "check:prepackage": "node scripts/prepackage-check.cjs",
-    "prepackage": "npm run test:regression && npm run check:prepackage",
-    "package:vsix": "npm run prepackage && vsce package --no-dependencies"
+    "prepackage": "node scripts/stage-bundled-skills.cjs && npm run test:regression && npm run check:prepackage",
+    "package:vsix": "npm run prepackage && vsce package --no-dependencies",
+    "vscode:prepublish": "npm run prepackage"
   },
   "devDependencies": {
     "@types/node": "^22.15.29",

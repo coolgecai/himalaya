@@ -7,6 +7,7 @@ use std::time::Instant;
 use glob::Pattern;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use walkdir::WalkDir;
 
 /// Maximum file size that can be read (10 MB).
@@ -589,19 +590,44 @@ pub struct GenerateFileOutput {
     #[serde(rename = "filePath")]
     pub file_path: String,
     pub format: String,
+    #[serde(rename = "manifestPath")]
+    pub manifest_path: String,
+    pub quality: file_generate::QualityReport,
 }
 
-/// Generate a binary document file (DOCX, PDF, PPTX) from markdown-style content.
+/// Generate a binary document file (DOCX, PDF, PPTX, XLSX) from markdown-style content.
 pub fn generate_file(path: &str, format: &str, content: &str) -> io::Result<GenerateFileOutput> {
     let absolute_path = normalize_path_allow_missing(path)?;
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    file_generate::generate_file(&absolute_path, format, content)
+    let report = file_generate::generate_file_with_report(&absolute_path, format, content)
         .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(GenerateFileOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
-        format: format.to_owned(),
+        format: report.format,
+        manifest_path: report.manifest_path,
+        quality: report.quality,
+    })
+}
+
+/// Generate a binary document file from a structured `DocumentSpec` JSON value.
+pub fn generate_file_from_spec(
+    path: &str,
+    format: &str,
+    document_spec: &Value,
+) -> io::Result<GenerateFileOutput> {
+    let absolute_path = normalize_path_allow_missing(path)?;
+    if let Some(parent) = absolute_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let report = file_generate::generate_file_from_spec_json(&absolute_path, format, document_spec)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(GenerateFileOutput {
+        file_path: absolute_path.to_string_lossy().into_owned(),
+        format: report.format,
+        manifest_path: report.manifest_path,
+        quality: report.quality,
     })
 }
 
@@ -620,11 +646,38 @@ pub fn generate_file_in_workspace(
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    file_generate::generate_file(&absolute_path, format, content)
+    let report = file_generate::generate_file_with_report(&absolute_path, format, content)
         .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(GenerateFileOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
-        format: format.to_owned(),
+        format: report.format,
+        manifest_path: report.manifest_path,
+        quality: report.quality,
+    })
+}
+
+/// Generate a binary document file from `DocumentSpec` with workspace boundary enforcement.
+pub fn generate_file_from_spec_in_workspace(
+    path: &str,
+    format: &str,
+    document_spec: &Value,
+    workspace_root: &Path,
+) -> io::Result<GenerateFileOutput> {
+    let absolute_path = normalize_workspace_path_allow_missing(path, workspace_root)?;
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    validate_workspace_boundary(&absolute_path, &canonical_root)?;
+    if let Some(parent) = absolute_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let report = file_generate::generate_file_from_spec_json(&absolute_path, format, document_spec)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(GenerateFileOutput {
+        file_path: absolute_path.to_string_lossy().into_owned(),
+        format: report.format,
+        manifest_path: report.manifest_path,
+        quality: report.quality,
     })
 }
 
@@ -789,9 +842,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        edit_file, edit_file_in_workspace, expand_braces, generate_file_in_workspace, glob_search,
-        grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
+        edit_file, edit_file_in_workspace, expand_braces, generate_file_from_spec_in_workspace,
+        generate_file_in_workspace, glob_search, grep_search, is_symlink_escape, read_file,
+        read_file_in_workspace, write_file, write_file_in_workspace, GrepSearchInput,
+        MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -862,6 +916,38 @@ mod tests {
         let generated = std::path::PathBuf::from(output.file_path);
         assert!(generated.starts_with(&workspace));
         assert!(generated.exists());
+        assert!(std::path::PathBuf::from(output.manifest_path).exists());
+        assert_eq!(output.quality.block_count, 2);
+        assert_eq!(output.quality.warning_count, 0);
+        std::fs::remove_dir_all(workspace).expect("cleanup workspace");
+    }
+
+    #[test]
+    fn generate_file_from_spec_in_workspace_writes_xlsx_manifest_and_quality() {
+        let workspace = temp_path("generate-spec-workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        let spec = serde_json::json!({
+            "title": "Metrics",
+            "blocks": [
+                {"type": "table", "headers": ["Metric", "Value"], "rows": [["A", "1"]]},
+                {"type": "formula", "latex": "x^2+y^2=z^2"}
+            ],
+            "sheets": [
+                {"name": "Data", "rows": [["Metric", "Value"], ["A", "1"]], "formulas": [{"cell": "B3", "formula": "SUM(B2:B2)", "value": "1"}]}
+            ]
+        });
+
+        let output =
+            generate_file_from_spec_in_workspace("docs/metrics.xlsx", "xlsx", &spec, &workspace)
+                .expect("spec generate path should stay inside workspace");
+
+        let generated = std::path::PathBuf::from(output.file_path);
+        assert!(generated.starts_with(&workspace));
+        assert!(generated.exists());
+        assert!(std::path::PathBuf::from(output.manifest_path).exists());
+        assert_eq!(output.format, "xlsx");
+        assert_eq!(output.quality.table_count, 1);
+        assert_eq!(output.quality.formula_count, 1);
         std::fs::remove_dir_all(workspace).expect("cleanup workspace");
     }
 

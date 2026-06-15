@@ -1,0 +1,4 @@
+interface:
+  display_name: "Document Generator"
+  short_description: "Create rich Office, PDF, and Excel files"
+  default_prompt: "Use $document-generator to create a polished report with tables, formulas, charts, and a quality manifest."

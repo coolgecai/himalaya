@@ -32,11 +32,31 @@ pub struct TaskMemoryEntry {
     pub latest_failure_class: Option<String>,
     pub latest_failure_reason: Option<String>,
     pub latest_report_message: Option<String>,
+    #[serde(default)]
+    pub plan_total_nodes: usize,
+    #[serde(default)]
+    pub plan_completed_nodes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_handoffs: Vec<TaskNodeMemoryArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_summary: Option<String>,
     pub recovery_triggered: bool,
     pub recovery_actions: Vec<TaskRecoveryActionSignal>,
     pub route_feedback_count: usize,
     pub route_failures: usize,
     pub route_recovery_triggered: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskNodeMemoryArtifact {
+    pub node_id: String,
+    pub status: String,
+    pub summary: Option<String>,
+    pub evidence: Vec<String>,
+    pub blocking_reason: Option<String>,
+    pub confidence_percent: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +97,12 @@ pub struct TaskMemoryContext {
     pub common_failure_classes: BTreeMap<String, usize>,
     pub recovery_actions: Vec<RecoveryActionMemorySummary>,
     pub route_failure_rate: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_node_handoffs: Vec<TaskNodeMemoryArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_handoff_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_node_hint: Option<String>,
     pub recommendations: Vec<String>,
 }
 
@@ -241,6 +267,8 @@ impl TaskMemoryStore {
             &failure_classes,
             &recovery_actions,
             route_failure_rate,
+            current.next_node_id.as_deref(),
+            current.handoff_summary.as_deref(),
         );
         TaskMemoryContext {
             task_type: current.task_type.clone(),
@@ -249,6 +277,9 @@ impl TaskMemoryStore {
             common_failure_classes: failure_classes,
             recovery_actions,
             route_failure_rate,
+            current_node_handoffs: current.node_handoffs.clone(),
+            current_handoff_summary: current.handoff_summary.clone(),
+            next_node_hint: current.next_node_id.clone(),
             recommendations,
         }
     }
@@ -330,8 +361,18 @@ fn memory_context_recommendations(
     failure_classes: &BTreeMap<String, usize>,
     recovery_actions: &[RecoveryActionMemorySummary],
     route_failure_rate: Option<f32>,
+    next_node_id: Option<&str>,
+    handoff_summary: Option<&str>,
 ) -> Vec<String> {
     let mut recommendations = Vec::new();
+    if let Some(next_node_id) = next_node_id {
+        recommendations.push(format!(
+            "Resume from node `{next_node_id}` using the current task handoff before replanning."
+        ));
+    }
+    if handoff_summary.is_some() {
+        recommendations.push("Preserve completed node artifacts; do not redo finished work unless verification fails.".to_string());
+    }
     if !tests.is_empty() {
         recommendations.push(format!(
             "Seed planning with {} successful acceptance test(s) from similar tasks.",
@@ -415,6 +456,30 @@ impl TaskMemoryEntry {
             ),
             |report| report.blocked,
         );
+        let plan_total_nodes = task
+            .plan
+            .as_ref()
+            .map_or(0, |plan| plan.execution.nodes.len());
+        let plan_completed_nodes = task
+            .plan
+            .as_ref()
+            .map_or(0, |plan| plan.execution.completed_nodes().len());
+        let next_node_id = task
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.resume_cursor.as_ref())
+            .and_then(|cursor| cursor.node_id.clone());
+        let node_handoffs = task
+            .plan
+            .as_ref()
+            .map(node_memory_artifacts)
+            .unwrap_or_default();
+        let handoff_summary = task_handoff_summary(
+            plan_completed_nodes,
+            plan_total_nodes,
+            next_node_id.as_deref(),
+            &node_handoffs,
+        );
         Self {
             task_id: task.task_id.clone(),
             task_type: task_type(task),
@@ -435,6 +500,11 @@ impl TaskMemoryEntry {
             latest_failure_class,
             latest_failure_reason,
             latest_report_message: latest_report.map(|report| report.message.clone()),
+            plan_total_nodes,
+            plan_completed_nodes,
+            next_node_id,
+            node_handoffs,
+            handoff_summary,
             recovery_triggered: !task.recovery_events.is_empty()
                 || !task.recovery_action_executions.is_empty()
                 || task
@@ -447,6 +517,66 @@ impl TaskMemoryEntry {
             route_recovery_triggered,
         }
     }
+}
+
+fn node_memory_artifacts(plan: &crate::TaskPlanSnapshot) -> Vec<TaskNodeMemoryArtifact> {
+    plan.execution
+        .nodes
+        .values()
+        .filter_map(|node| {
+            let artifact = node.artifact.as_ref();
+            let summary = artifact
+                .map(|artifact| artifact.summary.clone())
+                .or_else(|| node.output_summary.clone());
+            if summary.is_none()
+                && node.failure_class.is_none()
+                && artifact.is_none()
+                && node.status != crate::PlanNodeStatus::Running
+            {
+                return None;
+            }
+            Some(TaskNodeMemoryArtifact {
+                node_id: node.node_id.clone(),
+                status: format!("{:?}", node.status).to_ascii_lowercase(),
+                summary,
+                evidence: artifact.map_or_else(Vec::new, |artifact| artifact.evidence.clone()),
+                blocking_reason: artifact
+                    .and_then(|artifact| artifact.blocking_reason.clone())
+                    .or_else(|| node.failure_class.clone()),
+                confidence_percent: artifact.map(|artifact| artifact.confidence_percent),
+            })
+        })
+        .collect()
+}
+
+fn task_handoff_summary(
+    completed: usize,
+    total: usize,
+    next_node_id: Option<&str>,
+    node_handoffs: &[TaskNodeMemoryArtifact],
+) -> Option<String> {
+    if total == 0 && node_handoffs.is_empty() {
+        return None;
+    }
+    let mut parts = vec![format!("completed {completed}/{total} plan node(s)")];
+    if let Some(next) = next_node_id {
+        parts.push(format!("next node: {next}"));
+    }
+    let recent = node_handoffs
+        .iter()
+        .rev()
+        .take(3)
+        .filter_map(|artifact| {
+            artifact
+                .summary
+                .as_ref()
+                .map(|summary| format!("{}={summary}", artifact.node_id))
+        })
+        .collect::<Vec<_>>();
+    if !recent.is_empty() {
+        parts.push(format!("recent artifacts: {}", recent.join("; ")));
+    }
+    Some(parts.join("; "))
 }
 
 fn task_type(task: &Task) -> String {
@@ -486,7 +616,8 @@ fn normalize_type_fragment(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        ModelRouteDecision, ModelRouteFeedback, ModelRoutePhase, RecoveryAction,
+        ModelRouteDecision, ModelRouteFeedback, ModelRoutePhase, NodeExecutionArtifact, PlanDag,
+        PlanDagEdge, PlanDagEdgeKind, PlanDagNode, PlanExecution, PlanNodeKind, RecoveryAction,
         RecoveryActionExecution, RecoveryActionKind, RecoveryActionResult, RecoveryActionRisk,
         TaskPacket,
     };
@@ -575,6 +706,77 @@ mod tests {
             .recommendations
             .iter()
             .any(|item| item.contains("acceptance test")));
+    }
+
+    #[test]
+    fn context_for_task_includes_current_handoff_artifacts() {
+        let registry = crate::TaskRegistry::new();
+        let task = registry.create("resume complex work", Some("runtime scheduler"));
+        let dag = PlanDag {
+            task_id: task.task_id.clone(),
+            root_id: task.task_id.clone(),
+            nodes: vec![
+                PlanDagNode {
+                    kind: PlanNodeKind::Step,
+                    id: "analyze".to_string(),
+                    title: "Analyze".to_string(),
+                    parallelizable: false,
+                    estimated_effort: 1,
+                    candidate_tools: Vec::new(),
+                    notes: Vec::new(),
+                },
+                PlanDagNode {
+                    kind: PlanNodeKind::Step,
+                    id: "implement".to_string(),
+                    title: "Implement".to_string(),
+                    parallelizable: false,
+                    estimated_effort: 2,
+                    candidate_tools: Vec::new(),
+                    notes: Vec::new(),
+                },
+            ],
+            edges: vec![PlanDagEdge {
+                from: "analyze".to_string(),
+                to: "implement".to_string(),
+                kind: PlanDagEdgeKind::DependsOn,
+            }],
+        };
+        let mut execution = PlanExecution::new(&dag);
+        execution.start_node("analyze").expect("start");
+        execution
+            .succeed_node_with_artifact(
+                &dag,
+                "analyze",
+                Some("analysis complete".to_string()),
+                Some(
+                    NodeExecutionArtifact::new("analyze", "analysis complete")
+                        .with_evidence(vec!["read src/lib.rs".to_string()])
+                        .with_confidence_percent(90)
+                        .with_producer("test"),
+                ),
+            )
+            .expect("succeed");
+        registry
+            .record_plan(&task.task_id, dag, execution)
+            .expect("plan");
+        let task = registry.get(&task.task_id).expect("task");
+        let store = TaskMemoryStore::from_tasks(std::slice::from_ref(&task));
+        let context = store.context_for_task(&task);
+
+        assert_eq!(context.next_node_hint.as_deref(), Some("implement"));
+        assert!(context
+            .current_handoff_summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("completed 1/2")));
+        assert_eq!(context.current_node_handoffs.len(), 1);
+        assert_eq!(
+            context.current_node_handoffs[0].summary.as_deref(),
+            Some("analysis complete")
+        );
+        assert!(context
+            .recommendations
+            .iter()
+            .any(|item| item.contains("Resume from node `implement`")));
     }
 
     #[test]

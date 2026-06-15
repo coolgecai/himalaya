@@ -148,10 +148,11 @@ pub use execution_scheduler::{
 };
 pub use failure_classifier::{FailureClassification, FailureClassifier};
 pub use file_ops::{
-    edit_file, edit_file_in_workspace, generate_file, generate_file_in_workspace, glob_search,
-    grep_search, read_file, read_file_in_workspace, write_file, write_file_in_workspace,
-    EditFileOutput, GenerateFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
-    ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
+    edit_file, edit_file_in_workspace, generate_file, generate_file_from_spec,
+    generate_file_from_spec_in_workspace, generate_file_in_workspace, glob_search, grep_search,
+    read_file, read_file_in_workspace, write_file, write_file_in_workspace, EditFileOutput,
+    GenerateFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput,
+    StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
@@ -200,8 +201,8 @@ pub use permissions::{
     PermissionRequest,
 };
 pub use plan_executor::{
-    dependency_map, reverse_dependency_map, NodeVerificationGate, PlanExecution,
-    PlanExecutionEvent, PlanExecutionEventKind, PlanNodeExecution, PlanNodeStatus,
+    dependency_map, reverse_dependency_map, NodeExecutionArtifact, NodeVerificationGate,
+    PlanExecution, PlanExecutionEvent, PlanExecutionEventKind, PlanNodeExecution, PlanNodeStatus,
 };
 pub use plugin_lifecycle::{
     DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,
@@ -290,7 +291,7 @@ pub use task_execution_engine::{
 };
 pub use task_memory_store::{
     RecoveryActionMemorySummary, TaskMemoryContext, TaskMemoryEntry, TaskMemorySnapshot,
-    TaskMemoryStore, TaskMemorySummary, TaskRecoveryActionSignal,
+    TaskMemoryStore, TaskMemorySummary, TaskNodeMemoryArtifact, TaskRecoveryActionSignal,
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
 pub use task_registry::{

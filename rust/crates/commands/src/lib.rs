@@ -179,6 +179,36 @@ pub enum SkillSlashDispatch {
     Invoke(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillInvocation {
+    pub skill: String,
+    pub args: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedSkill {
+    pub skill: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub args: Option<String>,
+    pub description: Option<String>,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub path: PathBuf,
+    pub source_id: &'static str,
+    pub source_label: &'static str,
+    pub origin_id: &'static str,
+    pub origin_detail_label: Option<&'static str>,
+    pub active: bool,
+    pub shadowed_by_id: Option<&'static str>,
+    pub shadowed_by_label: Option<&'static str>,
+}
+
 const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "help",
@@ -370,7 +400,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "skills",
         aliases: &["skill"],
         summary: "List, install, or invoke available skills",
-        argument_hint: Some("[list|install <path>|help|<skill> [args]]"),
+        argument_hint: Some("[list|install <path>|show <skill>|doctor|help|<skill> [args]]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -2297,6 +2327,7 @@ enum DefinitionSource {
     UserCodexHome,
     UserHimalaya,
     UserCodex,
+    Bundled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2304,6 +2335,7 @@ enum DefinitionScope {
     Project,
     UserConfigHome,
     UserHome,
+    Bundled,
 }
 
 impl DefinitionScope {
@@ -2312,6 +2344,7 @@ impl DefinitionScope {
             Self::Project => "Project roots",
             Self::UserConfigHome => "User config roots",
             Self::UserHome => "User home roots",
+            Self::Bundled => "Bundled roots",
         }
     }
 }
@@ -2322,6 +2355,7 @@ impl DefinitionSource {
             Self::ProjectHimalaya | Self::ProjectCodex => DefinitionScope::Project,
             Self::UserHimalayaConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
             Self::UserHimalaya | Self::UserCodex => DefinitionScope::UserHome,
+            Self::Bundled => DefinitionScope::Bundled,
         }
     }
 
@@ -2344,6 +2378,7 @@ struct AgentSummary {
 struct SkillSummary {
     name: String,
     description: Option<String>,
+    path: PathBuf,
     source: DefinitionSource,
     shadowed_by: Option<DefinitionSource>,
     origin: SkillOrigin,
@@ -2573,6 +2608,21 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
             let skills = load_skills_from_roots(&roots)?;
             Ok(render_skills_report(&skills))
         }
+        Some("show") => Ok(render_skills_usage(Some("show"))),
+        Some(args) if args.starts_with("show ") => {
+            let target = args["show ".len()..].trim();
+            if target.is_empty() {
+                return Ok(render_skills_usage(Some("show")));
+            }
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            Ok(render_skill_show_report(target, &skills)?)
+        }
+        Some("doctor") => {
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            Ok(render_skills_doctor_report(&skills))
+        }
         Some("install") => Ok(render_skills_usage(Some("install"))),
         Some(args) if args.starts_with("install ") => {
             let target = args["install ".len()..].trim();
@@ -2604,6 +2654,21 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
             let skills = load_skills_from_roots(&roots)?;
             Ok(render_skills_report_json(&skills))
         }
+        Some("show") => Ok(render_skills_usage_json(Some("show"))),
+        Some(args) if args.starts_with("show ") => {
+            let target = args["show ".len()..].trim();
+            if target.is_empty() {
+                return Ok(render_skills_usage_json(Some("show")));
+            }
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            Ok(render_skill_show_report_json(target, &skills)?)
+        }
+        Some("doctor") => {
+            let roots = discover_skill_roots(cwd);
+            let skills = load_skills_from_roots(&roots)?;
+            Ok(render_skills_doctor_report_json(&skills))
+        }
         Some("install") => Ok(render_skills_usage_json(Some("install"))),
         Some(args) if args.starts_with("install ") => {
             let target = args["install ".len()..].trim();
@@ -2622,6 +2687,8 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
 pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
     match normalize_optional_args(args) {
         None | Some("list" | "help" | "-h" | "--help") => SkillSlashDispatch::Local,
+        Some("show" | "doctor") => SkillSlashDispatch::Local,
+        Some(args) if args.starts_with("show ") => SkillSlashDispatch::Local,
         Some(args) if args == "install" || args.starts_with("install ") => {
             SkillSlashDispatch::Local
         }
@@ -2658,7 +2725,7 @@ pub fn resolve_skill_invocation(
                         message.push_str(&format!("\n  Available skills: {}", names.join(", ")));
                     }
                 }
-                message.push_str("\n  Usage: /skills [list|install <path>|help|<skill> [args]]");
+                message.push_str("\n  Usage: /skills [list|install <path>|show <skill>|doctor|help|<skill> [args]]");
                 return Err(message);
             }
         }
@@ -2676,66 +2743,151 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
     }
 
     let roots = discover_skill_roots(cwd);
-    for root in &roots {
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(&root.path)? {
-            let entry = entry?;
-            match root.origin {
-                SkillOrigin::SkillsDir => {
-                    if !entry.path().is_dir() {
-                        continue;
-                    }
-                    let skill_path = entry.path().join("SKILL.md");
-                    if !skill_path.is_file() {
-                        continue;
-                    }
-                    let contents = fs::read_to_string(&skill_path)?;
-                    let (name, _) = parse_skill_frontmatter(&contents);
-                    entries.push((
-                        name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
-                        skill_path,
-                    ));
-                }
-                SkillOrigin::LegacyCommandsDir => {
-                    let path = entry.path();
-                    let markdown_path = if path.is_dir() {
-                        let skill_path = path.join("SKILL.md");
-                        if !skill_path.is_file() {
-                            continue;
-                        }
-                        skill_path
-                    } else if path
-                        .extension()
-                        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
-                    {
-                        path
-                    } else {
-                        continue;
-                    };
-
-                    let contents = fs::read_to_string(&markdown_path)?;
-                    let fallback_name = markdown_path.file_stem().map_or_else(
-                        || entry.file_name().to_string_lossy().to_string(),
-                        |stem| stem.to_string_lossy().to_string(),
-                    );
-                    let (name, _) = parse_skill_frontmatter(&contents);
-                    entries.push((name.unwrap_or(fallback_name), markdown_path));
-                }
-            }
-        }
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
-        if let Some((_, path)) = entries
-            .into_iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(requested))
-        {
-            return Ok(path);
-        }
+    let skills = load_skills_from_roots(&roots)?;
+    if let Some(skill) = find_skill_summary(&skills, requested) {
+        return Ok(skill.path.clone());
     }
 
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         format!("unknown skill: {requested}"),
     ))
+}
+
+pub fn discover_skills(cwd: &Path) -> std::io::Result<Vec<SkillDefinition>> {
+    let roots = discover_skill_roots(cwd);
+    let skills = load_skills_from_roots(&roots)?;
+    Ok(skills
+        .into_iter()
+        .map(|skill| SkillDefinition {
+            name: skill.name,
+            description: skill.description,
+            path: skill.path,
+            source_id: definition_source_id(skill.source),
+            source_label: skill.source.label(),
+            origin_id: skill_origin_id(skill.origin),
+            origin_detail_label: skill.origin.detail_label(),
+            active: skill.shadowed_by.is_none(),
+            shadowed_by_id: skill.shadowed_by.map(definition_source_id),
+            shadowed_by_label: skill.shadowed_by.map(DefinitionSource::label),
+        })
+        .collect())
+}
+
+#[must_use]
+pub fn parse_skill_invocation_prompt(input: &str) -> Option<SkillInvocation> {
+    let trimmed = input.trim();
+    let rest = trimmed.strip_prefix('$')?.trim_start();
+    let skill = rest.split_whitespace().next()?.trim();
+    if skill.is_empty() || !skill.chars().all(is_skill_invocation_char) {
+        return None;
+    }
+    let args = rest[skill.len()..].trim();
+    Some(SkillInvocation {
+        skill: skill.to_string(),
+        args: (!args.is_empty()).then(|| args.to_string()),
+    })
+}
+
+#[must_use]
+pub fn skill_invocation_from_args(args: &str) -> Option<SkillInvocation> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.trim_start_matches('/').trim_start_matches('$');
+    let skill = normalized.split_whitespace().next()?.trim();
+    if skill.is_empty() || !skill.chars().all(is_skill_invocation_char) {
+        return None;
+    }
+    let args = normalized[skill.len()..].trim();
+    Some(SkillInvocation {
+        skill: skill.to_string(),
+        args: (!args.is_empty()).then(|| args.to_string()),
+    })
+}
+
+fn is_skill_invocation_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
+}
+
+pub fn load_skill_invocation(
+    cwd: &Path,
+    invocation: SkillInvocation,
+) -> std::io::Result<LoadedSkill> {
+    let path = resolve_skill_path(cwd, &invocation.skill)?;
+    let prompt = fs::read_to_string(&path)?;
+    let (name, description) = parse_skill_frontmatter(&prompt);
+    let name = name.unwrap_or_else(|| fallback_skill_name_from_path(&path));
+
+    Ok(LoadedSkill {
+        skill: invocation.skill,
+        name,
+        path,
+        args: invocation.args,
+        description,
+        prompt,
+    })
+}
+
+pub fn load_skill(cwd: &Path, skill: &str, args: Option<String>) -> std::io::Result<LoadedSkill> {
+    let invocation = SkillInvocation {
+        skill: skill
+            .trim()
+            .trim_start_matches('/')
+            .trim_start_matches('$')
+            .to_string(),
+        args,
+    };
+    load_skill_invocation(cwd, invocation)
+}
+
+#[must_use]
+pub fn render_loaded_skill_prompt(skill: &LoadedSkill) -> String {
+    let mut lines = vec![
+        format!(
+            "Use the local Himalaya skill `{}` for this request.",
+            skill.name
+        ),
+        String::new(),
+        "Skill metadata:".to_string(),
+        format!("- Invocation: ${}", skill.skill),
+        format!("- Path: {}", skill.path.display()),
+    ];
+    if let Some(description) = &skill.description {
+        lines.push(format!("- Description: {description}"));
+    }
+    if let Some(args) = &skill.args {
+        lines.push(format!("- Arguments: {args}"));
+    } else {
+        lines.push("- Arguments: <none>".to_string());
+    }
+    lines.extend([
+        String::new(),
+        "Skill instructions:".to_string(),
+        "<skill_instructions>".to_string(),
+        skill.prompt.clone(),
+        "</skill_instructions>".to_string(),
+        String::new(),
+        "Follow the skill instructions above and complete the user's skill request.".to_string(),
+    ]);
+    lines.join("\n")
+}
+
+fn fallback_skill_name_from_path(path: &Path) -> String {
+    if path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("SKILL.md"))
+    {
+        return path.parent().and_then(Path::file_name).map_or_else(
+            || "skill".to_string(),
+            |name| name.to_string_lossy().to_string(),
+        );
+    }
+    path.file_stem().map_or_else(
+        || "skill".to_string(),
+        |stem| stem.to_string_lossy().to_string(),
+    )
 }
 
 fn render_mcp_report_for(
@@ -2925,7 +3077,7 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         );
     }
 
-    if let Some(home) = env::var_os("HOME") {
+    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
         let home = PathBuf::from(home);
         push_unique_root(
             &mut roots,
@@ -3034,7 +3186,7 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
-    if let Some(home) = env::var_os("HOME") {
+    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
         let home = PathBuf::from(home);
         push_unique_skill_root(
             &mut roots,
@@ -3065,6 +3217,18 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             DefinitionSource::UserCodex,
             home.join(".codex").join("commands"),
             SkillOrigin::LegacyCommandsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserHimalaya,
+            home.join(".agents").join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserHimalaya,
+            home.join(".config").join("opencode").join("skills"),
+            SkillOrigin::SkillsDir,
         );
         push_unique_skill_root(
             &mut roots,
@@ -3109,6 +3273,41 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
+    for path in bundled_skill_roots() {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::Bundled,
+            path,
+            SkillOrigin::SkillsDir,
+        );
+    }
+
+    roots
+}
+
+fn bundled_skill_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(path) = env::var("HIMALAYA_BUNDLED_SKILLS_DIR") {
+        roots.push(PathBuf::from(path));
+    }
+
+    roots.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("bundled")
+            .join("skills"),
+    );
+
+    if let Ok(exe) = env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            roots.push(parent.join("skills"));
+            if let Some(grandparent) = parent.parent() {
+                roots.push(grandparent.join("skills"));
+            }
+        }
+    }
+
+    roots.push(PathBuf::from("/usr/share/himalaya-code/bundled/skills"));
     roots
 }
 
@@ -3169,12 +3368,12 @@ fn default_skill_install_root() -> std::io::Result<PathBuf> {
     if let Ok(codex_home) = env::var("CODEX_HOME") {
         return Ok(PathBuf::from(codex_home).join("skills"));
     }
-    if let Some(home) = env::var_os("HOME") {
+    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
         return Ok(PathBuf::from(home).join(".Himalaya").join("skills"));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "unable to resolve a skills install root; set Himalaya_CONFIG_HOME or HOME",
+        "unable to resolve a skills install root; set Himalaya_CONFIG_HOME, HOME, or USERPROFILE",
     ))
 }
 
@@ -3402,6 +3601,7 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
                         name: name
                             .unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
                         description,
+                        path: entry.path().join("SKILL.md"),
                         source: root.source,
                         shadowed_by: None,
                         origin: root.origin,
@@ -3433,6 +3633,7 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
                     root_skills.push(SkillSummary {
                         name: name.unwrap_or(fallback_name),
                         description,
+                        path: markdown_path,
                         source: root.source,
                         shadowed_by: None,
                         origin: root.origin,
@@ -3701,6 +3902,154 @@ fn render_skill_install_report_json(skill: &InstalledSkill) -> Value {
     })
 }
 
+fn render_skill_show_report(target: &str, skills: &[SkillSummary]) -> std::io::Result<String> {
+    let skill = find_skill_summary(skills, target).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("unknown skill: {target}"),
+        )
+    })?;
+    let loaded = load_skill_summary(skill, None)?;
+    let mut lines = vec![
+        "Skills".to_string(),
+        format!("  Name             {}", loaded.name),
+        format!("  Invoke as        ${}", skill.name),
+        format!("  Path             {}", loaded.path.display()),
+        format!("  Source           {}", definition_source_id(skill.source)),
+        format!("  Origin           {}", skill_origin_id(skill.origin)),
+        format!(
+            "  Status           {}",
+            if skill.shadowed_by.is_some() {
+                "shadowed"
+            } else {
+                "active"
+            }
+        ),
+    ];
+    if let Some(description) = &loaded.description {
+        lines.push(format!("  Description      {description}"));
+    }
+    if let Some(shadowed_by) = skill.shadowed_by {
+        lines.push(format!("  Shadowed by      {}", shadowed_by.label()));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_skill_show_report_json(target: &str, skills: &[SkillSummary]) -> std::io::Result<Value> {
+    let skill = find_skill_summary(skills, target).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("unknown skill: {target}"),
+        )
+    })?;
+    let loaded = load_skill_summary(skill, None)?;
+    Ok(json!({
+        "kind": "skills",
+        "action": "show",
+        "skill": {
+            "name": loaded.name,
+            "description": loaded.description,
+            "path": loaded.path.display().to_string(),
+            "invoke_as": format!("${}", skill.name),
+            "source": definition_source_json(skill.source),
+            "origin": skill_origin_json(skill.origin),
+            "active": skill.shadowed_by.is_none(),
+            "shadowed_by": skill.shadowed_by.map(definition_source_json),
+        }
+    }))
+}
+
+fn load_skill_summary(skill: &SkillSummary, args: Option<String>) -> std::io::Result<LoadedSkill> {
+    let prompt = fs::read_to_string(&skill.path)?;
+    let (name, description) = parse_skill_frontmatter(&prompt);
+    Ok(LoadedSkill {
+        skill: skill.name.clone(),
+        name: name.unwrap_or_else(|| fallback_skill_name_from_path(&skill.path)),
+        path: skill.path.clone(),
+        args,
+        description,
+        prompt,
+    })
+}
+
+fn find_skill_summary<'a>(skills: &'a [SkillSummary], target: &str) -> Option<&'a SkillSummary> {
+    let requested = target
+        .trim()
+        .trim_start_matches('/')
+        .trim_start_matches('$');
+    skills
+        .iter()
+        .find(|skill| skill.name.eq_ignore_ascii_case(requested) && skill.shadowed_by.is_none())
+        .or_else(|| {
+            skills
+                .iter()
+                .find(|skill| skill.name.eq_ignore_ascii_case(requested))
+        })
+}
+
+fn render_skills_doctor_report(skills: &[SkillSummary]) -> String {
+    let active = skills
+        .iter()
+        .filter(|skill| skill.shadowed_by.is_none())
+        .count();
+    let issues = skills_doctor_issues(skills);
+    let mut lines = vec![
+        "Skills Doctor".to_string(),
+        format!("  Total            {}", skills.len()),
+        format!("  Active           {active}"),
+        format!("  Shadowed         {}", skills.len().saturating_sub(active)),
+    ];
+    if issues.is_empty() {
+        lines.push("  Issues           none".to_string());
+    } else {
+        lines.push(format!("  Issues           {}", issues.len()));
+        for issue in issues {
+            lines.push(format!("  - {issue}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_skills_doctor_report_json(skills: &[SkillSummary]) -> Value {
+    let active = skills
+        .iter()
+        .filter(|skill| skill.shadowed_by.is_none())
+        .count();
+    let issues = skills_doctor_issues(skills);
+    json!({
+        "kind": "skills",
+        "action": "doctor",
+        "summary": {
+            "total": skills.len(),
+            "active": active,
+            "shadowed": skills.len().saturating_sub(active),
+            "issues": issues.len(),
+        },
+        "issues": issues,
+    })
+}
+
+fn skills_doctor_issues(skills: &[SkillSummary]) -> Vec<String> {
+    let mut issues = Vec::new();
+    if skills.iter().all(|skill| skill.shadowed_by.is_some()) {
+        issues.push("No active skills found".to_string());
+    }
+    for skill in skills {
+        if skill.description.is_none() {
+            issues.push(format!("Skill `{}` has no description", skill.name));
+        }
+        if let Some(winner) = skill.shadowed_by {
+            issues.push(format!(
+                "Skill `{}` at {} is shadowed by {}",
+                skill.name,
+                skill.path.display(),
+                winner.label()
+            ));
+        }
+    }
+    issues
+}
+
 fn render_mcp_summary_report(
     cwd: &Path,
     servers: &BTreeMap<String, ScopedMcpServerConfig>,
@@ -3890,13 +4239,13 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
 
 fn render_skills_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
-        "Skills".to_string(),
-        "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
-        "  Alias            /skill".to_string(),
-        "  Direct CLI       Himalaya skills [list|install <path>|help|<skill> [args]]".to_string(),
-        "  Invoke           /skills help overview -> $help overview".to_string(),
-        "  Install root     $Himalaya_CONFIG_HOME/skills or ~/.Himalaya/skills".to_string(),
-        "  Sources          .Himalaya/skills, .omc/skills, .agents/skills, .codex/skills, .Himalaya/skills, ~/.Himalaya/skills, ~/.omc/skills, ~/.Himalaya/skills/omc-learned, ~/.codex/skills, ~/.Himalaya/skills, legacy /commands".to_string(),
+	        "Skills".to_string(),
+	        "  Usage            /skills [list|install <path>|show <skill>|doctor|help|<skill> [args]]".to_string(),
+	        "  Alias            /skill".to_string(),
+	        "  Direct CLI       Himalaya skills [list|install <path>|show <skill>|doctor|help|<skill> [args]]".to_string(),
+	        "  Invoke           $help overview or /skills help overview".to_string(),
+	        "  Install root     $Himalaya_CONFIG_HOME/skills or ~/.Himalaya/skills".to_string(),
+	        "  Sources          .Himalaya/skills, .omc/skills, .agents/skills, .codex/skills, ~/.Himalaya/skills, ~/.omc/skills, ~/.agents/skills, ~/.config/opencode/skills, ~/.Himalaya/skills/omc-learned, ~/.codex/skills, bundled skills, legacy /commands".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3909,25 +4258,26 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         "kind": "skills",
         "action": "help",
         "usage": {
-            "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
-            "aliases": ["/skill"],
-            "direct_cli": "Himalaya skills [list|install <path>|help|<skill> [args]]",
-            "invoke": "/skills help overview -> $help overview",
-            "install_root": "$Himalaya_CONFIG_HOME/skills or ~/.Himalaya/skills",
-            "sources": [
-                ".Himalaya/skills",
-                ".omc/skills",
-                ".agents/skills",
-                ".codex/skills",
-                ".Himalaya/skills",
-                "~/.Himalaya/skills",
-                "~/.omc/skills",
-                "~/.Himalaya/skills/omc-learned",
-                "~/.codex/skills",
-                "~/.Himalaya/skills",
-                "legacy /commands",
-                "legacy fallback dirs still load automatically"
-            ],
+                "slash_command": "/skills [list|install <path>|show <skill>|doctor|help|<skill> [args]]",
+                "aliases": ["/skill"],
+                "direct_cli": "Himalaya skills [list|install <path>|show <skill>|doctor|help|<skill> [args]]",
+                "invoke": "$help overview or /skills help overview",
+                "install_root": "$Himalaya_CONFIG_HOME/skills or ~/.Himalaya/skills",
+                "sources": [
+                    ".Himalaya/skills",
+                    ".omc/skills",
+                    ".agents/skills",
+                    ".codex/skills",
+                    "~/.Himalaya/skills",
+                    "~/.omc/skills",
+                    "~/.agents/skills",
+                    "~/.config/opencode/skills",
+                    "~/.Himalaya/skills/omc-learned",
+                    "~/.codex/skills",
+                    "bundled skills",
+                    "legacy /commands",
+                    "legacy fallback dirs still load automatically"
+                ],
         },
         "unexpected": unexpected,
     })
@@ -4042,6 +4392,7 @@ fn definition_source_id(source: DefinitionSource) -> &'static str {
             "user_Himalaya_config_home"
         }
         DefinitionSource::UserHimalaya | DefinitionSource::UserCodex => "user_Himalaya",
+        DefinitionSource::Bundled => "bundled",
     }
 }
 
@@ -4082,6 +4433,8 @@ fn skill_summary_json(skill: &SkillSummary) -> Value {
     json!({
         "name": &skill.name,
         "description": &skill.description,
+        "path": skill.path.display().to_string(),
+        "invoke_as": format!("${}", skill.name),
         "source": definition_source_json(skill.source),
         "origin": skill_origin_json(skill.origin),
         "active": skill.shadowed_by.is_none(),
@@ -4278,15 +4631,16 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_skills_slash_command, handle_agents_slash_command_json,
-        handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
-        load_agents_from_roots, load_skills_from_roots, render_agents_report,
-        render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
-        render_skills_report, render_slash_command_help, render_slash_command_help_detail,
-        resolve_skill_path, resume_supported_slash_commands, slash_command_specs,
-        slash_command_status, stub_slash_commands, suggest_slash_commands,
-        validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch,
-        SlashCommand, SlashCommandStatus,
+        classify_skills_slash_command, default_skill_install_root,
+        handle_agents_slash_command_json, handle_plugins_slash_command,
+        handle_skills_slash_command_json, handle_slash_command, load_agents_from_roots,
+        load_skill_invocation, load_skills_from_roots, render_agents_report,
+        render_agents_report_json, render_loaded_skill_prompt, render_mcp_report_json_for,
+        render_plugins_report, render_skills_report, render_slash_command_help,
+        render_slash_command_help_detail, resolve_skill_path, resume_supported_slash_commands,
+        skill_invocation_from_args, slash_command_specs, slash_command_status, stub_slash_commands,
+        suggest_slash_commands, validate_slash_command_input, DefinitionSource, SkillOrigin,
+        SkillRoot, SkillSlashDispatch, SlashCommand, SlashCommandStatus,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{
@@ -4804,7 +5158,9 @@ mod tests {
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|help]"));
-        assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
+        assert!(
+            help.contains("/skills [list|install <path>|show <skill>|doctor|help|<skill> [args]]")
+        );
         assert!(help.contains("aliases: /skill"));
         assert_eq!(slash_command_specs().len(), 141);
         assert!(resume_supported_slash_commands().len() >= 27);
@@ -5311,17 +5667,26 @@ mod tests {
                 origin: SkillOrigin::SkillsDir,
             },
         ];
-        let report = super::render_skills_report_json(
-            &load_skills_from_roots(&roots).expect("skills should load"),
-        );
+        let skills = load_skills_from_roots(&roots).expect("skills should load");
+        let report = super::render_skills_report_json(&skills);
         assert_eq!(report["kind"], "skills");
         assert_eq!(report["action"], "list");
         assert_eq!(report["summary"]["active"], 3);
         assert_eq!(report["summary"]["shadowed"], 1);
         assert_eq!(report["skills"][0]["name"], "plan");
         assert_eq!(report["skills"][0]["source"]["id"], "project_Himalaya");
+        assert_eq!(report["skills"][0]["invoke_as"], "$plan");
+        assert!(report["skills"][0]["path"]
+            .as_str()
+            .expect("skill path")
+            .ends_with("plan/SKILL.md"));
         assert_eq!(report["skills"][1]["name"], "deploy");
         assert_eq!(report["skills"][1]["origin"]["id"], "legacy_commands_dir");
+        assert_eq!(report["skills"][1]["invoke_as"], "$deploy");
+        assert!(report["skills"][1]["path"]
+            .as_str()
+            .expect("legacy skill path")
+            .ends_with("deploy.md"));
         assert_eq!(report["skills"][3]["shadowed_by"]["id"], "project_Himalaya");
 
         let help = handle_skills_slash_command_json(Some("help"), &workspace).expect("skills help");
@@ -5330,11 +5695,111 @@ mod tests {
         assert_eq!(help["usage"]["aliases"][0], "/skill");
         assert_eq!(
             help["usage"]["direct_cli"],
-            "Himalaya skills [list|install <path>|help|<skill> [args]]"
+            "Himalaya skills [list|install <path>|show <skill>|doctor|help|<skill> [args]]"
         );
+
+        let show = super::render_skill_show_report_json("plan", &skills).expect("show skill");
+        assert_eq!(show["kind"], "skills");
+        assert_eq!(show["action"], "show");
+        assert_eq!(show["skill"]["name"], "plan");
+        assert_eq!(show["skill"]["invoke_as"], "$plan");
+        assert!(show["skill"]["path"]
+            .as_str()
+            .expect("show path")
+            .ends_with("plan/SKILL.md"));
+
+        let doctor = super::render_skills_doctor_report_json(&skills);
+        assert_eq!(doctor["kind"], "skills");
+        assert_eq!(doctor["action"], "doctor");
+        assert_eq!(doctor["summary"]["shadowed"], 1);
+        assert!(!doctor["issues"].as_array().expect("issues").is_empty());
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(user_home);
+    }
+
+    #[test]
+    fn loads_and_renders_skill_invocation_prompt() {
+        let workspace = temp_dir("skill-invocation-prompt");
+        let project_skills = workspace.join(".Himalaya").join("skills");
+        write_skill(&project_skills, "demo", "Demo guidance");
+
+        let invocation =
+            skill_invocation_from_args("demo with context").expect("skill invocation should parse");
+        let loaded = load_skill_invocation(&workspace, invocation).expect("skill should load");
+        assert_eq!(loaded.name, "demo");
+        assert_eq!(loaded.args.as_deref(), Some("with context"));
+        assert!(loaded.path.ends_with(Path::new("demo/SKILL.md")));
+
+        let prompt = render_loaded_skill_prompt(&loaded);
+        assert!(prompt.contains("Use the local Himalaya skill `demo`"));
+        assert!(prompt.contains("- Invocation: $demo"));
+        assert!(prompt.contains("- Arguments: with context"));
+        assert!(prompt.contains("<skill_instructions>"));
+        assert!(prompt.contains("# demo"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn loads_bundled_document_generator_skill() {
+        let roots = vec![SkillRoot {
+            source: DefinitionSource::Bundled,
+            path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("bundled")
+                .join("skills"),
+            origin: SkillOrigin::SkillsDir,
+        }];
+        let skills = load_skills_from_roots(&roots).expect("bundled skills should load");
+        let skill = skills
+            .iter()
+            .find(|skill| skill.name == "document-generator")
+            .expect("document-generator skill should be bundled");
+
+        assert_eq!(skill.source, DefinitionSource::Bundled);
+        assert!(skill.description.as_deref().is_some_and(|description| {
+            description.contains("Word/DOCX")
+                && description.contains("PowerPoint/PPTX")
+                && description.contains("Excel/XLSX")
+        }));
+        assert!(skill
+            .path
+            .ends_with(Path::new("document-generator/SKILL.md")));
+    }
+
+    #[test]
+    fn discovers_userprofile_skills_when_home_is_missing() {
+        let _guard = env_lock().lock().expect("env lock");
+        let workspace = temp_dir("skills-userprofile-workspace");
+        let userprofile = temp_dir("skills-userprofile-home");
+        let user_skills = userprofile.join(".Himalaya").join("skills");
+        write_skill(&user_skills, "win", "Windows home guidance");
+
+        let original_home = std::env::var_os("HOME");
+        let original_userprofile = std::env::var_os("USERPROFILE");
+        let original_config_home = std::env::var_os("Himalaya_CONFIG_HOME");
+        let original_codex_home = std::env::var_os("CODEX_HOME");
+        std::env::remove_var("HOME");
+        std::env::set_var("USERPROFILE", &userprofile);
+        std::env::remove_var("Himalaya_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+
+        let report = handle_skills_slash_command_json(Some("list"), &workspace)
+            .expect("skills should list from USERPROFILE");
+        assert_eq!(report["skills"][0]["name"], "win");
+        assert!(resolve_skill_path(&workspace, "$win")
+            .expect("USERPROFILE skill should resolve")
+            .ends_with(Path::new("win/SKILL.md")));
+        assert!(default_skill_install_root()
+            .expect("install root should use USERPROFILE")
+            .ends_with(Path::new(".Himalaya/skills")));
+
+        restore_env_var("HOME", original_home);
+        restore_env_var("USERPROFILE", original_userprofile);
+        restore_env_var("Himalaya_CONFIG_HOME", original_config_home);
+        restore_env_var("CODEX_HOME", original_codex_home);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(userprofile);
     }
 
     #[test]
@@ -5355,33 +5820,41 @@ mod tests {
 
         let skills_help =
             super::handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
-        assert!(skills_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_help.contains(
+	            "Usage            /skills [list|install <path>|show <skill>|doctor|help|<skill> [args]]"
+	        ));
         assert!(skills_help.contains("Alias            /skill"));
-        assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
+        assert!(skills_help.contains("Invoke           $help overview or /skills help overview"));
         assert!(skills_help
             .contains("Install root     $Himalaya_CONFIG_HOME/skills or ~/.Himalaya/skills"));
         assert!(skills_help.contains(".omc/skills"));
         assert!(skills_help.contains(".agents/skills"));
         assert!(skills_help.contains("~/.Himalaya/skills/omc-learned"));
+        assert!(skills_help.contains("bundled skills"));
         assert!(skills_help.contains("legacy /commands"));
 
         let skills_unexpected =
-            super::handle_skills_slash_command(Some("show help"), &cwd).expect("skills usage");
-        assert!(skills_unexpected.contains("Unexpected       show"));
+            super::handle_skills_slash_command(Some("bogus help"), &cwd).expect("skills usage");
+        assert!(skills_unexpected.contains("Unexpected       bogus"));
+
+        let skills_show_usage =
+            super::handle_skills_slash_command(Some("show"), &cwd).expect("skills show usage");
+        assert!(skills_show_usage.contains("Unexpected       show"));
 
         let skills_install_help = super::handle_skills_slash_command(Some("install --help"), &cwd)
             .expect("nested skills help");
-        assert!(skills_install_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
+        assert!(skills_install_help.contains(
+	            "Usage            /skills [list|install <path>|show <skill>|doctor|help|<skill> [args]]"
+	        ));
         assert!(skills_install_help.contains("Alias            /skill"));
         assert!(skills_install_help.contains("Unexpected       install"));
 
         let skills_unknown_help =
-            super::handle_skills_slash_command(Some("show --help"), &cwd).expect("skills help");
-        assert!(skills_unknown_help
-            .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
-        assert!(skills_unknown_help.contains("Unexpected       show"));
+            super::handle_skills_slash_command(Some("bogus --help"), &cwd).expect("skills help");
+        assert!(skills_unknown_help.contains(
+	            "Usage            /skills [list|install <path>|show <skill>|doctor|help|<skill> [args]]"
+	        ));
+        assert!(skills_unknown_help.contains("Unexpected       bogus"));
 
         let skills_help_json =
             super::handle_skills_slash_command_json(Some("help"), &cwd).expect("skills help json");
@@ -5392,9 +5865,14 @@ mod tests {
         assert!(sources.iter().any(|value| value == ".omc/skills"));
         assert!(sources.iter().any(|value| value == ".agents/skills"));
         assert!(sources.iter().any(|value| value == "~/.omc/skills"));
+        assert!(sources.iter().any(|value| value == "~/.agents/skills"));
+        assert!(sources
+            .iter()
+            .any(|value| value == "~/.config/opencode/skills"));
         assert!(sources
             .iter()
             .any(|value| value == "~/.Himalaya/skills/omc-learned"));
+        assert!(sources.iter().any(|value| value == "bundled skills"));
 
         let _ = fs::remove_dir_all(cwd);
     }

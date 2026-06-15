@@ -46,6 +46,10 @@ assets = [
   ["../plugins/bundled/sample-hooks/.Himalaya-plugin/plugin.json", "usr/share/himalaya-code/bundled/sample-hooks/.Himalaya-plugin/plugin.json", "644"],
   ["../plugins/bundled/sample-hooks/hooks/pre.sh", "usr/share/himalaya-code/bundled/sample-hooks/hooks/pre.sh", "755"],
   ["../plugins/bundled/sample-hooks/hooks/post.sh", "usr/share/himalaya-code/bundled/sample-hooks/hooks/post.sh", "755"],
+  ["../commands/bundled/skills/document-generator/SKILL.md", "usr/share/himalaya-code/bundled/skills/document-generator/SKILL.md", "644"],
+  ["../commands/bundled/skills/document-generator/agents/openai.yaml", "usr/share/himalaya-code/bundled/skills/document-generator/agents/openai.yaml", "644"],
+  ["../commands/bundled/skills/document-generator/references/document-spec.md", "usr/share/himalaya-code/bundled/skills/document-generator/references/document-spec.md", "644"],
+  ["../commands/bundled/skills/document-generator/scripts/chart_asset.py", "usr/share/himalaya-code/bundled/skills/document-generator/scripts/chart_asset.py", "755"],
 ]
 
 [dev-dependencies]

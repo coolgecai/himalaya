@@ -610,7 +610,7 @@ fn get_simple_intro_section(has_output_style: bool) -> String {
 
 fn get_capabilities_section() -> String {
     let items = prepend_bullets(vec![
-        "**File operations**: read_file (reads text, PDF, DOCX, XLSX, PPTX), write_file (creates/overwrites), edit_file (precise string replacement), generate_file (creates binary documents)".to_string(),
+        "**File operations**: read_file (reads text, PDF, DOCX, XLSX, PPTX), write_file (creates/overwrites), edit_file (precise string replacement), generate_file (creates DOCX/PPTX/PDF/XLSX documents from markdown or structured DocumentSpec with tables, formulas, chart data, and a quality manifest)".to_string(),
         "**Code search**: glob_search (find files by pattern), grep_search (search file contents with regex)".to_string(),
         "**Web access**: WebSearch (search the web for current information, research, documentation), WebFetch (fetch a URL and answer questions about its content)".to_string(),
         "**Shell**: bash (execute shell commands in the workspace), REPL (interactive code execution)".to_string(),
@@ -635,6 +635,7 @@ fn get_using_tools_section() -> String {
         "For architecture or source-analysis requests, gather local evidence first: discover files with glob_search, read key manifests and configs with read_file, search for entry points with grep_search, and read at least three relevant source files before forming your answer.".to_string(),
         "Use WebSearch for questions about libraries, APIs, research papers, best practices, error messages, and current information; it returns cited results. Use WebFetch to read a specific URL in detail.".to_string(),
         "Use ToolSearch when you need a capability that is not obvious from the built-in tool list; it returns matching tool names and descriptions.".to_string(),
+        "Prompts that begin with `$skill` are local skill invocations; follow the injected skill instructions before answering.".to_string(),
         "Use TodoWrite to track progress on multi-step tasks. Mark one item in_progress at a time and completed when done.".to_string(),
     ]);
 
@@ -665,6 +666,7 @@ fn get_simple_doing_tasks_section() -> String {
         "Read relevant code before changing it and keep changes tightly scoped to the request.".to_string(),
         "When the user asks about the current project, repository, workspace, working directory, source tree, or 当前工程/当前工作目录, inspect the local working directory with available tools instead of asking the user to upload code or provide a repository link.".to_string(),
         "For architecture/source-analysis requests, do not provide a final answer from filenames or prior context alone: first gather local evidence with file discovery, manifest/config reads, multiple relevant source-file reads, and at least one content search for entry points or module relationships.".to_string(),
+        "For document-generation requests (DOCX/Word, PPTX/PPT/PowerPoint, PDF, XLSX/Excel), a prose summary is not completion. Read or extract the supplied source material, create the requested file with `generate_file` (prefer structured `document_spec` for polished output), inspect the returned quality manifest, fix reported issues when possible, and only then give the final answer with the generated file path and manifest path. If generation cannot be completed, explicitly say why instead of presenting analysis as the deliverable.".to_string(),
         "Do not add speculative abstractions, compatibility shims, or unrelated cleanup.".to_string(),
         "Do not create files unless they are required to complete the task.".to_string(),
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),

@@ -367,6 +367,23 @@ Himalaya --allowedTools read,glob prompt "只用读取和 glob 工具总结项�
 | `Himalaya init` | 创建项目 `Himalaya.md` |
 | `Himalaya export` | 导出会话为 Markdown |
 
+### 4.8 文档生成能力
+
+Himalaya 的内置 `generate_file` 工具可以生成二进制办公文档：
+
+- Word 报告：`docx`
+- PowerPoint 演示：`pptx` / `ppt`
+- 可打印文档：`pdf`
+- Excel 工作簿：`xlsx` / `xls`
+
+简单场景可以让 agent 使用 markdown 内容生成；复杂场景建议使用 `$document-generator` skill，让 agent 构造结构化 `document_spec`。`document_spec` 支持标题、段落、项目符号、表格、LaTeX 公式、图表数据、图片引用、Excel sheet、单元格公式等字段。生成成功后会在同目录写入质量清单，例如 `report.docx.manifest.json`，其中包含表格、公式、图表、图片数量以及潜在质量告警。
+
+示例：
+
+```bash
+Himalaya prompt '使用 $document-generator 生成 docs/经营分析报告.docx，包含摘要、指标表、NPV 公式、收入趋势图和质量 manifest'
+```
+
 ## 5. 会话、记忆与恢复
 
 ### 5.1 会话保存位置
@@ -651,7 +668,10 @@ recovery
 /agents help
 /skills list
 /skills install <path>
+/skills show <skill>
+/skills doctor
 /skills help
+$skill args
 /mcp list
 /mcp show <server>
 /plugin list
@@ -661,6 +681,8 @@ recovery
 /plugin uninstall <id>
 /plugin update <id>
 ```
+
+项目内置的 `$document-generator` skill 面向 Word、PPT、PDF、Excel 生成任务，会优先使用结构化 `document_spec`，适合包含高质量表格、公式、图表数据和质量 manifest 的报告、演示稿与工作簿。
 
 ## 9. 配置文件
 
@@ -901,8 +923,38 @@ REPL：
 
 ```bash
 Himalaya skills
+Himalaya skills show <skill>
+Himalaya skills doctor
 Himalaya agents
 ```
+
+Skill 目录结构：
+
+```text
+.Himalaya/skills/<name>/SKILL.md
+```
+
+`SKILL.md` 可包含 frontmatter：
+
+```markdown
+---
+name: demo
+description: Demo workflow guidance
+---
+
+# Demo
+Follow this workflow when the user invokes the skill.
+```
+
+调用方式：
+
+```text
+$demo args
+/skills demo args
+demo args
+```
+
+优先级为项目级 skill 优先，其次是用户配置根，再到用户 home 兼容根；同名低优先级 skill 会在列表中显示为 shadowed。常用兼容根包括 `.Himalaya/skills`、`.omc/skills`、`.agents/skills`、`.codex/skills`、`~/.Himalaya/skills`、`~/.agents/skills`、`~/.config/opencode/skills` 和 legacy `commands`。
 
 REPL：
 

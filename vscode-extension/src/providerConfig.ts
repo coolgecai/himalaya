@@ -5,7 +5,7 @@ import * as path from 'path';
 /// Shared cloud-model provider configuration, kept byte-compatible with the
 /// CLI's `provider_config.rs` so the CLI and the VS Code extension read/write
 /// the SAME files:
-///   - `<workspace>/.Himalaya/provider.json`         (model + base_url, no secret)
+///   - `<workspace>/.Himalaya/provider.json`         (model + base_url + optional api_key, no secret by default)
 ///   - `$Himalaya_CONFIG_HOME|$HOME/.Himalaya/provider_credentials.json` (api_key)
 ///
 /// This unifies cloud-model setup: a model configured in either surface is
@@ -69,7 +69,7 @@ export function loadProviderSelection(workspaceRoot: string): ProviderSelection 
   return {
     model: config.model,
     baseUrl: config.base_url,
-    apiKey: readApiKey()
+    apiKey: config.api_key ?? readApiKey()
   };
 }
 
@@ -108,4 +108,38 @@ export function saveProviderSelection(workspaceRoot: string, selection: Provider
       try { fs.chmodSync(credsPath, 0o600); } catch { /* best effort */ }
     }
   }
+}
+
+/// Persist a named provider profile. Adds or updates the profile entry in
+/// provider.json while preserving existing profiles and the default model.
+/// The api_key is never written to provider.json; use saveProviderCredentials
+/// to persist it in the separate credentials file.
+export function saveProviderProfile(
+  workspaceRoot: string,
+  profileName: string,
+  profile: ProviderProfile
+): void {
+  const configDir = path.join(workspaceRoot, '.Himalaya');
+  fs.mkdirSync(configDir, { recursive: true });
+
+  const existing = readConfigFile(workspaceRoot);
+  const profiles: Record<string, ProviderProfile> = { ...(existing?.profiles ?? {}) };
+  profiles[profileName] = profile;
+
+  const config: ProviderConfigFile = {
+    model: existing?.model ?? profile.model,
+    ...(existing?.base_url || profile.base_url ? { base_url: existing?.base_url ?? profile.base_url } : {}),
+    profiles
+  };
+  fs.writeFileSync(providerConfigPath(workspaceRoot), JSON.stringify(config, null, 2), 'utf8');
+}
+
+/// Read a named profile from provider.json. Returns null if the profile does
+/// not exist. Does NOT include the api_key — call readApiKey() separately.
+export function loadProviderProfile(
+  workspaceRoot: string,
+  profileName: string
+): ProviderProfile | null {
+  const profiles = listProviderProfiles(workspaceRoot);
+  return profiles[profileName] ?? null;
 }

@@ -440,6 +440,10 @@ const MODEL_ROUTING_ROUTE_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Number,
     },
     FieldSpec {
+        name: "contextWindow",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
         name: "costWeight",
         expected: FieldType::Number,
     },
@@ -450,6 +454,26 @@ const MODEL_ROUTING_ROUTE_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "qualityWeight",
         expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "schemaReliability",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "planningScore",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "verificationScore",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "maxTaskComplexity",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "requiresSupervisor",
+        expected: FieldType::Bool,
     },
 ];
 

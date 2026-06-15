@@ -4,7 +4,8 @@ import * as path from 'path';
 import { HimalayaCli, type HimalayaReplHandle } from './cli';
 import { ChatHistoryRecord, ChatHistorySnapshot, HimalayaHistoryStore, RecoveryEvidence } from './history';
 import { readModelRoute, writeModelRoute } from './modelRoute';
-import { loadProviderSelection, saveProviderSelection } from './providerConfig';
+import { SeqDeduper } from './seqDedup';
+import { loadProviderSelection, listProviderProfiles, loadProviderProfile, ProviderProfile, providerCredentialsPath, saveProviderProfile, saveProviderSelection } from './providerConfig';
 import {
   DANGEROUS_PERMISSION_MODE,
   DEFAULT_PERMISSION_MODE,
@@ -163,6 +164,41 @@ function detectPreferredResponseLanguage(text: string): string | undefined {
   return undefined;
 }
 
+function detectDominantResponseLanguage(text: string): string | undefined {
+  let han = 0;
+  let hiraganaKatakana = 0;
+  let hangul = 0;
+  let cyrillic = 0;
+  let arabic = 0;
+  let latin = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    if ((code >= 0x4e00 && code <= 0x9fff) || (code >= 0x3400 && code <= 0x4dbf) || (code >= 0xf900 && code <= 0xfaff)) {
+      han += 1;
+    } else if (code >= 0x3040 && code <= 0x30ff) {
+      hiraganaKatakana += 1;
+    } else if ((code >= 0xac00 && code <= 0xd7a3) || (code >= 0x1100 && code <= 0x11ff)) {
+      hangul += 1;
+    } else if (code >= 0x0400 && code <= 0x04ff) {
+      cyrillic += 1;
+    } else if (code >= 0x0600 && code <= 0x06ff) {
+      arabic += 1;
+    } else if (/^[A-Za-z]$/.test(ch)) {
+      latin += 1;
+    }
+  }
+  if (hiraganaKatakana >= 2) { return 'Japanese'; }
+  if (hangul >= 2) { return 'Korean'; }
+  if (han >= 2 && han * 2 >= latin) { return 'Chinese'; }
+  if (cyrillic >= 2 && cyrillic * 2 >= latin) { return 'Russian'; }
+  if (arabic >= 2 && arabic * 2 >= latin) { return 'Arabic'; }
+  return undefined;
+}
+
+function resolvePreferredResponseLanguage(prompt: string, storedLanguage: string | undefined): string | undefined {
+  return detectPreferredResponseLanguage(prompt) ?? detectDominantResponseLanguage(prompt) ?? storedLanguage;
+}
+
 function languagePromptPrefix(language: string): string {
   if (language === 'Chinese') {
     return '[Persistent interaction language: respond to the user in Chinese unless they explicitly change language. Keep commands, code, file paths, and quoted source text unchanged; prose headings and explanations must be Chinese.]';
@@ -178,6 +214,21 @@ function applyLanguagePreferenceToPrompt(prompt: string, language: string | unde
     return prompt;
   }
   return `${languagePromptPrefix(language)}\n\n${prompt}`;
+}
+
+function shouldStartFreshForAttachmentDocumentTask(prompt: string, hasAttachment: boolean): boolean {
+  const lower = prompt.toLowerCase();
+  const continuation = /(继续|接着|上次|上一轮|刚才|前面|当前会话|已有|原来的|continue|resume|previous|above|same conversation|existing session)/iu;
+  if (continuation.test(prompt)) {
+    return false;
+  }
+  const attachmentSignal = hasAttachment || /(\bfile\s*[:：]|附件\s*[:：]|文件\s*[:：]|依据附件|根据附件|基于附件|attached|attachment)/iu.test(prompt);
+  if (!attachmentSignal) {
+    return false;
+  }
+  const documentFormat = /(pptx?|powerpoint|幻灯片|演示文稿|答辩|word|docx|pdf|excel|xlsx|电子文档|文档|表格|spreadsheet|deck|slides?)/iu;
+  const createVerb = /(生成|制作|创建|输出|导出|整理|撰写|编写|做一份|转换|generate|create|make|build|export|produce|draft)/iu;
+  return documentFormat.test(lower) && createVerb.test(lower);
 }
 
 
@@ -369,6 +420,12 @@ export class HimalayaChatPanel {
           const enabled = Boolean((typedMessage as any).enabled);
           this.currentOptions = { ...this.currentOptions, showReasoning: enabled };
           void this.context.workspaceState.update(this.reasoningPrefKey, enabled);
+        }
+        break;
+      case 'permission-change':
+        if ((typedMessage as any).permissionMode !== undefined) {
+          const pm = String((typedMessage as any).permissionMode || '').trim();
+          this.currentOptions = { ...this.currentOptions, permissionMode: normalizePermissionMode(pm) };
         }
         break;
 
@@ -594,6 +651,11 @@ export class HimalayaChatPanel {
       this.replEventHandler = input.onEvent;
       this.replStderrHandler = input.onStderr;
     }
+    if (this.replHandle && this.forceNewSession && !input.resumeTarget) {
+      this.closeReplWorker();
+      this.replEventHandler = input.onEvent;
+      this.replStderrHandler = input.onStderr;
+    }
     if (!this.replHandle) {
       this.host.webview.postMessage({ type: 'runStatus', text: 'Starting REPL worker…', kind: 'running' });
       let handle: HimalayaReplHandle | null = null;
@@ -688,8 +750,12 @@ export class HimalayaChatPanel {
       };
     }
     const preferredLanguage = detectedLanguage
-      ?? this.currentBootstrap.identity?.preferredLanguage
-      ?? this.context.workspaceState.get<string>(this.languagePreferenceKey);
+      ? detectedLanguage
+      : resolvePreferredResponseLanguage(
+        prompt,
+        this.currentBootstrap.identity?.preferredLanguage
+        ?? this.context.workspaceState.get<string>(this.languagePreferenceKey)
+      );
     const cliPrompt = applyLanguagePreferenceToPrompt(prompt, preferredLanguage);
 
     const route = await readModelRoute(this.context);
@@ -720,10 +786,6 @@ export class HimalayaChatPanel {
 
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const cwd = input.cwd?.trim() || workspaceFolder;
-    const existingRecord = this.selectedHistoryId
-      ? this.history.records().find((item) => item.id === this.selectedHistoryId)
-      : undefined;
-    const resumeTarget = input.resumeTarget?.trim() || existingRecord?.resumeTarget?.trim() || this.selectedCliSessionId || undefined;
     const explicitFiles = (input.files ?? [])
       .map((file) => extractReferencePathCandidate(file))
       .filter((file): file is string => Boolean(file && file.trim()))
@@ -731,6 +793,21 @@ export class HimalayaChatPanel {
     const files = [...explicitFiles, ...extractPromptAttachmentReferences(prompt)];
     const preparedAttachments = prepareAttachmentDescriptors(files, cwd, 'picker');
     const attachmentPaths = preparedAttachments.paths;
+    const startFreshForTask = shouldStartFreshForAttachmentDocumentTask(prompt, attachmentPaths.length > 0);
+    if (startFreshForTask) {
+      this.output.appendLine('[session] starting a fresh session for an attachment-backed document generation task');
+      this.closeReplWorker();
+      this.selectedHistoryId = null;
+      this.selectedCliSessionId = null;
+      this.forceNewSession = true;
+    }
+    const selectedRecord = this.selectedHistoryId
+      ? this.history.records().find((item) => item.id === this.selectedHistoryId)
+      : undefined;
+    const existingRecord = startFreshForTask ? undefined : selectedRecord;
+    const resumeTarget = startFreshForTask
+      ? undefined
+      : input.resumeTarget?.trim() || existingRecord?.resumeTarget?.trim() || this.selectedCliSessionId || undefined;
     if (attachmentPaths.length > 0) {
       const names = preparedAttachments.descriptors.map((attachment) => attachment.displayName).join(', ');
       this.output.appendLine(`[attachments] included ${attachmentPaths.length} file(s): ${attachmentPaths.join(', ')}`);
@@ -802,6 +879,9 @@ export class HimalayaChatPanel {
 
     const handleStreamLine = (line: string) => {
       if (!line.trim()) { return; }
+      // seq de-dup helper (stored on closure so it survives across lines)
+      const deduper: SeqDeduper = (handleStreamLine as any)._deduper ?? ((handleStreamLine as any)._deduper = new SeqDeduper());
+      const shouldForwardEvent = deduper.shouldForward.bind(deduper);
       const parsed = parseStreamEventLine(line);
       if (!parsed.ok) {
         if (parsed.reason === 'invalid-shape') {
@@ -869,6 +949,7 @@ export class HimalayaChatPanel {
           this.host.webview.postMessage({
             type: 'toolStep',
             step: 'use',
+            toolUseId: typeof event.id === 'string' ? event.id : undefined,
             name: event.name,
             input: JSON.stringify(event.input),
             inputData: event.input ?? null
@@ -879,7 +960,14 @@ export class HimalayaChatPanel {
           const toolName = event.name ?? 'tool';
           const output = String(event.output ?? '');
           const isError = Boolean(event.is_error);
-          this.host.webview.postMessage({ type: 'toolStep', step: 'result', name: toolName, output, isError });
+          this.host.webview.postMessage({
+            type: 'toolStep',
+            step: 'result',
+            toolUseId: typeof event.id === 'string' ? event.id : undefined,
+            name: toolName,
+            output,
+            isError
+          });
 
           const permissionDenied =
             isError &&
@@ -917,12 +1005,22 @@ export class HimalayaChatPanel {
             this.output.appendLine('[decisioning] failed to forward decisioning_event: ' + String(e));
           }
           break;
-        case 'plan_execution_event':
-          this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.plan_execution_event ?? event });
+        case 'plan_execution_event': {
+          const ev = event.plan_execution_event ?? event;
+          if (shouldForwardEvent('plan_execution_event', ev)) {
+            this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.plan_execution_event ?? event });
+            void this.history.appendRecoveryEvidence(record.id, { sourceEvent: `plan_execution_event ${JSON.stringify({ seq: (ev as any).seq, task_id: ev.task_id, node_id: ev.node_id, status: ev.status })}`, createdAt: Date.now() });
+          }
           break;
-        case 'task_ledger_event':
-          this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.task_ledger_event ?? event });
+        }
+        case 'task_ledger_event': {
+          const ev = event.task_ledger_event ?? event;
+          if (shouldForwardEvent('task_ledger_event', ev)) {
+            this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.task_ledger_event ?? event });
+            void this.history.appendRecoveryEvidence(record.id, { sourceEvent: `task_ledger_event ${JSON.stringify({ seq: (ev as any).seq, task_id: ev.task_id, event: ev.event, status: ev.status })}`, createdAt: Date.now() });
+          }
           break;
+        }
         case 'model_route_event':
           this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.model_route_event ?? event });
           break;
@@ -932,12 +1030,54 @@ export class HimalayaChatPanel {
         case 'recovery_event':
           this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.recovery_event ?? event });
           break;
-        case 'recovery_action_event':
-          this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.recovery_action_event ?? event });
+        case 'recovery_action_event': {
+          const ev = event.recovery_action_event ?? event;
+          try {
+            // Inspect risk; if high risk, require explicit user approval before forwarding
+            const hasRisk = (function findRisk(e: any) {
+              if (!e || typeof e !== 'object') { return false; }
+              if (typeof e.risk === 'string' && (e.risk === 'needs_workspace_write' || e.risk === 'needs_danger_full_access' || e.risk === 'needs_human')) { return true; }
+              if (Array.isArray(e.results)) {
+                return e.results.some((r: any) => r && r.action && (r.action.risk === 'needs_workspace_write' || r.action.risk === 'needs_danger_full_access' || r.action.risk === 'needs_human'));
+              }
+              if (Array.isArray(e.actions)) {
+                return e.actions.some((a: any) => a && (a.risk === 'needs_workspace_write' || a.risk === 'needs_danger_full_access' || a.risk === 'needs_human'));
+              }
+              return false;
+            })(ev);
+
+            if (hasRisk) {
+              // ask user asynchronously, do not forward automatically
+              void (async () => {
+                const choice = await vscode.window.showWarningMessage('Recovery action requires approval (may write to workspace). Approve?', 'Approve', 'Deny');
+                if (choice === 'Approve') {
+                  this.output.appendLine('[recovery-audit] user approved recovery action');
+                  this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.recovery_action_event ?? event });
+                  void this.history.appendRecoveryEvidence(record.id, { sourceEvent: `recovery_action_event.approved ${JSON.stringify({ seq: (ev as any).seq, details: ev })}`, createdAt: Date.now() });
+                } else {
+                  this.output.appendLine('[recovery-audit] user denied recovery action');
+                  void this.history.appendRecoveryEvidence(record.id, { sourceEvent: `recovery_action_event.denied ${JSON.stringify({ seq: (ev as any).seq, details: ev })}`, createdAt: Date.now() });
+                }
+              })();
+            } else {
+              if (shouldForwardEvent('recovery_action_event', ev)) {
+                this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.recovery_action_event ?? event });
+                void this.history.appendRecoveryEvidence(record.id, { sourceEvent: `recovery_action_event ${JSON.stringify({ seq: (ev as any).seq, details: ev })}`, createdAt: Date.now() });
+              }
+            }
+          } catch (e) {
+            this.output.appendLine('[recovery] failed processing recovery_action_event: ' + String(e));
+          }
           break;
-        case 'task_execution_event':
-          this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.task_execution_event ?? event });
+        }
+        case 'task_execution_event': {
+          const ev = event.task_execution_event ?? event;
+          if (shouldForwardEvent('task_execution_event', ev)) {
+            this.host.webview.postMessage({ type: 'runtimeEvent', kind: event.type, event: event.task_execution_event ?? event });
+            void this.history.appendRecoveryEvidence(record.id, { sourceEvent: `task_execution_event ${JSON.stringify({ seq: (ev as any).seq, task_id: ev.task_id, completed: ev.completed })}`, createdAt: Date.now() });
+          }
           break;
+        }
         case 'task_list':
         case 'task_show':
         case 'task_packet_create':
@@ -983,16 +1123,18 @@ export class HimalayaChatPanel {
           break;
         }
         case 'recovery_suggestion': {
+          const failureClass = typeof event.failure_class === 'string' ? event.failure_class : (typeof (event as any).failureClass === 'string' ? (event as any).failureClass : undefined);
           const recoveryEvidence: RecoveryEvidence = {
             tool: typeof event.tool === 'string' ? event.tool : undefined,
             reason: typeof event.reason === 'string' ? event.reason : undefined,
             action: typeof event.action === 'string' ? event.action : undefined,
             suggestion: typeof event.suggestion === 'string' ? event.suggestion : undefined,
             sourceEvent: typeof event.source_event === 'string' ? event.source_event : undefined,
-            failureClass: typeof event.failure_class === 'string' ? event.failure_class : undefined,
+            failureClass: failureClass,
             createdAt: Date.now(),
           };
           void this.history.appendRecoveryEvidence(record.id, recoveryEvidence);
+          const fc = recoveryEvidence.failureClass ?? (event as any).failure_class ?? (event as any).failureClass;
           this.host.webview.postMessage({
             type: 'recoverySuggestion',
             tool: recoveryEvidence.tool,
@@ -1001,6 +1143,7 @@ export class HimalayaChatPanel {
             suggestion: recoveryEvidence.suggestion,
             sourceEvent: recoveryEvidence.sourceEvent,
             failureClass: recoveryEvidence.failureClass,
+            failure_class: fc,
           });
           break;
         }
@@ -1475,11 +1618,11 @@ export class HimalayaChatPanel {
       return;
     }
 
-    if (picked.action === 'invoke' && picked.skillName) {
-      // Insert the `$skill` invocation token into the composer so the user can
-      // add arguments before sending. The CLI expands `$skill args` on submit.
-      void this.host.webview.postMessage({ type: 'insertComposerText', text: '$' + picked.skillName + ' ' });
-    }
+	    if (picked.action === 'invoke' && picked.skillName) {
+	      // Insert the `$skill` invocation token into the composer so the user can
+	      // add arguments before sending. The CLI resolves `$skill args` on submit.
+	      void this.host.webview.postMessage({ type: 'insertComposerText', text: '$' + picked.skillName + ' ' });
+	    }
   }
 
   private async installSkillInteractive(cwd?: string): Promise<void> {
@@ -1507,6 +1650,17 @@ export class HimalayaChatPanel {
   }
 
   async openModelConfigurationWizard(): Promise<void> {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const profiles = workspaceRoot ? listProviderProfiles(workspaceRoot) : {};
+
+    // When saved provider profiles exist, present them directly for one-click switching.
+    // This skips the "Cloud / Local" picker when profiles are available.
+    if (Object.keys(profiles).length > 0) {
+      await this.selectFromProfiles(workspaceRoot!, profiles);
+      return;
+    }
+
+    // No saved profiles: show the original Cloud / Local picker.
     const routeMode = await vscode.window.showQuickPick(
       [
         {
@@ -1531,7 +1685,7 @@ export class HimalayaChatPanel {
     }
 
     if (routeMode.value === 'cloud') {
-      await this.configureCloudModelRoute();
+      await this.configureNewCloudRoute(workspaceRoot);
       return;
     }
 
@@ -1540,93 +1694,104 @@ export class HimalayaChatPanel {
 
   private async configureCloudModelRoute(): Promise<void> {
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    // Prefer a previously persisted base URL (shared with the CLI via
-    // provider.json) so re-running the wizard pre-fills the last value.
     const savedSelection = workspaceRoot ? loadProviderSelection(workspaceRoot) : null;
-    const cloudBaseUrl = await vscode.window.showInputBox({
-      title: 'Cloud model',
-      prompt: 'Enter the cloud network address or OpenAI-compatible base URL',
-      value: savedSelection?.baseUrl || this.currentBootstrap.config.ollamaBaseUrl || 'https://api.openai.com/v1',
-      ignoreFocusOut: true
-    });
+    const profiles = workspaceRoot ? listProviderProfiles(workspaceRoot) : {};
+    const profileNames = Object.keys(profiles).sort();
 
-    if (cloudBaseUrl === undefined) {
-      return;
+    let selectedProfileName: string | undefined;
+    const profileItems: vscode.QuickPickItem[] = [];
+
+    if (profileNames.length > 0) {
+      const hasApiKey = !!savedSelection?.apiKey;
+      profileItems.push(...profileNames.map((profileName) => {
+        const profile = profiles[profileName];
+        const descriptionParts = [
+          profile.model ? `"model": "${profile.model}"` : undefined,
+          profile.base_url ? `"base_url": "${profile.base_url}"` : undefined,
+          `"api_key": "${hasApiKey ? 'saved' : 'missing'}"`
+        ].filter(Boolean);
+        return {
+          label: profileName,
+          description: `{ ${descriptionParts.join(', ')} }`,
+          detail: 'Configured profile'
+        };
+      }));
+    } else {
+      profileItems.push({
+        label: 'No configured provider profiles found',
+        description: 'Add provider profiles to provider.json to reuse saved cloud route settings.',
+        detail: 'Use Custom cloud route… to create a new profile'
+      });
     }
 
-    const cloudApiKey = await vscode.window.showInputBox({
-      title: 'Cloud model',
-      prompt: savedSelection?.apiKey
-        ? 'Enter the API key (leave blank to keep the existing one)'
-        : 'Enter the API key',
-      password: true,
-      ignoreFocusOut: true
-    });
+    profileItems.push({ label: 'Custom cloud route…', description: 'Enter a new base URL, API key, and model', detail: 'Custom' });
 
-    if (cloudApiKey === undefined) {
-      return;
-    }
-    // Reuse the previously saved key when the user leaves the field blank.
-    const effectiveApiKey = cloudApiKey.trim() || savedSelection?.apiKey || '';
-
-    // Fetch the real model catalogue from the provider's /v1/models endpoint so
-    // the user selects an actually-available model (Codex/Claude UX). Falls
-    // back gracefully to the built-in aliases + profiles when unreachable.
-    let cloudModels: { name: string }[] = [];
-    try {
-      cloudModels = await this.cli.listCloudModels(cloudBaseUrl.trim(), effectiveApiKey);
-    } catch (_) { /* keep empty */ }
-    const builtinAliases = [
-      'Himalaya-opus-4-6', 'Himalaya-sonnet-4-6', 'Himalaya-haiku-4-5-20251213',
-      'gpt-4o', 'gpt-4o-mini', 'Himalaya-fable-5', 'claude-sonnet-4-6'
-    ];
-    // Merge provider models, deduplicated with built-in names.
-    const seen = new Set<string>();
-    const modelOptions: vscode.QuickPickItem[] = [];
-    for (const m of cloudModels) {
-      const label = m.name.trim();
-      if (!label || seen.has(label)) { continue; }
-      seen.add(label);
-      modelOptions.push({ label, description: 'Provider', detail: 'Cloud' });
-    }
-    for (const alias of builtinAliases) {
-      if (!seen.has(alias)) {
-        seen.add(alias);
-        modelOptions.push({ label: alias, description: 'Built-in', detail: 'Known model' });
-      }
-    }
-    const defaultModel = this.currentOptions.cloudModel || this.currentOptions.model || this.currentBootstrap.config.defaultModel;
-    if (defaultModel && !seen.has(defaultModel)) {
-      modelOptions.unshift({ label: defaultModel, description: 'Current', detail: 'Pre-selected' });
-    }
-    modelOptions.push({ label: 'Custom model name…', description: 'Enter a model name not in the list', detail: 'Other' });
-    const modelPick = await vscode.window.showQuickPick(modelOptions, {
-      title: 'Cloud model',
-      placeHolder: `Select a model (default: ${defaultModel})`,
+    const profilePick = await vscode.window.showQuickPick(profileItems, {
+      title: 'Cloud model route settings',
+      placeHolder: 'Select a configured profile or define a custom cloud route',
       ignoreFocusOut: true,
       matchOnDescription: true,
       matchOnDetail: true
     });
-
-    if (modelPick === undefined) {
+    if (!profilePick) {
       return;
     }
+    if (profilePick.label !== 'Custom cloud route…' && profilePick.label !== 'No configured provider profiles found') {
+      selectedProfileName = profilePick.label;
+    }
 
-    let selectedModel: string;
-    if (modelPick.label === 'Custom model name…') {
-      const custom = await vscode.window.showInputBox({
-        title: 'Cloud model',
-        prompt: 'Enter the model name',
-        value: defaultModel,
-        ignoreFocusOut: true
-      });
-      if (custom === undefined) {
+    let cloudBaseUrl = savedSelection?.baseUrl || this.currentBootstrap.config.ollamaBaseUrl || 'https://api.openai.com/v1';
+    let effectiveApiKey = savedSelection?.apiKey || '';
+    let selectedModel = this.currentOptions.cloudModel || this.currentOptions.model || this.currentBootstrap.config.defaultModel;
+
+    if (selectedProfileName) {
+      const profile = profiles[selectedProfileName];
+      cloudBaseUrl = profile.base_url ?? cloudBaseUrl;
+      selectedModel = profile.model || selectedModel;
+      effectiveApiKey = savedSelection?.apiKey || effectiveApiKey;
+
+      if (!effectiveApiKey) {
+        const apiKey = await vscode.window.showInputBox({
+          title: 'Cloud model route settings',
+          prompt: `Enter api_key for profile ${selectedProfileName}`,
+          password: true,
+          ignoreFocusOut: true
+        });
+        if (apiKey === undefined) {
+          return;
+        }
+        effectiveApiKey = apiKey.trim();
+      }
+
+      if (!profile.model || !profile.base_url) {
+        const confirmed = await this.confirmCloudRouteSettings(
+          cloudBaseUrl,
+          effectiveApiKey,
+          selectedModel,
+          selectedProfileName
+        );
+        if (!confirmed) {
+          return;
+        }
+        cloudBaseUrl = confirmed.cloudBaseUrl;
+        effectiveApiKey = confirmed.cloudApiKey;
+        selectedModel = confirmed.selectedModel;
+      }
+    } else {
+      const confirmed = await this.confirmCloudRouteSettings(
+        cloudBaseUrl,
+        effectiveApiKey,
+        selectedModel,
+        selectedProfileName
+      );
+      if (!confirmed) {
         return;
       }
-      selectedModel = custom.trim();
-    } else {
-      selectedModel = modelPick.label.trim();
+      cloudBaseUrl = confirmed.cloudBaseUrl;
+      effectiveApiKey = confirmed.cloudApiKey;
+      selectedModel = confirmed.selectedModel;
     }
+
     if (!cloudBaseUrl.trim() || !effectiveApiKey || !selectedModel) {
       void vscode.window.showWarningMessage('Cloud model setup requires a network address, API key, and model name.');
       return;
@@ -1641,8 +1806,6 @@ export class HimalayaChatPanel {
       cloudModel: selectedModel
     });
 
-    // Unify with the CLI: mirror the selection into the shared provider.json
-    // (+ credentials file) so `Himalaya` picks up the same cloud model.
     if (workspaceRoot) {
       try {
         saveProviderSelection(workspaceRoot, {
@@ -1667,6 +1830,322 @@ export class HimalayaChatPanel {
 
     void this.host.webview.postMessage({ type: 'model-updated', model: selectedModel, modelBackend: 'cloud' });
     void vscode.window.showInformationMessage(`Himalaya cloud model set to ${selectedModel} (shared with CLI).`);
+  }
+
+  /// Show a profile switcher QuickPick with all saved provider profiles,
+  /// plus options to create a new cloud route or switch to local models.
+  private async selectFromProfiles(
+    workspaceRoot: string,
+    profiles: Record<string, ProviderProfile>
+  ): Promise<void> {
+    const items: vscode.QuickPickItem[] = [];
+
+    for (const [name, profile] of Object.entries(profiles)) {
+      const descParts = [
+        profile.model ? `model: ${profile.model}` : undefined,
+        profile.base_url ? `url: ${profile.base_url}` : undefined
+      ].filter(Boolean);
+      items.push({
+        label: name,
+        description: descParts.join(' · '),
+        detail: 'Select to switch immediately'
+      });
+    }
+
+    items.push(
+      { label: '', kind: vscode.QuickPickItemKind.Separator },
+      { label: 'Configure new cloud route…', description: 'Add a new provider and save as a profile', detail: 'New' },
+      { label: 'Switch to local model…', description: 'Use Ollama-managed models', detail: 'Local' }
+    );
+
+    const pick = await vscode.window.showQuickPick(items, {
+      title: 'Switch model',
+      placeHolder: 'Select a configured profile or add a new one',
+      ignoreFocusOut: true,
+      matchOnDescription: true,
+      matchOnDetail: true
+    });
+
+    if (!pick) { return; }
+
+    if (pick.label === 'Configure new cloud route…') {
+      await this.configureNewCloudRoute(workspaceRoot);
+    } else if (pick.label === 'Switch to local model…') {
+      await this.configureLocalModelRoute();
+    } else {
+      // One-click profile switch: no confirmation for complete profiles.
+      await this.applyProfile(workspaceRoot, pick.label, profiles[pick.label]);
+    }
+  }
+
+  /// One-click profile switch. Reads the profile from provider.json, looks up
+  /// the api_key from credentials, and applies the route immediately without
+  /// prompting for base_url or model name.
+  private async applyProfile(
+    workspaceRoot: string,
+    profileName: string,
+    profile: ProviderProfile
+  ): Promise<void> {
+    const baseUrl = profile.base_url?.trim();
+    const model = profile.model?.trim();
+
+    if (!model || !baseUrl) {
+      void vscode.window.showWarningMessage(`Profile "${profileName}" is incomplete; please edit provider.json to include model and base_url.`);
+      return;
+    }
+
+    // Read the api_key from credentials (the same file the CLI reads).
+    let apiKey = '';
+    try {
+      const credsPath = providerCredentialsPath();
+      if (fs.existsSync(credsPath)) {
+        const raw = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+        apiKey = typeof raw.api_key === 'string' ? raw.api_key : '';
+      }
+    } catch { /* best effort */}
+    apiKey = apiKey.trim();
+
+    // If no api_key is saved, prompt once.
+    if (!apiKey && baseUrl) {
+      const entered = await vscode.window.showInputBox({
+        title: 'API Key required',
+        prompt: `Enter the API key for "${profileName}" (${baseUrl})`,
+        password: true,
+        ignoreFocusOut: true
+      });
+      if (entered === undefined) { return; } // user cancelled
+      apiKey = entered.trim();
+      if (!apiKey) {
+        void vscode.window.showWarningMessage('No API key configured. Please set one first.');
+        return;
+      }
+    }
+
+    // If we have base_url + api_key, save them to credentials for future use.
+    if (apiKey) {
+      try {
+        const credsPath = providerCredentialsPath();
+        fs.mkdirSync(path.dirname(credsPath), { recursive: true });
+        fs.writeFileSync(credsPath, JSON.stringify({ api_key: apiKey }, null, 2), 'utf8');
+        if (process.platform !== 'win32') {
+          try { fs.chmodSync(credsPath, 0o600); } catch { /* best effort */}
+        }
+      } catch { /* best effort */}
+    }
+
+    // Write to the extension's own model route storage (Layer A).
+    await writeModelRoute(this.context, {
+      model,
+      modelBackend: 'cloud',
+      modelSource: 'cloud',
+      cloudBaseUrl: baseUrl || undefined,
+      cloudApiKey: apiKey || undefined,
+      cloudModel: model
+    });
+
+    this.currentOptions = {
+      ...this.currentOptions,
+      model,
+      modelBackend: 'cloud',
+      cloudBaseUrl: baseUrl || undefined,
+      cloudApiKey: apiKey || undefined,
+      cloudModel: model
+    };
+
+    void this.host.webview.postMessage({ type: 'model-updated', model, modelBackend: 'cloud' });
+    void vscode.window.showInformationMessage(`Switched to ${profileName}: ${model}`);
+  }
+
+  /// Configure a brand-new cloud provider in 4 steps (base_url → api_key →
+  /// model → profile name) and persist it both as a named profile and as the
+  /// active model route.
+  private async configureNewCloudRoute(workspaceRoot?: string): Promise<void> {
+    // Step 1: base_url
+    const baseUrl = await vscode.window.showInputBox({
+      title: 'New cloud provider',
+      prompt: 'Enter the provider base URL (OpenAI-compatible endpoint)',
+      value: 'https://api.openai.com/v1',
+      ignoreFocusOut: true
+    });
+    if (!baseUrl) { return; }
+
+    // Step 2: api_key
+    const apiKey = await vscode.window.showInputBox({
+      title: 'New cloud provider',
+      prompt: 'Enter the API key',
+      password: true,
+      ignoreFocusOut: true
+    });
+    if (!apiKey) { return; }
+
+    // Step 3: auto-fetch model list and let the user pick (or type manually).
+    const selectedModel = await this.pickCloudModelWithBaseUrl(
+      baseUrl.trim(), apiKey.trim(), undefined
+    );
+    if (!selectedModel) { return; }
+
+    // Step 4: ask for a profile name so the user can switch back later.
+    let defaultName = 'default';
+    try {
+      defaultName = new URL(baseUrl.trim()).hostname.split('.')[0] || 'custom';
+    } catch { defaultName = 'custom'; }
+    const profileName = await vscode.window.showInputBox({
+      title: 'Save as profile',
+      prompt: 'Give this configuration a name for quick switching later (e.g. "openai", "deepseek")',
+      value: defaultName,
+      ignoreFocusOut: true
+    });
+    if (!profileName) { return; }
+
+    // --- Persist ---
+    // Layer A: extension's own route storage
+    await writeModelRoute(this.context, {
+      model: selectedModel,
+      modelBackend: 'cloud',
+      modelSource: 'cloud',
+      cloudBaseUrl: baseUrl.trim(),
+      cloudApiKey: apiKey.trim(),
+      cloudModel: selectedModel
+    });
+
+    // Layer B: provider.json + credentials (shared with CLI)
+    if (workspaceRoot) {
+      try {
+        saveProviderProfile(workspaceRoot, profileName.trim(), {
+          model: selectedModel,
+          base_url: baseUrl.trim()
+        });
+        // Also save the api_key to credentials (shared global file).
+        const credsPath = providerCredentialsPath();
+        fs.mkdirSync(path.dirname(credsPath), { recursive: true });
+        fs.writeFileSync(credsPath, JSON.stringify({ api_key: apiKey.trim() }, null, 2), 'utf8');
+        if (process.platform !== 'win32') {
+          try { fs.chmodSync(credsPath, 0o600); } catch { /* best effort */}
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.output.appendLine(`[model] failed to persist cloud config: ${message}`);
+      }
+    }
+
+    this.currentOptions = {
+      ...this.currentOptions,
+      model: selectedModel,
+      modelBackend: 'cloud',
+      cloudBaseUrl: baseUrl.trim(),
+      cloudApiKey: apiKey.trim(),
+      cloudModel: selectedModel
+    };
+
+    void this.host.webview.postMessage({ type: 'model-updated', model: selectedModel, modelBackend: 'cloud' });
+    void vscode.window.showInformationMessage(
+      `Cloud model set to ${selectedModel} (profile: ${profileName.trim()}). Shared with CLI.`
+    );
+  }
+
+  private async fetchCloudModelOptions(baseUrl: string, apiKey: string): Promise<{ name: string }[]> {
+    const models: { name: string }[] = [];
+    if (!baseUrl || !apiKey) {
+      return models;
+    }
+    try {
+      return await this.cli.listCloudModels(baseUrl, apiKey);
+    } catch (_) {
+      return models;
+    }
+  }
+
+  private async confirmCloudRouteSettings(
+    baseUrl: string,
+    apiKey: string,
+    currentModel: string,
+    profileName?: string
+  ): Promise<{ cloudBaseUrl: string; cloudApiKey: string; selectedModel: string } | undefined> {
+    const cloudBaseUrl = await vscode.window.showInputBox({
+      title: 'Cloud model route settings',
+      prompt: profileName
+        ? `Confirm or edit base_url for profile ${profileName}`
+        : 'Enter the provider base_url (OpenAI-compatible endpoint)',
+      value: baseUrl,
+      ignoreFocusOut: true
+    });
+    if (cloudBaseUrl === undefined) {
+      return undefined;
+    }
+
+    const cloudApiKey = await vscode.window.showInputBox({
+      title: 'Cloud model route settings',
+      prompt: apiKey
+        ? `Confirm or edit api_key for profile ${profileName ?? 'custom route'} (leave blank to keep existing)`
+        : 'Enter the provider api_key',
+      password: true,
+      ignoreFocusOut: true
+    });
+    if (cloudApiKey === undefined) {
+      return undefined;
+    }
+    const effectiveApiKey = cloudApiKey.trim() || apiKey;
+
+    const selectedModel = await this.pickCloudModelWithBaseUrl(cloudBaseUrl.trim(), effectiveApiKey, currentModel);
+    if (!selectedModel) {
+      return undefined;
+    }
+
+    return {
+      cloudBaseUrl: cloudBaseUrl.trim(),
+      cloudApiKey: effectiveApiKey,
+      selectedModel
+    };
+  }
+
+  private async pickCloudModelWithBaseUrl(baseUrl: string, apiKey: string, currentModel: string | undefined): Promise<string | undefined> {
+    const cloudModels = await this.fetchCloudModelOptions(baseUrl, apiKey);
+    const builtinAliases = [
+      'Himalaya-opus-4-6', 'Himalaya-sonnet-4-6', 'Himalaya-haiku-4-5-20251213',
+      'gpt-4o', 'gpt-4o-mini', 'Himalaya-fable-5', 'claude-sonnet-4-6'
+    ];
+    const seen = new Set<string>();
+    const modelOptions: vscode.QuickPickItem[] = [];
+    for (const m of cloudModels) {
+      const label = m.name.trim();
+      if (!label || seen.has(label)) { continue; }
+      seen.add(label);
+      modelOptions.push({ label, description: 'Provider', detail: 'Cloud model from endpoint' });
+    }
+    for (const alias of builtinAliases) {
+      if (!seen.has(alias)) {
+        seen.add(alias);
+        modelOptions.push({ label: alias, description: 'Built-in', detail: 'Known alias' });
+      }
+    }
+    if (currentModel && !seen.has(currentModel)) {
+      modelOptions.unshift({ label: currentModel, description: 'Current', detail: 'Preserved selection' });
+    }
+    modelOptions.push({ label: 'Custom model name…', description: 'Enter a model name not in the list', detail: 'Other' });
+
+    const modelPick = await vscode.window.showQuickPick(modelOptions, {
+      title: 'Cloud model route settings',
+      placeHolder: `Select or confirm a model name (default: ${currentModel ?? 'none'})`,
+      ignoreFocusOut: true,
+      matchOnDescription: true,
+      matchOnDetail: true
+    });
+    if (!modelPick) {
+      return undefined;
+    }
+    if (modelPick.label === 'Custom model name…') {
+      const custom = await vscode.window.showInputBox({
+        title: 'Cloud model route settings',
+        prompt: 'Enter the provider model name',
+        value: currentModel,
+        ignoreFocusOut: true
+      });
+      if (custom === undefined) {
+        return undefined;
+      }
+      return custom.trim();
+    }
+    return modelPick.label.trim();
   }
 
   private async configureLocalModelRoute(): Promise<void> {
@@ -2675,16 +3154,6 @@ export class HimalayaChatPanel {
       gap: 6px;
     }
     .trust-banner[hidden] { display: none; }
-    .task-board-surface {
-      flex: 0 0 auto;
-      margin: 8px 10px 0;
-      padding: 8px;
-      border-radius: 8px;
-      border: 1px solid rgba(78,201,176,0.25);
-      background: linear-gradient(180deg, rgba(78,201,176,0.08), rgba(255,255,255,0.02));
-      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
-    }
-    .task-board-surface[hidden] { display: none; }
     .task-board-surface.collapsed {
       padding: 7px 9px;
     }
@@ -2871,6 +3340,91 @@ export class HimalayaChatPanel {
     .task-board-status.status-cancelled { border-color: rgba(244,71,71,0.45); color: #ff9a9a; }
     .task-board-status.status-created,
     .task-board-status.status-pending { border-color: rgba(76,132,255,0.35); color: #a8c7ff; }
+    .content-shell {
+      flex: 1 1 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(280px, var(--trace-width, 340px));
+      gap: 10px;
+      overflow: hidden;
+      padding: 0 10px;
+    }
+    .pane-resizer {
+      width: 8px;
+      cursor: col-resize;
+      background: rgba(255,255,255,0.04);
+      transition: background 0.2s ease;
+    }
+    .pane-resizer:hover {
+      background: rgba(255,255,255,0.11);
+    }
+    .trace-shell {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      max-height: 100%;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      overflow: hidden;
+    }
+    .trace-shell-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,0.03);
+    }
+    .trace-shell-title {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text);
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .trace-shell-body {
+      flex: 1 1 0;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .trace-feed {
+      flex: 0 0 auto;
+      min-height: 120px;
+      height: var(--trace-feed-height, 240px);
+      overflow-y: auto;
+      padding: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .trace-feed::-webkit-scrollbar { width: 4px; }
+    .trace-feed::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+    .trace-feed .msg { margin-bottom: 10px; }
+    .trace-body-resizer {
+      height: 6px;
+      cursor: row-resize;
+      background: rgba(255,255,255,0.04);
+      transition: background 0.2s ease;
+    }
+    .trace-body-resizer:hover {
+      background: rgba(255,255,255,0.11);
+    }
+    .task-board-surface {
+      flex: 1 1 0;
+      min-height: 0;
+      margin: 0;
+      padding: 8px;
+      border-radius: 0 0 8px 8px;
+      border-top: none;
+      border-left: none;
+      border-right: none;
+      border-bottom: none;
+      background: linear-gradient(180deg, rgba(78,201,176,0.08), rgba(255,255,255,0.02));
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
+      overflow-y: auto;
+    }
+    .task-board-surface[hidden] { display: none; }
   </style>
 `;
     const _body = `</head>
@@ -2905,25 +3459,36 @@ export class HimalayaChatPanel {
     <button class="icon-btn" id="btnStatus" title="Status">&#9432;</button>
   </div>
 
-  <div class="task-board-surface" id="taskBoardSurface" hidden></div>
+  <div class="content-shell">
+    <div class="thread" id="thread">
+      <div class="empty-state" id="emptyState">
+        <div class="logo">H</div>
+        <div class="tagline">Ask Himalaya to inspect, refactor, or recover a session.</div>
+        <div class="quick-chips" id="quickChips">
+          <button class="chip" data-prompt="Summarize this repository">Summarize repo</button>
+          <button class="chip" data-prompt="Show the current status">Status</button>
+          <button class="chip" data-prompt="Run the doctor health check">Doctor</button>
+          <button class="chip" data-prompt="Open my latest session">Resume latest</button>
+        </div>
+      </div>
+    </div>
+    <div class="pane-resizer" id="traceResizer" title="Drag to resize trace panel"></div>
+    <div class="trace-shell" id="traceShell" hidden>
+      <div class="trace-shell-header">
+        <div class="trace-shell-title">Trace</div>
+        <button class="icon-btn" id="btnTraceClose" title="Close trace panel">✕</button>
+      </div>
+      <div class="trace-shell-body">
+        <div class="trace-feed" id="traceFeed"></div>
+        <div class="trace-body-resizer" id="traceBodyResizer" title="Drag to resize trace feed"></div>
+        <div class="task-board-surface" id="taskBoardSurface" hidden></div>
+      </div>
+    </div>
+  </div>
 
   <!-- history drawer (collapsed by default) -->
   <div class="history-drawer" id="historyDrawer">
     <div id="historyList"></div>
-  </div>
-
-  <!-- thread -->
-  <div class="thread" id="thread">
-    <div class="empty-state" id="emptyState">
-      <div class="logo">H</div>
-      <div class="tagline">Ask Himalaya to inspect, refactor, or recover a session.</div>
-      <div class="quick-chips" id="quickChips">
-        <button class="chip" data-prompt="Summarize this repository">Summarize repo</button>
-        <button class="chip" data-prompt="Show the current status">Status</button>
-        <button class="chip" data-prompt="Run the doctor health check">Doctor</button>
-        <button class="chip" data-prompt="Open my latest session">Resume latest</button>
-      </div>
-    </div>
   </div>
 
   <!-- composer -->
@@ -3014,6 +3579,9 @@ export class HimalayaChatPanel {
         routeSummary: null,
         benchmark: null
       },
+      traceOpen: Boolean(INIT.showReasoning),
+      traceManualClosed: !Boolean(INIT.showReasoning),
+      traceAutoOpenEnabled: true,
       historyRecords: HISTORY
     };
 
@@ -3033,6 +3601,10 @@ export class HimalayaChatPanel {
     const historyDrawer= document.getElementById('historyDrawer');
     const historyList  = document.getElementById('historyList');
     const trustBanner  = document.getElementById('trustBanner');
+    const traceShell = document.getElementById('traceShell');
+    const traceFeed = document.getElementById('traceFeed');
+    const traceResizer = document.getElementById('traceResizer');
+    const traceBodyResizer = document.getElementById('traceBodyResizer');
     const taskBoardSurface = document.getElementById('taskBoardSurface');
 
     /* ── attachment state ── */
@@ -3227,6 +3799,7 @@ export class HimalayaChatPanel {
       try {
         if (!thread) { return; }
         showEmpty(false);
+        clearPendingToolCards();
         streamBuffer = '';
         streamRendered = '';
         streamBubble = document.createElement('div');
@@ -3265,6 +3838,7 @@ export class HimalayaChatPanel {
             body.innerHTML = renderMarkdown(streamBuffer);
           }
         }
+        clearPendingToolCards();
         if (streamCursor && streamCursor.remove) { streamCursor.remove(); }
         streamCursor = null;
         streamBuffer = '';
@@ -3494,9 +4068,68 @@ export class HimalayaChatPanel {
     }
 
     // TOOL_CARD_BUILDERS_2
-    // Track the most recent tool card per tool name so a tool_result can attach
-    // its output to the matching tool_use card.
-    const pendingToolCards = {};
+    // Track pending tool cards by tool-use id when available, falling back to
+    // per-name queues for legacy or partial events.
+    const pendingToolCardsById = {};
+    const pendingToolCardsByName = {};
+
+    function pendingToolCardName(msg) {
+      return msg && msg.name ? String(msg.name) : 'tool';
+    }
+
+    function storePendingToolCard(msg, card) {
+      const name = pendingToolCardName(msg);
+      const toolUseId = msg && msg.toolUseId ? String(msg.toolUseId) : '';
+      const entry = { toolUseId: toolUseId, card: card };
+      if (toolUseId) {
+        pendingToolCardsById[toolUseId] = entry;
+      }
+      if (!pendingToolCardsByName[name]) {
+        pendingToolCardsByName[name] = [];
+      }
+      pendingToolCardsByName[name].push(entry);
+    }
+
+    function removePendingToolCardFromNameQueue(name, card) {
+      const queue = pendingToolCardsByName[name];
+      if (!queue || queue.length === 0) {
+        return;
+      }
+      const remaining = queue.filter(function(entry) { return entry.card !== card; });
+      if (remaining.length === 0) {
+        delete pendingToolCardsByName[name];
+      } else {
+        pendingToolCardsByName[name] = remaining;
+      }
+    }
+
+    function takePendingToolCard(msg) {
+      const name = pendingToolCardName(msg);
+      const toolUseId = msg && msg.toolUseId ? String(msg.toolUseId) : '';
+      if (toolUseId && pendingToolCardsById[toolUseId]) {
+        const entry = pendingToolCardsById[toolUseId];
+        delete pendingToolCardsById[toolUseId];
+        removePendingToolCardFromNameQueue(name, entry.card);
+        return entry.card;
+      }
+      const queue = pendingToolCardsByName[name];
+      if (!queue || queue.length === 0) {
+        return undefined;
+      }
+      const entry = queue.shift();
+      if (queue.length === 0) {
+        delete pendingToolCardsByName[name];
+      }
+      if (entry && entry.toolUseId) {
+        delete pendingToolCardsById[entry.toolUseId];
+      }
+      return entry ? entry.card : undefined;
+    }
+
+    function clearPendingToolCards() {
+      Object.keys(pendingToolCardsById).forEach(function(key) { delete pendingToolCardsById[key]; });
+      Object.keys(pendingToolCardsByName).forEach(function(key) { delete pendingToolCardsByName[key]; });
+    }
 
     function buildResultBlock(output, isError) {
       const text = String(output == null ? '' : output);
@@ -3520,13 +4153,12 @@ export class HimalayaChatPanel {
         const name = msg.name ? String(msg.name) : 'tool';
         if (msg.step === 'result') {
           // Attach to the pending use-card if present, else create a standalone card.
-          const card = pendingToolCards[name];
+          const card = takePendingToolCard(msg);
           const block = buildResultBlock(msg.output, msg.isError);
           if (card && card.querySelector) {
             const slot = card.querySelector('.tool-result-slot');
             if (slot) { slot.innerHTML = block; }
             if (msg.isError) { card.classList.add('has-error'); }
-            delete pendingToolCards[name];
             smartScroll();
             return;
           }
@@ -3551,7 +4183,7 @@ export class HimalayaChatPanel {
           '<div class="tool-use-body">' + toolUseBody(name, input) + '</div>' +
           '<div class="tool-result-slot"></div>';
         thread.appendChild(div);
-        pendingToolCards[name] = div;
+        storePendingToolCard(msg, div);
         smartScroll();
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'renderToolCard failed: ' + String(e) }); } catch (_) {}
@@ -3607,7 +4239,6 @@ export class HimalayaChatPanel {
       try {
         if (!step) { return; }
         if (!state.showReasoning) { return; }
-        if (!thread) { return; }
         // Close any active answer stream so the thinking block lands before the
         // next answer segment (preserves think → answer → think ordering).
         if (streamBubble) { endStream(); }
@@ -3617,14 +4248,17 @@ export class HimalayaChatPanel {
         div.className = 'msg thinking-block';
         const details = document.createElement('details');
         details.className = 'thinking-details';
-        // Collapsed by default — like Claude's foldable thinking.
         details.innerHTML = '<summary class="thinking-summary">' +
           '<span class="thinking-icon">💭</span><span class="thinking-label">Thinking</span>' +
           '<span class="thinking-kind">' + esc(kind) + '</span></summary>' +
           '<div class="thinking-body">' + renderMarkdown(text) + '</div>';
         div.appendChild(details);
-        thread.appendChild(div);
-        smartScroll();
+        if (traceFeed) {
+          appendTraceEntry(div);
+        } else if (thread) {
+          thread.appendChild(div);
+          smartScroll();
+        }
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'addReasoningStep failed: ' + String(e) }); } catch (_) {}
       }
@@ -4689,9 +5323,25 @@ export class HimalayaChatPanel {
     }
 
     function addRuntimeEvent(kind, event) {
-      try { updateTaskBoardFromRuntimeEvent(kind, event); } catch (_) {}
       try {
-        if (!thread) { return; }
+        // webview-level seq de-dup: keep last seq per (kind + id) to ignore stale events
+        try {
+          state._lastSeqByKey = state._lastSeqByKey || Object.create(null);
+          const seq = event && typeof event.seq === 'number' ? event.seq : null;
+          let key = 'global:' + String(kind);
+          if (event && typeof event === 'object') {
+            const id = event.task_id || event.taskId || event.node_id || event.nodeId || (event.task && event.task.task_id) || '';
+            key = String(kind) + ':' + String(id || 'global');
+          }
+          if (seq !== null) {
+            const prev = typeof state._lastSeqByKey[key] === 'number' ? state._lastSeqByKey[key] : -Infinity;
+            if (seq <= prev) { return; }
+            state._lastSeqByKey[key] = seq;
+          }
+        } catch (_) {}
+        updateTaskBoardFromRuntimeEvent(kind, event);
+      } catch (_) {}
+      try {
         const div = document.createElement('div');
         const normalizedKind = String(kind || 'runtime_event').replace(/_/g, ' ');
         const summary = runtimeEventSummary(kind, event);
@@ -4704,8 +5354,12 @@ export class HimalayaChatPanel {
           '<span class="rt-summary">' + esc(summary) + '</span></div>' +
           (detail ? '<div class="rt-detail">' + detail + '</div>' : '') +
           '<details class="rt-raw"><summary>Raw event</summary><pre>' + esc(raw) + '</pre></details>';
-        thread.appendChild(div);
-        smartScroll();
+        if (traceFeed) {
+          appendTraceEntry(div);
+        } else if (thread) {
+          thread.appendChild(div);
+          smartScroll();
+        }
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'addRuntimeEvent failed: ' + String(e) }); } catch (_) {}
       }
@@ -4715,12 +5369,15 @@ export class HimalayaChatPanel {
       try {
         if (!event) { return; }
         if (!state.showReasoning) { return; }
-        if (!thread) { return; }
         const div = document.createElement('div');
         div.className = 'msg decisioning-step';
         div.innerHTML = renderDecisioningEventMarkup(event);
-        thread.appendChild(div);
-        scrollBottom();
+        if (traceFeed) {
+          appendTraceEntry(div);
+        } else if (thread) {
+          thread.appendChild(div);
+          scrollBottom();
+        }
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'addDecisioningEvent failed: ' + String(e) }); } catch (_) {}
       }
@@ -4730,20 +5387,69 @@ export class HimalayaChatPanel {
       try {
         const btn = document.getElementById('btnReasoning');
         if (!btn) { return; }
-        btn.style.opacity = state.showReasoning ? '1' : '0.6';
-        btn.title = state.showReasoning ? 'Hide reasoning visualization' : 'Show reasoning visualization';
+        btn.style.opacity = state.traceOpen ? '1' : '0.6';
+        btn.title = state.traceOpen ? 'Hide trace panel' : 'Show trace panel';
       } catch (e) {
         try { vscode.postMessage({ type: 'webview-error', message: 'updateReasoningToggle failed: ' + String(e) }); } catch (_) {}
       }
     }
 
-    
+    function maybeAutoOpenTrace() {
+      try {
+        if (!state.traceAutoOpenEnabled || state.traceOpen || state.traceManualClosed) { return; }
+        state.traceOpen = true;
+        state.showReasoning = true;
+        updateReasoningToggle();
+        updateTracePanel();
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'maybeAutoOpenTrace failed: ' + String(e) }); } catch (_) {}
+      }
+    }
+
+    function updateTracePanel() {
+      try {
+        if (!traceShell) { return; }
+        traceShell.hidden = !state.traceOpen;
+        if (traceResizer) { traceResizer.hidden = !state.traceOpen; }
+        if (traceShell.hidden) {
+          return;
+        }
+        if (traceBodyResizer) { traceBodyResizer.hidden = taskBoardSurface ? taskBoardSurface.hidden : true; }
+        if (taskBoardSurface) {
+          updateTaskBoardSurface();
+        }
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'updateTracePanel failed: ' + String(e) }); } catch (_) {}
+      }
+    }
+
+    function appendTraceEntry(div) {
+      try {
+        if (!traceFeed) { return; }
+        maybeAutoOpenTrace();
+        traceFeed.appendChild(div);
+        traceFeed.scrollTop = traceFeed.scrollHeight;
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'appendTraceEntry failed: ' + String(e) }); } catch (_) {}
+      }
+    }
+
+    function clearTraceFeed() {
+      try {
+        if (!traceFeed) { return; }
+        traceFeed.innerHTML = '';
+      } catch (e) {
+        try { vscode.postMessage({ type: 'webview-error', message: 'clearTraceFeed failed: ' + String(e) }); } catch (_) {}
+      }
+    }
 
     /* ── thread rendering ── */
     function renderThread() {
       thread.innerHTML = '';
       streamBubble = null;
       streamCursor = null;
+      clearPendingToolCards();
+      clearTraceFeed();
       if (state.messages.length === 0 && state.recoveryEvidence.length === 0) {
         thread.appendChild(emptyState);
         showEmpty(true);
@@ -4848,6 +5554,7 @@ export class HimalayaChatPanel {
           const idx = modes.indexOf(state.permissionMode);
           state.permissionMode = modes[(idx + 1) % modes.length];
           updateModelBar();
+          try { vscode.postMessage({ type: 'permission-change', permissionMode: state.permissionMode }); } catch (_) {}
         } catch (_) {}
       });
     }
@@ -4868,7 +5575,10 @@ export class HimalayaChatPanel {
           state.activeRecordId = null;
           state.resumeTarget = '';
           state.taskBoard = taskBoardInitialState();
+          state.traceOpen = false;
+          clearTraceFeed();
           renderThread();
+          updateTracePanel();
           setStatus('New session.', '');
           vscode.postMessage({ type: 'command', command: 'newSession' });
         } catch (_) {}
@@ -4886,8 +5596,24 @@ export class HimalayaChatPanel {
     if (btnReasoningEl) {
       btnReasoningEl.addEventListener('click', function() {
         try {
-          state.showReasoning = !state.showReasoning;
+          state.traceOpen = !state.traceOpen;
+          state.traceManualClosed = !state.traceOpen;
+          state.showReasoning = state.traceOpen;
           updateReasoningToggle();
+          updateTracePanel();
+          try { vscode.postMessage({ type: 'toggle-reasoning', enabled: state.showReasoning }); } catch (_) {}
+        } catch (_) {}
+      });
+    }
+    const btnTraceCloseEl = document.getElementById('btnTraceClose');
+    if (btnTraceCloseEl) {
+      btnTraceCloseEl.addEventListener('click', function() {
+        try {
+          state.traceOpen = false;
+          state.showReasoning = false;
+          state.traceManualClosed = true;
+          updateReasoningToggle();
+          updateTracePanel();
           try { vscode.postMessage({ type: 'toggle-reasoning', enabled: state.showReasoning }); } catch (_) {}
         } catch (_) {}
       });
@@ -4895,6 +5621,7 @@ export class HimalayaChatPanel {
     // ensure initial visual state
     try { updateReasoningToggle(); } catch (_) {}
     try { updateTaskBoardSurface(); } catch (_) {}
+    try { updateTracePanel(); } catch (_) {}
 
     const btnRefreshEl = document.getElementById('btnRefresh');
     if (btnRefreshEl) {
@@ -4946,6 +5673,70 @@ export class HimalayaChatPanel {
         } catch (_) {}
       });
     }
+    if (traceResizer) {
+      let isTraceResizing = false;
+      let traceResizeStartX = 0;
+      let traceStartWidth = 0;
+      const minTraceWidth = 280;
+      const maxTraceWidth = 640;
+      traceResizer.addEventListener('pointerdown', function(event) {
+        try {
+          event.preventDefault();
+          if (!traceShell) { return; }
+          isTraceResizing = true;
+          traceResizeStartX = event.clientX;
+          traceStartWidth = traceShell.getBoundingClientRect().width;
+          traceResizer.setPointerCapture(event.pointerId);
+          document.addEventListener('pointermove', onTraceResize);
+          document.addEventListener('pointerup', stopTraceResize);
+        } catch (_) {}
+      });
+      function onTraceResize(event) {
+        if (!isTraceResizing || !traceShell) { return; }
+        const delta = traceResizeStartX - event.clientX;
+        let width = traceStartWidth + delta;
+        width = Math.min(Math.max(width, minTraceWidth), maxTraceWidth);
+        traceShell.style.setProperty('--trace-width', width + 'px');
+      }
+      function stopTraceResize() {
+        if (!isTraceResizing) { return; }
+        isTraceResizing = false;
+        document.removeEventListener('pointermove', onTraceResize);
+        document.removeEventListener('pointerup', stopTraceResize);
+      }
+    }
+    if (traceBodyResizer) {
+      let isTraceBodyResizing = false;
+      let traceBodyStartY = 0;
+      let traceBodyStartHeight = 0;
+      const minTraceFeedHeight = 120;
+      const maxTraceFeedHeight = 520;
+      traceBodyResizer.addEventListener('pointerdown', function(event) {
+        try {
+          event.preventDefault();
+          if (!traceShell) { return; }
+          isTraceBodyResizing = true;
+          traceBodyStartY = event.clientY;
+          traceBodyStartHeight = traceFeed ? traceFeed.getBoundingClientRect().height : 0;
+          traceBodyResizer.setPointerCapture(event.pointerId);
+          document.addEventListener('pointermove', onTraceBodyResize);
+          document.addEventListener('pointerup', stopTraceBodyResize);
+        } catch (_) {}
+      });
+      function onTraceBodyResize(event) {
+        if (!isTraceBodyResizing || !traceShell) { return; }
+        const delta = event.clientY - traceBodyStartY;
+        let height = traceBodyStartHeight + delta;
+        height = Math.min(Math.max(height, minTraceFeedHeight), maxTraceFeedHeight);
+        traceShell.style.setProperty('--trace-feed-height', height + 'px');
+      }
+      function stopTraceBodyResize() {
+        if (!isTraceBodyResizing) { return; }
+        isTraceBodyResizing = false;
+        document.removeEventListener('pointermove', onTraceBodyResize);
+        document.removeEventListener('pointerup', stopTraceBodyResize);
+      }
+    }
 
     /* ── messages from extension host ── */
     window.addEventListener('message', function(event) {
@@ -4986,9 +5777,13 @@ export class HimalayaChatPanel {
             if (msg.options.modelBackend) { state.modelBackend = msg.options.modelBackend; }
             if (msg.options.permissionMode) { state.permissionMode = msg.options.permissionMode; }
             if (msg.options.resumeTarget !== undefined) { state.resumeTarget = msg.options.resumeTarget || ''; }
-            if (msg.options.showReasoning !== undefined) { state.showReasoning = Boolean(msg.options.showReasoning); }
+            if (msg.options.showReasoning !== undefined) {
+              state.showReasoning = Boolean(msg.options.showReasoning);
+              state.traceOpen = state.showReasoning;
+            }
           }
           trustBanner.hidden = state.isTrusted;
+          try { updateTracePanel(); } catch (_) {}
             setStatus(
               state.isTrusted ? 'Ready' : 'Workspace untrusted — execution blocked.',
               state.isTrusted ? '' : 'error'
@@ -5033,7 +5828,10 @@ export class HimalayaChatPanel {
           state.activeRecordId = null;
           state.resumeTarget = '';
           state.taskBoard = taskBoardInitialState();
+          state.traceOpen = false;
+          clearTraceFeed();
           renderThread();
+          updateTracePanel();
           setStatus('Ready', '');
           break;
         case 'model-updated':
