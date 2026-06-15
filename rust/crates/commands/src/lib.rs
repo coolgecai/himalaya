@@ -2789,6 +2789,79 @@ pub fn parse_skill_invocation_prompt(input: &str) -> Option<SkillInvocation> {
     })
 }
 
+/// Parse an explicit `$skill` token that appears inside a larger prompt.
+///
+/// Prefix invocations keep the historical `$skill args` semantics via
+/// [`parse_skill_invocation_prompt`]. For inline invocations, the skill token is
+/// removed from the user's original text and the remaining text becomes the
+/// skill arguments. Callers should validate that the candidate skill exists
+/// before treating this as a dispatch, so ordinary text such as `$5` is not
+/// accidentally routed as a skill.
+#[must_use]
+pub fn parse_inline_skill_invocation_prompt(input: &str) -> Option<SkillInvocation> {
+    if let Some(invocation) = parse_skill_invocation_prompt(input) {
+        return Some(invocation);
+    }
+
+    let trimmed = input.trim();
+    let mut candidates = trimmed.char_indices().peekable();
+    while let Some((start, ch)) = candidates.next() {
+        if ch != '$' {
+            continue;
+        }
+
+        if start > 0 {
+            let previous = trimmed[..start].chars().next_back();
+            if previous.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+                continue;
+            }
+        }
+
+        let token_start = start + '$'.len_utf8();
+        let mut token_end = token_start;
+        for (idx, token_ch) in trimmed[token_start..].char_indices() {
+            if is_skill_invocation_char(token_ch) {
+                token_end = token_start + idx + token_ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if token_end == token_start {
+            continue;
+        }
+
+        let skill = &trimmed[token_start..token_end];
+        if skill.is_empty() || !skill.chars().all(is_skill_invocation_char) {
+            continue;
+        }
+
+        let after = &trimmed[token_end..];
+        if after
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            continue;
+        }
+
+        let before = trimmed[..start].trim();
+        let after = after.trim();
+        let args = match (before.is_empty(), after.is_empty()) {
+            (true, true) => None,
+            (true, false) => Some(after.to_string()),
+            (false, true) => Some(before.to_string()),
+            (false, false) => Some(format!("{before} {after}")),
+        };
+
+        return Some(SkillInvocation {
+            skill: skill.to_string(),
+            args,
+        });
+    }
+
+    None
+}
+
 #[must_use]
 pub fn skill_invocation_from_args(args: &str) -> Option<SkillInvocation> {
     let trimmed = args.trim();
@@ -4634,13 +4707,14 @@ mod tests {
         classify_skills_slash_command, default_skill_install_root,
         handle_agents_slash_command_json, handle_plugins_slash_command,
         handle_skills_slash_command_json, handle_slash_command, load_agents_from_roots,
-        load_skill_invocation, load_skills_from_roots, render_agents_report,
-        render_agents_report_json, render_loaded_skill_prompt, render_mcp_report_json_for,
-        render_plugins_report, render_skills_report, render_slash_command_help,
-        render_slash_command_help_detail, resolve_skill_path, resume_supported_slash_commands,
-        skill_invocation_from_args, slash_command_specs, slash_command_status, stub_slash_commands,
-        suggest_slash_commands, validate_slash_command_input, DefinitionSource, SkillOrigin,
-        SkillRoot, SkillSlashDispatch, SlashCommand, SlashCommandStatus,
+        load_skill_invocation, load_skills_from_roots, parse_inline_skill_invocation_prompt,
+        render_agents_report, render_agents_report_json, render_loaded_skill_prompt,
+        render_mcp_report_json_for, render_plugins_report, render_skills_report,
+        render_slash_command_help, render_slash_command_help_detail, resolve_skill_path,
+        resume_supported_slash_commands, skill_invocation_from_args, slash_command_specs,
+        slash_command_status, stub_slash_commands, suggest_slash_commands,
+        validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch,
+        SlashCommand, SlashCommandStatus,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{
@@ -5739,6 +5813,20 @@ mod tests {
         assert!(prompt.contains("# demo"));
 
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn parses_inline_skill_invocation_as_arguments_without_token() {
+        let invocation = parse_inline_skill_invocation_prompt(
+            "请依据附件生成答辩 PPT $GordenSuperPPTSkill 重点突出公式",
+        )
+        .expect("inline skill should parse");
+
+        assert_eq!(invocation.skill, "GordenSuperPPTSkill");
+        let args = invocation.args.expect("inline prompt should become args");
+        assert!(args.contains("请依据附件生成答辩 PPT"));
+        assert!(args.contains("重点突出公式"));
+        assert!(!args.contains("$GordenSuperPPTSkill"));
     }
 
     #[test]

@@ -839,6 +839,100 @@ fn document_generation_gate_prompt(
     }
 }
 
+fn document_generation_preflight_message(
+    user_input: &str,
+    source_attachments: &[AttachmentEvidence],
+) -> String {
+    let estimated_slides = estimate_requested_slide_count(user_input).unwrap_or(12);
+    let attachment_count = source_attachments.len();
+    if is_super_ppt_request(user_input) {
+        format!(
+            "SuperPPT preflight: {attachment_count} attachment/source item(s); estimated {estimated_slides} slides; expected imagegen calls at least {} (phase A) + {} (phase B). Verify imagegen availability before generation and write resumable manifests.",
+            estimated_slides,
+            estimated_slides * 3
+        )
+    } else {
+        format!(
+            "Document generation preflight: {attachment_count} attachment/source item(s); estimated {estimated_slides} deck slide(s) when PPT is requested; generate_file is the required deliverable."
+        )
+    }
+}
+
+fn document_generation_long_task_prompt(
+    user_input: &str,
+    source_attachments: &[AttachmentEvidence],
+    language: Option<&str>,
+) -> String {
+    let estimated_slides = estimate_requested_slide_count(user_input).unwrap_or(12);
+    let super_ppt = is_super_ppt_request(user_input);
+    let attachment_lines = if source_attachments.is_empty() {
+        "- Source attachments: none detected in conversation markers.".to_string()
+    } else {
+        format!(
+            "- Source attachments: {}",
+            source_attachments
+                .iter()
+                .take(8)
+                .map(AttachmentEvidence::summary)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    };
+    if matches!(language, Some("Chinese")) {
+        if super_ppt {
+            format!(
+                "# 长任务执行契约（SuperPPT 强制）\n- 这是长时 PPT 生成任务，必须按阶段推进并持续产出中间文件，不能只输出大纲或要求用户再次提供附件。\n{attachment_lines}\n- 预估页数：{estimated_slides} 页；阶段 1 至少 {estimated_slides} 次 imagegen；阶段 2 至少 {} 次背景/骨架/图标提取类 imagegen。\n- 启动前先做预检：确认 imagegen 可用、输出目录可写、附件 brief/manifest/fullTextPath 可用；若 imagegen 不可用，明确阻塞并停止，不能用代码绘图兜底。\n- 对超长附件，优先使用附件 brief 和 manifest；需要细节时读取 fullTextPath 或 chunk index，不要要求用户粘贴正文。\n- 必须写入可恢复产物清单：outline、prompts、imagegen manifest、slides、editable deck manifest、最终 pptx 路径。"
+            , estimated_slides * 3)
+        } else {
+            format!(
+                "# 长任务执行契约（文档生成）\n- 这是附件驱动的电子文档生成任务，最终交付必须是实际文件，不是摘要或策划案。\n{attachment_lines}\n- 对超长附件，优先使用附件 brief 和 manifest；需要细节时读取 fullTextPath 或 chunk index，不要要求用户再次上传或粘贴正文。\n- 生成前先整理结构化 document_spec；生成后检查 manifestPath 和 quality，能修复的问题先修复再答复。"
+            )
+        }
+    } else if super_ppt {
+        format!(
+            "# Long-Running Task Contract (SuperPPT Mandatory)\n- This is a long-running deck generation task. Work stage by stage, persist intermediate files, and do not replace the deliverable with an outline or ask the user to resend attachments.\n{attachment_lines}\n- Estimated slides: {estimated_slides}; phase A needs at least {estimated_slides} imagegen calls; phase B needs at least {} extraction imagegen calls.\n- Preflight before starting: confirm imagegen availability, writable output directories, and attachment brief/manifest/fullTextPath availability. If imagegen is unavailable, stop with a blocker; do not fall back to code-drawn slides.\n- For long attachments, use the brief and manifest first; read fullTextPath or chunk index for details instead of asking the user to paste the source.\n- Persist resumable artifacts: outline, prompts, imagegen manifest, slides, editable deck manifest, and final pptx paths.",
+            estimated_slides * 3
+        )
+    } else {
+        format!(
+            "# Long-Running Task Contract (Document Generation)\n- This attachment-backed document request must end with a real generated file, not a summary or outline.\n{attachment_lines}\n- For long attachments, use the brief and manifest first; read fullTextPath or chunk index for details instead of asking the user to upload or paste the source again.\n- Build a structured document_spec before generation; after generation inspect manifestPath and quality and fix actionable issues before final response."
+        )
+    }
+}
+
+fn is_super_ppt_request(user_input: &str) -> bool {
+    user_input.contains("GordenSuperPPTSkill")
+        || user_input.contains("GordenImagePPTGen")
+        || user_input.contains("GordenImage2PPTX")
+        || user_input.contains("imagegen-manifest")
+}
+
+fn estimate_requested_slide_count(user_input: &str) -> Option<usize> {
+    for marker in ["页", "slides", "slide"] {
+        if let Some(count) = number_before_marker(user_input, marker) {
+            if (1..=80).contains(&count) {
+                return Some(count);
+            }
+        }
+    }
+    None
+}
+
+fn number_before_marker(input: &str, marker: &str) -> Option<usize> {
+    let marker_start = input.find(marker)?;
+    let before = &input[..marker_start];
+    let digits = before
+        .chars()
+        .rev()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    digits.parse().ok()
+}
+
 fn gate_attachment_lines(source_attachments: &[AttachmentEvidence], heading: &str) -> String {
     if source_attachments.is_empty() {
         return String::new();
@@ -2617,6 +2711,17 @@ where
         task_state.set_source_attachments(collect_attachment_evidence_from_messages(
             &self.session.messages,
         ));
+        if !task_state.source_attachments.is_empty() {
+            self.record_and_emit_task_progress(
+                &runtime_task_id,
+                &mut task_ledger_offset,
+                "attachments_ready",
+                Some(format!(
+                    "{} attachment/source item(s) available",
+                    task_state.source_attachments.len()
+                )),
+            );
+        }
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -2714,12 +2819,26 @@ where
             effective_system_prompt.push(relevant_memory);
         }
         if task_state.requires_document_generation {
+            self.record_and_emit_task_progress(
+                &runtime_task_id,
+                &mut task_ledger_offset,
+                "document_generation_preflight",
+                Some(document_generation_preflight_message(
+                    &user_input,
+                    &task_state.source_attachments,
+                )),
+            );
             if let Some(attachment_context) = format_attachment_context_prompt(
                 &task_state.source_attachments,
                 active_language.as_deref(),
             ) {
                 effective_system_prompt.push(attachment_context);
             }
+            effective_system_prompt.push(document_generation_long_task_prompt(
+                &user_input,
+                &task_state.source_attachments,
+                active_language.as_deref(),
+            ));
         }
         effective_system_prompt.push(task_state.format_context());
 
@@ -2827,6 +2946,12 @@ where
                     return Err(error);
                 }
                 if task_state.should_prompt_for_document_generation() {
+                    self.record_and_emit_task_progress(
+                        &runtime_task_id,
+                        &mut task_ledger_offset,
+                        "document_generation_redrive",
+                        Some("assistant stopped before generating the requested file; completion gate redrive scheduled".to_string()),
+                    );
                     self.session
                         .push_message(ConversationMessage::user_text(
                             document_generation_gate_prompt(
@@ -2909,6 +3034,12 @@ where
 
             for (_, (tool_use_id, tool_name, input)) in ordered_pending_tool_uses {
                 let tool_started_at = Instant::now();
+                self.record_and_emit_task_progress(
+                    &runtime_task_id,
+                    &mut task_ledger_offset,
+                    "tool_requested",
+                    Some(format!("{tool_name} requested")),
+                );
                 if !available_tool_names.contains(&tool_name) {
                     let plan_step_id = decisioning_plan
                         .as_ref()
@@ -2957,6 +3088,12 @@ where
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                     self.record_tool_finished(iterations, &result_message);
                     task_state.record_tool_result(&tool_name, true, &output);
+                    self.record_and_emit_task_progress(
+                        &runtime_task_id,
+                        &mut task_ledger_offset,
+                        "tool_finished",
+                        Some(format!("{tool_name} failed: unsupported tool")),
+                    );
                     tool_results.push(result_message);
                     continue;
                 }
@@ -3066,6 +3203,12 @@ where
                 }
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
+                        self.record_and_emit_task_progress(
+                            &runtime_task_id,
+                            &mut task_ledger_offset,
+                            "tool_started",
+                            Some(format!("{tool_name} started")),
+                        );
                         self.record_tool_started(iterations, &tool_name);
                         let (mut output, mut is_error) =
                             match self.tool_executor.execute(&tool_name, &effective_input) {
@@ -3164,6 +3307,19 @@ where
                     .push_message(result_message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message);
+                self.record_and_emit_task_progress(
+                    &runtime_task_id,
+                    &mut task_ledger_offset,
+                    "tool_finished",
+                    Some(format!(
+                        "{tool_name} {}",
+                        if step_succeeded {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        }
+                    )),
+                );
                 tool_results.push(result_message);
             }
 
@@ -4479,6 +4635,20 @@ where
         }
     }
 
+    fn record_and_emit_task_progress(
+        &self,
+        task_id: &str,
+        task_ledger_offset: &mut usize,
+        event: &str,
+        message: Option<String>,
+    ) {
+        let _ = self
+            .task_registry
+            .record_progress_event(task_id, event, message);
+        self.emit_task_ledger_events(task_id, *task_ledger_offset);
+        *task_ledger_offset = self.task_registry.ledger_for_task(task_id).len();
+    }
+
     fn enrich_latest_route_feedback_from_usage(
         &self,
         task_id: &str,
@@ -5040,12 +5210,12 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold,
-        user_requests_document_generation, AlternativeApproach, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ChainOfThought, ConversationRuntime, DecisioningEvent,
-        DecisioningEventReporter, LongTermMemory, MemoryEntry, MemoryKind, PromptCacheEvent,
-        ReasoningStep, RuntimeError, StaticToolExecutor, ToolExecutor, TurnSummary,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        build_assistant_message, document_generation_long_task_prompt,
+        parse_auto_compaction_threshold, user_requests_document_generation, AlternativeApproach,
+        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ChainOfThought,
+        ConversationRuntime, DecisioningEvent, DecisioningEventReporter, LongTermMemory,
+        MemoryEntry, MemoryKind, PromptCacheEvent, ReasoningStep, RuntimeError, StaticToolExecutor,
+        ToolExecutor, TurnSummary, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{DecisioningConfig, RuntimeFeatureConfig, RuntimeHookConfig};
@@ -5485,6 +5655,22 @@ mod tests {
         assert!(!user_requests_document_generation(
             "请检查文档生成代码是否完善。"
         ));
+    }
+
+    #[test]
+    fn super_ppt_long_task_prompt_estimates_imagegen_work() {
+        let prompt = document_generation_long_task_prompt(
+            "请生成 15 页答辩 PPT。Use the local Himalaya skill `GordenSuperPPTSkill`.",
+            &[],
+            Some("Chinese"),
+        );
+
+        assert!(prompt.contains("SuperPPT"));
+        assert!(prompt.contains("预估页数：15 页"));
+        assert!(prompt.contains("阶段 1 至少 15 次 imagegen"));
+        assert!(prompt.contains("阶段 2 至少 45 次"));
+        assert!(prompt.contains("确认 imagegen 可用"));
+        assert!(prompt.contains("不能用代码绘图兜底"));
     }
 
     struct UnsupportedToolApiClient {

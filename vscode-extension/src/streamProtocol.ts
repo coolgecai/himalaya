@@ -112,6 +112,9 @@ export type StreamEvent = {
   name?: string;
   tool?: string;
   reason?: string;
+  request_id?: string;
+  current_mode?: string;
+  required_mode?: string;
   action?: string;
   suggestion?: string;
   source_event?: string;

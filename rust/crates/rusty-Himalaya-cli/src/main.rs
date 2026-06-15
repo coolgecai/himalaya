@@ -44,11 +44,11 @@ use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
     handle_skills_slash_command, handle_skills_slash_command_json, is_stub_slash_command,
-    parse_skill_invocation_prompt, render_loaded_skill_prompt, render_slash_command_help,
-    render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    skill_invocation_from_args, slash_command_specs, slash_command_status,
-    validate_slash_command_input, SkillInvocation, SkillSlashDispatch, SlashCommand,
-    SlashCommandStatus,
+    parse_inline_skill_invocation_prompt, parse_skill_invocation_prompt,
+    render_loaded_skill_prompt, render_slash_command_help, render_slash_command_help_filtered,
+    resolve_skill_invocation, resume_supported_slash_commands, skill_invocation_from_args,
+    slash_command_specs, slash_command_status, validate_slash_command_input, SkillInvocation,
+    SkillSlashDispatch, SlashCommand, SlashCommandStatus,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -192,15 +192,37 @@ fn is_permission_denial_output(output: &str) -> bool {
         .any(|keyword| output.contains(keyword))
 }
 
-fn permission_request_event(request: &runtime::PermissionRequest) -> Value {
-    json!({
+fn permission_request_event(
+    request: &runtime::PermissionRequest,
+    request_id: Option<&str>,
+) -> Value {
+    let mut event = json!({
         "type": "permission_request",
         "tool": request.tool_name.as_str(),
         "input": request.input.as_str(),
         "current_mode": request.current_mode.as_str(),
         "required_mode": request.required_mode.as_str(),
         "reason": request.reason.as_deref().unwrap_or(""),
-    })
+    });
+    if let Some(request_id) = request_id {
+        if let Some(object) = event.as_object_mut() {
+            object.insert(
+                "request_id".to_string(),
+                Value::String(request_id.to_string()),
+            );
+        }
+    }
+    event
+}
+
+fn permission_response_matches_request(
+    response_id: Option<&str>,
+    expected_request_id: Option<&str>,
+) -> bool {
+    match expected_request_id {
+        Some(expected) => response_id == Some(expected),
+        None => true,
+    }
 }
 
 fn recovery_suggestion_event(source_event: &str, tool: &str, reason: &str) -> Value {
@@ -309,6 +331,17 @@ fn render_skill_invocation_prompt_for_current_dir(
             message.push_str("\n  Usage: $skill [args] or /skills <skill> [args]");
             Err(std::io::Error::new(error.kind(), message).into())
         }
+    }
+}
+
+fn parse_known_inline_skill_invocation_for_dir(input: &str, cwd: &Path) -> Option<SkillInvocation> {
+    let invocation = parse_inline_skill_invocation_prompt(input)?;
+    if input.trim_start().starts_with('$')
+        || commands::resolve_skill_path(cwd, &invocation.skill).is_ok()
+    {
+        Some(invocation)
+    } else {
+        None
     }
 }
 
@@ -1348,6 +1381,22 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allow_broad_cwd,
             file_paths: file_paths.clone(),
         });
+    }
+    if let Ok(cwd) = env::current_dir() {
+        if let Some(invocation) = parse_known_inline_skill_invocation_for_dir(&joined_rest, &cwd) {
+            return Ok(CliAction::SkillPrompt {
+                invocation,
+                model,
+                output_format,
+                allowed_tools,
+                permission_mode,
+                compact,
+                base_commit,
+                reasoning_effort: reasoning_effort.clone(),
+                allow_broad_cwd,
+                file_paths: file_paths.clone(),
+            });
+        }
     }
 
     match rest[0].as_str() {
@@ -6335,6 +6384,11 @@ fn run_repl_ndjson(
                 let _ = cli.persist_session();
                 break;
             }
+            Some("permission_response") => {
+                eprintln!(
+                    "[repl] ignored stale permission_response outside an active permission request"
+                );
+            }
             _ => {
                 eprintln!(
                     "[repl] unknown command type: {}",
@@ -7383,6 +7437,17 @@ impl LiveCli {
         }
 
         if let Some(invocation) = parse_skill_invocation_prompt(input) {
+            let cwd = env::current_dir()?;
+            return match commands::load_skill_invocation(&cwd, invocation) {
+                Ok(skill) => Ok(Some(render_loaded_skill_prompt(&skill))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(Box::new(error)),
+            };
+        }
+
+        if let Some(invocation) =
+            parse_known_inline_skill_invocation_for_dir(input, &env::current_dir()?)
+        {
             let cwd = env::current_dir()?;
             return match commands::load_skill_invocation(&cwd, invocation) {
                 Ok(skill) => Ok(Some(render_loaded_skill_prompt(&skill))),
@@ -13873,6 +13938,8 @@ struct CliPermissionPrompter {
     stream_json: bool,
     /// Tools the host approved "always" for this session (stream-json mode).
     session_allowed_tools: std::collections::HashSet<String>,
+    next_request_seq: u64,
+    pending_request_id: Option<String>,
 }
 
 impl CliPermissionPrompter {
@@ -13885,6 +13952,8 @@ impl CliPermissionPrompter {
             current_mode,
             stream_json,
             session_allowed_tools: std::collections::HashSet::new(),
+            next_request_seq: 0,
+            pending_request_id: None,
         }
     }
 }
@@ -13892,7 +13961,14 @@ impl CliPermissionPrompter {
 impl runtime::PermissionPrompter for CliPermissionPrompter {
     fn notify_request(&mut self, request: &runtime::PermissionRequest) {
         if self.stream_json {
-            print_stream_json_event(permission_request_event(request));
+            if self.session_allowed_tools.contains(&request.tool_name) {
+                self.pending_request_id = None;
+                return;
+            }
+            self.next_request_seq += 1;
+            let request_id = format!("permission-{}", self.next_request_seq);
+            self.pending_request_id = Some(request_id.clone());
+            print_stream_json_event(permission_request_event(request, Some(&request_id)));
         }
     }
 
@@ -13903,10 +13979,11 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         if self.stream_json {
             // Host-driven approval (VS Code): a tool that needs elevation emits a
             // `permission_request` event; the host replies with a single line
-            //   {"type":"permission_response","decision":"allow|deny|allow_always"}
+            //   {"type":"permission_response","request_id":"permission-1","decision":"allow|deny|allow_always"}
             // read from stdin. This closes the loop so writes/installs are no
             // longer auto-denied. Missing/garbled replies fall back to Deny.
             if self.session_allowed_tools.contains(&request.tool_name) {
+                self.pending_request_id = None;
                 return runtime::PermissionPromptDecision::Allow;
             }
             let deny_reason = || {
@@ -13919,24 +13996,66 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
                     )
                 })
             };
-            let mut response = String::new();
-            match std::io::stdin().read_line(&mut response) {
-                Ok(0) | Err(_) => {
-                    return runtime::PermissionPromptDecision::Deny {
-                        reason: deny_reason(),
-                    };
+            let expected_request_id = self.pending_request_id.clone();
+            let mut decision = None;
+            for _ in 0..32 {
+                let mut response = String::new();
+                match std::io::stdin().read_line(&mut response) {
+                    Ok(0) | Err(_) => {
+                        self.pending_request_id = None;
+                        return runtime::PermissionPromptDecision::Deny {
+                            reason: deny_reason(),
+                        };
+                    }
+                    Ok(_) => {}
                 }
-                Ok(_) => {}
+                let trimmed = response.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    let response_type = value.get("type").and_then(serde_json::Value::as_str);
+                    if matches!(response_type, Some("permission_response")) {
+                        let response_id = value
+                            .get("request_id")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| !value.trim().is_empty());
+                        if expected_request_id.is_some() && response_id.is_none() {
+                            eprintln!(
+                                "[permission] denying malformed permission_response without request_id while waiting for request_id={}",
+                                expected_request_id.as_deref().unwrap_or("<none>")
+                            );
+                            decision = Some("deny".to_string());
+                            break;
+                        }
+                        if !permission_response_matches_request(
+                            response_id,
+                            expected_request_id.as_deref(),
+                        ) {
+                            eprintln!(
+                                "[permission] ignoring stale response for request_id={} while waiting for request_id={}",
+                                response_id.unwrap_or("<missing>"),
+                                expected_request_id.as_deref().unwrap_or("<none>")
+                            );
+                            continue;
+                        }
+                        decision = value
+                            .get("decision")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                        break;
+                    }
+                    eprintln!(
+                        "[permission] ignoring unexpected stdin command while waiting: {}",
+                        trimmed.chars().take(80).collect::<String>()
+                    );
+                    continue;
+                }
+                decision = Some(trimmed.to_string());
+                break;
             }
-            let decision = serde_json::from_str::<serde_json::Value>(response.trim())
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("decision")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| response.trim().to_string());
+            self.pending_request_id = None;
+            let decision = decision.unwrap_or_else(|| "deny".to_string());
             return match decision.as_str() {
                 "allow" | "allow_once" | "yes" | "y" => runtime::PermissionPromptDecision::Allow,
                 "allow_always" | "allow_session" => {
@@ -15772,7 +15891,12 @@ fn expand_at_file_syntax(input: &str, model: &str) -> Result<(String, Vec<Conten
             Ok(FileContent::Text(text)) => {
                 warn_for_extracted_attachment_text(path, &text);
                 let label = path_str;
-                result.push_str(&format!("[File: {label}]\n{text}\n"));
+                let context =
+                    prepare_text_attachment_context(path, label, &text).map_err(|error| {
+                        format!("@{path_str}: failed to prepare attachment: {error}")
+                    })?;
+                result.push_str(&context);
+                result.push('\n');
             }
             Ok(FileContent::Image {
                 base64_data,
@@ -15847,7 +15971,9 @@ fn load_files_as_content_blocks(
                 warn_for_extracted_attachment_text(path, &text);
                 let label = path.display().to_string();
                 blocks.push(ContentBlock::Text {
-                    text: format!("[File: {label}]\n{text}"),
+                    text: prepare_text_attachment_context(path, &label, &text).map_err(
+                        |error| format!("failed to prepare {}: {error}", path.display()),
+                    )?,
                 });
             }
             Ok(FileContent::Image {
@@ -15866,6 +15992,202 @@ fn load_files_as_content_blocks(
 }
 
 const LARGE_TEXT_ATTACHMENT_WARNING_CHARS: usize = 120_000;
+const LARGE_TEXT_ATTACHMENT_INLINE_LIMIT_CHARS: usize = 120_000;
+const ATTACHMENT_CONTEXT_CHUNK_CHARS: usize = 20_000;
+const ATTACHMENT_CONTEXT_PREVIEW_CHUNKS: usize = 8;
+const ATTACHMENT_CONTEXT_BRIEF_CHARS: usize = 5_000;
+const ATTACHMENT_CONTEXT_CHUNK_PREVIEW_CHARS: usize = 260;
+
+struct AttachmentContextAsset {
+    manifest_path: PathBuf,
+    full_text_path: PathBuf,
+    extracted_chars: usize,
+    chunk_count: usize,
+    brief: String,
+}
+
+fn prepare_text_attachment_context(path: &Path, label: &str, text: &str) -> io::Result<String> {
+    let extracted_chars = text.chars().count();
+    if extracted_chars < LARGE_TEXT_ATTACHMENT_INLINE_LIMIT_CHARS {
+        return Ok(format!("[File: {label}]\n{text}"));
+    }
+
+    let asset = write_attachment_context_asset(path, text)?;
+    Ok(format!(
+        "[File: {label}]\n\
+[Attachment structured context]\n\
+- Source path: {}\n\
+- Extracted characters: {}\n\
+- Chunk count: {} chunks of about {} characters\n\
+- Full extracted text path: {}\n\
+- Structured manifest path: {}\n\
+- Long-task contract: this attachment is already available; do not ask the user to upload it again or paste its content. Use the brief below first, then use the full text path or manifest chunk index if more detail is needed.\n\
+\n\
+[Attachment brief]\n{}\n\
+[End attachment brief]",
+        path.display(),
+        asset.extracted_chars,
+        asset.chunk_count,
+        ATTACHMENT_CONTEXT_CHUNK_CHARS,
+        asset.full_text_path.display(),
+        asset.manifest_path.display(),
+        asset.brief
+    ))
+}
+
+fn write_attachment_context_asset(path: &Path, text: &str) -> io::Result<AttachmentContextAsset> {
+    let dir = env::current_dir()?.join(".Himalayad").join("attachments");
+    fs::create_dir_all(&dir)?;
+    let slug = attachment_asset_slug(path, text);
+    let full_text_path = dir.join(format!("{slug}.extracted.txt"));
+    let manifest_path = dir.join(format!("{slug}.manifest.json"));
+    fs::write(&full_text_path, text)?;
+
+    let extracted_chars = text.chars().count();
+    let chunk_count = extracted_chars.div_ceil(ATTACHMENT_CONTEXT_CHUNK_CHARS);
+    let brief = attachment_brief(text);
+    let heading_candidates = attachment_heading_candidates(text);
+    let chunks = (0..chunk_count.min(ATTACHMENT_CONTEXT_PREVIEW_CHUNKS))
+        .map(|index| {
+            let start = index * ATTACHMENT_CONTEXT_CHUNK_CHARS;
+            let end = ((index + 1) * ATTACHMENT_CONTEXT_CHUNK_CHARS).min(extracted_chars);
+            json!({
+                "index": index,
+                "charStart": start,
+                "charEnd": end,
+                "preview": compact_preview(&slice_chars(text, start, ATTACHMENT_CONTEXT_CHUNK_PREVIEW_CHARS), ATTACHMENT_CONTEXT_CHUNK_PREVIEW_CHARS),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let manifest = json!({
+        "version": 1,
+        "sourcePath": path.display().to_string(),
+        "sourceName": path.file_name().and_then(|name| name.to_str()).unwrap_or("attachment"),
+        "extractedChars": extracted_chars,
+        "chunkChars": ATTACHMENT_CONTEXT_CHUNK_CHARS,
+        "chunkCount": chunk_count,
+        "fullTextPath": full_text_path.display().to_string(),
+        "brief": brief,
+        "headingCandidates": heading_candidates,
+        "chunks": chunks,
+        "contract": {
+            "alreadyProvided": true,
+            "doNotAskUserToReupload": true,
+            "retrieval": "Use fullTextPath or chunk previews when the model needs details beyond the injected brief."
+        }
+    });
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    )?;
+
+    Ok(AttachmentContextAsset {
+        manifest_path,
+        full_text_path,
+        extracted_chars,
+        chunk_count,
+        brief,
+    })
+}
+
+fn attachment_asset_slug(path: &Path, text: &str) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.display().to_string().hash(&mut hasher);
+    text.len().hash(&mut hasher);
+    let digest = hasher.finish();
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment")
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(48)
+        .collect::<String>();
+    let stem = if stem.is_empty() {
+        "attachment".to_string()
+    } else {
+        stem
+    };
+    format!("{stem}-{digest:016x}")
+}
+
+fn attachment_brief(text: &str) -> String {
+    let mut lines = Vec::new();
+    let headings = attachment_heading_candidates(text);
+    if !headings.is_empty() {
+        lines.push("Detected section/title candidates:".to_string());
+        lines.extend(
+            headings
+                .iter()
+                .take(18)
+                .map(|heading| format!("- {heading}")),
+        );
+        lines.push(String::new());
+    }
+    lines.push("Opening excerpt:".to_string());
+    lines.push(compact_preview(
+        &slice_chars(text, 0, ATTACHMENT_CONTEXT_BRIEF_CHARS),
+        ATTACHMENT_CONTEXT_BRIEF_CHARS,
+    ));
+    lines.join("\n")
+}
+
+fn attachment_heading_candidates(text: &str) -> Vec<String> {
+    let mut headings = Vec::new();
+    for line in text.lines().take(2_000) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.chars().count() > 80 {
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+        let looks_like_heading = trimmed.starts_with("第")
+            || trimmed.starts_with('#')
+            || lower.starts_with("chapter")
+            || lower.starts_with("abstract")
+            || lower.starts_with("keywords")
+            || trimmed.contains("摘要")
+            || trimmed.contains("关键词")
+            || trimmed.contains("目录")
+            || trimmed.contains("绪论")
+            || trimmed.contains("结论")
+            || trimmed.contains("创新点")
+            || trimmed.contains("实验")
+            || trimmed.contains("仿真");
+        if looks_like_heading && !headings.iter().any(|item| item == trimmed) {
+            headings.push(trimmed.to_string());
+        }
+        if headings.len() >= 32 {
+            break;
+        }
+    }
+    headings
+}
+
+fn slice_chars(text: &str, start: usize, count: usize) -> String {
+    text.chars().skip(start).take(count).collect()
+}
+
+fn compact_preview(text: &str, max_chars: usize) -> String {
+    let compacted = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = compacted.chars().take(max_chars).collect::<String>();
+    if compacted.chars().count() > max_chars {
+        preview.push('…');
+    }
+    preview
+}
 
 fn warn_for_extracted_attachment_text(path: &Path, text: &str) {
     for warning in extracted_attachment_warnings(path, text) {
@@ -16199,11 +16521,13 @@ mod tests {
         normalize_permission_mode, parse_args, parse_benchmark_cli_command, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, parse_policy_cli_command, parse_route_cli_command,
-        parse_task_cli_command, parse_worker_cli_command, permission_policy, print_help_to,
-        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
-        render_governed_policy_apply_text, render_maturity_matrix_text, render_memory_report,
-        render_policy_apply_plan_text, render_policy_replay_text, render_prompt_history_report,
-        render_repl_help, render_resume_usage, render_session_markdown,
+        parse_task_cli_command, parse_worker_cli_command, permission_policy,
+        permission_request_event, permission_response_matches_request,
+        prepare_text_attachment_context, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_governed_policy_apply_text,
+        render_maturity_matrix_text, render_memory_report, render_policy_apply_plan_text,
+        render_policy_replay_text, render_prompt_history_report, render_repl_help,
+        render_resume_usage, render_session_markdown,
         render_skill_invocation_prompt_for_current_dir, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
         response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
@@ -16214,8 +16538,8 @@ mod tests {
         InternalPromptProgressState, LiveCli, LocalHelpTopic, PolicyCliCommand, PromptHistoryEntry,
         RouteCliCommand, SlashCommand, SlashCommandStatus, StatusUsage, TaskCliCommand,
         TaskDaemonCliCommand, TaskPacketCliCommand, TaskSchedulerCliCommand, WorkerCliCommand,
-        DEFAULT_MODEL, LARGE_TEXT_ATTACHMENT_WARNING_CHARS, LATEST_SESSION_REFERENCE,
-        STREAM_PROTOCOL_VERSION,
+        DEFAULT_MODEL, LARGE_TEXT_ATTACHMENT_INLINE_LIMIT_CHARS,
+        LARGE_TEXT_ATTACHMENT_WARNING_CHARS, LATEST_SESSION_REFERENCE, STREAM_PROTOCOL_VERSION,
     };
     use crate::autonomous_cli::{
         render_autonomous_daemon_report_text, render_autonomous_health_checkpoint_text,
@@ -16232,7 +16556,7 @@ mod tests {
         ConversationMessage, MessageRole, OAuthConfig, PermissionMode, PermissionOutcome, Session,
         ToolExecutor,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -16270,6 +16594,40 @@ mod tests {
             event["protocol_version"],
             serde_json::Value::from(STREAM_PROTOCOL_VERSION)
         );
+    }
+
+    #[test]
+    fn permission_request_event_includes_request_id_when_present() {
+        let request = runtime::PermissionRequest {
+            tool_name: "write_file".to_string(),
+            input: "{}".to_string(),
+            current_mode: PermissionMode::ReadOnly,
+            required_mode: PermissionMode::WorkspaceWrite,
+            reason: Some("requires workspace-write".to_string()),
+        };
+
+        let event = permission_request_event(&request, Some("permission-7"));
+
+        assert_eq!(event["type"], "permission_request");
+        assert_eq!(event["request_id"], "permission-7");
+        assert_eq!(event["tool"], "write_file");
+    }
+
+    #[test]
+    fn permission_response_matching_requires_pending_request_id() {
+        assert!(permission_response_matches_request(
+            Some("permission-7"),
+            Some("permission-7")
+        ));
+        assert!(!permission_response_matches_request(
+            Some("permission-6"),
+            Some("permission-7")
+        ));
+        assert!(!permission_response_matches_request(
+            None,
+            Some("permission-7")
+        ));
+        assert!(permission_response_matches_request(None, None));
     }
 
     #[test]
@@ -17296,6 +17654,57 @@ mod tests {
             large_text[0].contains("small-context local models may not read the whole attachment"),
             "{large_text:?}"
         );
+    }
+
+    #[test]
+    fn large_text_attachment_writes_structured_context_sidecars() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+        let path = workspace.join("thesis.pdf");
+        fs::write(&path, b"placeholder").expect("source placeholder should write");
+        let text = format!(
+            "摘要\n多层复杂网络建模。\n{}\n结论\n网络瓦解方法有效。",
+            "正文段落。".repeat(LARGE_TEXT_ATTACHMENT_INLINE_LIMIT_CHARS / 4)
+        );
+
+        let context =
+            prepare_text_attachment_context(&path, path.to_str().unwrap_or("thesis.pdf"), &text)
+                .expect("large attachment context should prepare");
+
+        assert!(context.contains("[Attachment structured context]"));
+        assert!(context.contains("Full extracted text path:"));
+        assert!(context.contains("Structured manifest path:"));
+        assert!(context.contains("do not ask the user to upload it again"));
+        assert!(context.chars().count() < text.chars().count() / 4);
+        let manifest_dir = workspace.join(".Himalayad").join("attachments");
+        let manifests = fs::read_dir(&manifest_dir)
+            .expect("manifest dir should exist")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext == "json")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(manifests.len(), 1);
+        let manifest: Value =
+            serde_json::from_str(&fs::read_to_string(&manifests[0]).expect("manifest should read"))
+                .expect("manifest should parse");
+        assert_eq!(manifest["contract"]["alreadyProvided"], true);
+        assert!(manifest["chunkCount"].as_u64().unwrap_or_default() >= 2);
+        let full_text_path = PathBuf::from(
+            manifest["fullTextPath"]
+                .as_str()
+                .expect("full text path should exist"),
+        );
+        assert!(full_text_path.exists());
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        fs::remove_dir_all(workspace).expect("temp workspace should clean up");
     }
 
     #[test]
@@ -18842,6 +19251,64 @@ mod tests {
         assert!(rendered.contains("- Invocation: $demo"));
         assert!(rendered.contains("- Arguments: arg one"));
         assert!(rendered.contains("Use demo guidance."));
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn routes_known_inline_skill_token_before_document_generator() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_Himalaya_PERMISSION_MODE");
+        let workspace = temp_dir();
+        let skill_dir = workspace
+            .join(".Himalaya")
+            .join("skills")
+            .join("GordenSuperPPTSkill");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: GordenSuperPPTSkill\ndescription: Super PPT\n---\n\n# Super\nUse imagegen pipeline.\n",
+        )
+        .expect("write skill");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+
+        let parsed = parse_args(&[
+            "请依据附件中的学位论文，整理生成一份答辩用高质量的ppt电子文档。".to_string(),
+            "$GordenSuperPPTSkill".to_string(),
+        ])
+        .expect("inline known skill should route");
+
+        match parsed {
+            CliAction::SkillPrompt { invocation, .. } => {
+                assert_eq!(invocation.skill, "GordenSuperPPTSkill");
+                let args = invocation
+                    .args
+                    .expect("original request should become args");
+                assert!(args.contains("答辩用高质量的ppt电子文档"));
+                assert!(!args.contains("$GordenSuperPPTSkill"));
+            }
+            other => panic!("expected SkillPrompt, got {other:?}"),
+        }
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn inline_unknown_skill_token_does_not_steal_prompt_mode() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_Himalaya_PERMISSION_MODE");
+        let workspace = temp_dir();
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+
+        let parsed = parse_args(&["请生成一份预算说明，价格是".to_string(), "$5".to_string()])
+            .expect("unknown inline token should stay prompt");
+
+        assert!(matches!(parsed, CliAction::Prompt { .. }));
 
         std::env::set_current_dir(previous).expect("restore cwd");
         let _ = fs::remove_dir_all(workspace);

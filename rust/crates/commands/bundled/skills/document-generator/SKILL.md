@@ -11,6 +11,7 @@ Use `generate_file` for binary document output. Prefer `document_spec` for polis
 
 1. Choose the output format: `docx`, `pptx`, `pdf`, or `xlsx`.
 2. If the request references attachments or source documents, read/extract them first and base the document on that evidence. Do not stop after summarizing the source.
+   - When the attachment context includes a `Structured manifest path` or `Full extracted text path`, treat it as the source document's persisted context for long tasks. Use the injected brief first, then read the full text/manifest for details; never ask the user to upload or paste the same attachment again.
 3. Build a `document_spec` with title metadata, ordered content blocks, and optional workbook sheets.
 4. Include structured blocks for tables, formulas, charts, and images instead of flattening them into prose.
 5. Run `generate_file` and inspect the returned `quality` object plus `manifestPath`.

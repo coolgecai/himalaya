@@ -576,6 +576,24 @@ impl TaskRegistry {
         Ok(updated)
     }
 
+    pub fn record_progress_event(
+        &self,
+        task_id: &str,
+        event: impl Into<String>,
+        message: Option<String>,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("registry lock poisoned");
+        let task = inner
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        let ts = now_secs();
+        task.updated_at = ts;
+        let status = task.status;
+        push_ledger_entry(&mut inner, task_id, event, status, message, ts);
+        Ok(())
+    }
+
     pub fn record_plan(
         &self,
         task_id: &str,
@@ -1271,6 +1289,13 @@ mod tests {
             .append_output(&task.task_id, "line\n")
             .expect("append should succeed");
         registry
+            .record_progress_event(
+                &task.task_id,
+                "document_generation_preflight",
+                Some("preflight ready".to_string()),
+            )
+            .expect("progress event should record");
+        registry
             .assign_team(&task.task_id, "team-ledger")
             .expect("assign should succeed");
         let removed = registry
@@ -1290,6 +1315,7 @@ mod tests {
                 "status_changed",
                 "updated",
                 "output_appended",
+                "document_generation_preflight",
                 "team_assigned",
                 "removed",
             ]

@@ -1151,6 +1151,7 @@ export class HimalayaChatPanel {
           const requestedTool = typeof event.tool === 'string' ? event.tool : 'unknown';
           const requestReason = typeof event.reason === 'string' ? event.reason : '';
           const requiredMode = typeof event.required_mode === 'string' ? event.required_mode : undefined;
+          const requestId = typeof event.request_id === 'string' ? event.request_id : undefined;
           const toolInput = typeof event.input === 'string' ? event.input : JSON.stringify(event.input ?? '');
           this.host.webview.postMessage({
             type: 'permissionRequest',
@@ -1158,11 +1159,12 @@ export class HimalayaChatPanel {
             reason: requestReason,
             currentMode: typeof event.current_mode === 'string' ? event.current_mode : undefined,
             requiredMode,
+            requestId,
             input: toolInput,
           });
           // The CLI is now BLOCKED waiting for our decision on stdin. Ask the user
           // via a native modal and write the decision back to the REPL worker.
-          void this.resolvePermissionRequest(requestedTool, requestReason, requiredMode, toolInput);
+          void this.resolvePermissionRequest(requestedTool, requestReason, requiredMode, toolInput, requestId);
           break;
         }
         case 'permission_denial': {
@@ -1365,7 +1367,8 @@ export class HimalayaChatPanel {
     tool: string,
     reason: string,
     requiredMode: string | undefined,
-    input: string
+    input: string,
+    requestId?: string
   ): Promise<void> {
     let decision: 'allow' | 'allow_always' | 'deny';
     if (this.sessionAllowedTools.has(tool)) {
@@ -1394,7 +1397,11 @@ export class HimalayaChatPanel {
     }
     // Write the decision back to the blocked CLI turn over the REPL stdin.
     try {
-      this.replHandle?.send(JSON.stringify({ type: 'permission_response', decision }));
+      const response: { type: 'permission_response'; decision: typeof decision; request_id?: string } = { type: 'permission_response', decision };
+      if (requestId) {
+        response.request_id = requestId;
+      }
+      this.replHandle?.send(JSON.stringify(response));
     } catch (error) {
       this.output.appendLine(`[permission] failed to send decision: ${String(error)}`);
     }

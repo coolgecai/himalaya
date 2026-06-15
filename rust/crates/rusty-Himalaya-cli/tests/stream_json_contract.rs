@@ -361,7 +361,7 @@ fn stream_json_permission_request_events_match_contract() {
         &workspace,
         server.base_url().as_str(),
         "write_file_denied",
-        Some("write_file"),
+        None,
     );
 
     assert_all_events_are_versioned(&events);
@@ -389,7 +389,7 @@ fn stream_json_permission_denial_events_match_contract() {
         &workspace,
         server.base_url().as_str(),
         "write_file_denied",
-        Some("write_file"),
+        None,
     );
 
     assert_all_events_are_versioned(&events);

@@ -688,11 +688,12 @@ test('stream protocol helpers behave as expected', async () => {
   assert.equal(redacted.ok, true);
   assert.equal(redacted.event.reasoning_step.data.opaque, 'redacted');
 
-  const permissionRequest = parseStreamEventLine('{"type":"permission_request","tool":"write_file","input":"{\\"path\\":\\"generated/denied.txt\\"}","current_mode":"read-only","required_mode":"workspace-write","reason":"requires workspace-write","protocol_version":1}');
+  const permissionRequest = parseStreamEventLine('{"type":"permission_request","tool":"write_file","input":"{\\"path\\":\\"generated/denied.txt\\"}","current_mode":"read-only","required_mode":"workspace-write","request_id":"permission-1","reason":"requires workspace-write","protocol_version":1}');
   assert.equal(permissionRequest.ok, true);
   assert.equal(permissionRequest.event.tool, 'write_file');
   assert.equal(permissionRequest.event.current_mode, 'read-only');
   assert.equal(permissionRequest.event.required_mode, 'workspace-write');
+  assert.equal(permissionRequest.event.request_id, 'permission-1');
 
   const toolUse = parseStreamEventLine('{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"fixture.txt"},"protocol_version":1}');
   assert.equal(toolUse.ok, true);
@@ -807,6 +808,7 @@ test('permission closed-loop authorizes tools via host stdin response', () => {
   assert.match(chatPanelSource, /case 'permission_request'/);
   assert.match(chatPanelSource, /resolvePermissionRequest\(requestedTool/);
   assert.match(chatPanelSource, /type: 'permission_response', decision/);
+  assert.match(chatPanelSource, /request_id/);
   assert.match(chatPanelSource, /sessionAllowedTools\.add\(tool\)/);
   assert.match(chatPanelSource, /Allow for this session/);
   assert.match(chatPanelSource, /Deny/);

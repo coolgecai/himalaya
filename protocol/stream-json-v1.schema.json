@@ -564,10 +564,14 @@
             "tool": {
               "type": "string"
             },
+            "input": {},
             "current_mode": {
               "type": "string"
             },
             "required_mode": {
+              "type": "string"
+            },
+            "request_id": {
               "type": "string"
             },
             "reason": {
