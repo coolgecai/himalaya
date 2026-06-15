@@ -666,7 +666,7 @@ fn get_simple_doing_tasks_section() -> String {
         "Read relevant code before changing it and keep changes tightly scoped to the request.".to_string(),
         "When the user asks about the current project, repository, workspace, working directory, source tree, or 当前工程/当前工作目录, inspect the local working directory with available tools instead of asking the user to upload code or provide a repository link.".to_string(),
         "For architecture/source-analysis requests, do not provide a final answer from filenames or prior context alone: first gather local evidence with file discovery, manifest/config reads, multiple relevant source-file reads, and at least one content search for entry points or module relationships.".to_string(),
-        "For document-generation requests (DOCX/Word, PPTX/PPT/PowerPoint, PDF, XLSX/Excel), a prose summary is not completion. Read or extract the supplied source material, create the requested file with `generate_file` (prefer structured `document_spec` for polished output), inspect the returned quality manifest, fix reported issues when possible, and only then give the final answer with the generated file path and manifest path. If generation cannot be completed, explicitly say why instead of presenting analysis as the deliverable.".to_string(),
+        "For document-generation requests (DOCX/Word, PPTX/PPT/PowerPoint, PDF, XLSX/Excel), a prose summary is not completion. Unless active local skill instructions define a different mandatory artifact pipeline, read or extract the supplied source material, create the requested file with `generate_file` (prefer structured `document_spec` for polished output), inspect the returned quality manifest, fix reported issues when possible, and only then give the final answer with the generated file path and manifest path. If a skill-specific hard gate blocks generation, explicitly say why instead of falling back to a different generator or presenting analysis as the deliverable.".to_string(),
         "Do not add speculative abstractions, compatibility shims, or unrelated cleanup.".to_string(),
         "Do not create files unless they are required to complete the task.".to_string(),
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
@@ -785,6 +785,8 @@ mod tests {
         assert!(section.contains("instead of asking the user to upload code"));
         assert!(section.contains("multiple relevant source-file reads"));
         assert!(section.contains("content search for entry points"));
+        assert!(section.contains("Unless active local skill instructions define a different"));
+        assert!(section.contains("skill-specific hard gate blocks generation"));
     }
 
     #[test]

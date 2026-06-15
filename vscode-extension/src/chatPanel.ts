@@ -26,6 +26,10 @@ import { executeWithPermissionGate } from './executionGate';
 import { extractPromptAttachmentReferences, extractReferencePathCandidate, prepareAttachmentDescriptors } from './attachmentPaths';
 import { SessionSnapshot } from './sessionTree';
 
+const NORMAL_REPL_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
+const LONG_REPL_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const LONG_REPL_MAX_DURATION_MS = 8 * 60 * 60 * 1000;
+
 export interface ChatLaunchOptions {
   [key: string]: unknown;
   model?: string;
@@ -229,6 +233,22 @@ function shouldStartFreshForAttachmentDocumentTask(prompt: string, hasAttachment
   const documentFormat = /(pptx?|powerpoint|幻灯片|演示文稿|答辩|word|docx|pdf|excel|xlsx|电子文档|文档|表格|spreadsheet|deck|slides?)/iu;
   const createVerb = /(生成|制作|创建|输出|导出|整理|撰写|编写|做一份|转换|generate|create|make|build|export|produce|draft)/iu;
   return documentFormat.test(lower) && createVerb.test(lower);
+}
+
+function replWaitPolicyForPrompt(prompt: string, hasAttachment: boolean): { longRunning: boolean; idleTimeoutMs: number; maxDurationMs: number } {
+  const longRunning = shouldStartFreshForAttachmentDocumentTask(prompt, hasAttachment)
+    || /(GordenSuperPPTSkill|GordenImagePPTGen|GordenImage2PPTX|imagegen|pptx?|powerpoint|幻灯片|演示文稿|答辩)/iu.test(prompt);
+  return longRunning
+    ? {
+        longRunning: true,
+        idleTimeoutMs: LONG_REPL_IDLE_TIMEOUT_MS,
+        maxDurationMs: LONG_REPL_MAX_DURATION_MS,
+      }
+    : {
+        longRunning: false,
+        idleTimeoutMs: NORMAL_REPL_REQUEST_TIMEOUT_MS,
+        maxDurationMs: NORMAL_REPL_REQUEST_TIMEOUT_MS,
+      };
 }
 
 
@@ -1227,6 +1247,11 @@ export class HimalayaChatPanel {
       if (this.replCanReuse) {
         try {
           let completed = false;
+          let lastActivityAt = Date.now();
+          const waitPolicy = replWaitPolicyForPrompt(prompt, attachmentPaths.length > 0);
+          const markReplActivity = () => {
+            lastActivityAt = Date.now();
+          };
           const handle = await this.ensureReplWorker({
             model,
             permissionMode,
@@ -1234,22 +1259,31 @@ export class HimalayaChatPanel {
             env,
             resumeTarget: this.selectedCliSessionId ?? resumeTarget,
             onEvent: (event) => {
+              markReplActivity();
               handleStreamLine(JSON.stringify(event));
               if (event && typeof event === 'object' && (event as { type?: unknown }).type === 'done') {
                 completed = true;
               }
             },
             onStderr: (chunk) => {
+              markReplActivity();
               const clean = chunk.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b[()][AB012]/g, '');
               this.host.webview.postMessage({ type: 'stderrChunk', text: clean });
             }
           });
           this.replBusy = true;
-          this.host.webview.postMessage({ type: 'runStatus', text: 'Sending prompt…', kind: 'running' });
+          this.host.webview.postMessage({
+            type: 'runStatus',
+            text: waitPolicy.longRunning
+              ? 'Sending long-running document task…'
+              : 'Sending prompt…',
+            kind: 'running'
+          });
           handle.send(JSON.stringify({ type: 'prompt', text: cliPrompt, files: attachmentPaths }));
           await new Promise<void>((resolve, reject) => {
             const started = Date.now();
             const timer = setInterval(() => {
+              const now = Date.now();
               if (completed) {
                 clearInterval(timer);
                 resolve();
@@ -1260,7 +1294,12 @@ export class HimalayaChatPanel {
                 reject(new Error(this.abortController?.signal.aborted ? 'Operation cancelled.' : 'Himalaya REPL worker stopped.'));
                 return;
               }
-              if (Date.now() - started > 30 * 60 * 1000) {
+              if (waitPolicy.longRunning && now - lastActivityAt > waitPolicy.idleTimeoutMs) {
+                clearInterval(timer);
+                reject(new Error('Himalaya REPL long-running request idle timed out.'));
+                return;
+              }
+              if (now - started > waitPolicy.maxDurationMs) {
                 clearInterval(timer);
                 reject(new Error('Himalaya REPL request timed out.'));
               }

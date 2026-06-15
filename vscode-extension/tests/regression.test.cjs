@@ -1158,6 +1158,17 @@ test('attachment-backed document generation starts a fresh session', () => {
   assert.match(chatPanelSource, /const resumeTarget = startFreshForTask[\s\S]*?\? undefined[\s\S]*?: input\.resumeTarget\?\.trim\(\)/);
 });
 
+test('long-running document tasks use activity-aware REPL timeout', () => {
+  assert.match(chatPanelSource, /function replWaitPolicyForPrompt\(prompt: string, hasAttachment: boolean\)/);
+  assert.match(chatPanelSource, /LONG_REPL_IDLE_TIMEOUT_MS/);
+  assert.match(chatPanelSource, /LONG_REPL_MAX_DURATION_MS/);
+  assert.match(chatPanelSource, /let lastActivityAt = Date\.now\(\)/);
+  assert.match(chatPanelSource, /markReplActivity\(\)/);
+  assert.match(chatPanelSource, /Sending long-running document task/);
+  assert.match(chatPanelSource, /long-running request idle timed out/);
+  assert.doesNotMatch(chatPanelSource, /Date\.now\(\) - started > 30 \* 60 \* 1000/);
+});
+
 test('skills are surfaced in the extension (list, install, invoke)', () => {
   // #3: cli.ts exposes skill backend calls.
   assert.match(cliSource, /async listSkills\(cwd\?: string\): Promise<HimalayaSkillInfo\[\]>/);

@@ -417,6 +417,7 @@ struct TurnTaskState {
     objective: String,
     requires_workspace_analysis: bool,
     requires_document_generation: bool,
+    requires_generate_file_deliverable: bool,
     required_evidence: Vec<&'static str>,
     source_attachments: Vec<AttachmentEvidence>,
     observed_tools: BTreeSet<String>,
@@ -449,6 +450,8 @@ impl TurnTaskState {
             objective: user_input.trim().chars().take(240).collect(),
             requires_workspace_analysis,
             requires_document_generation,
+            requires_generate_file_deliverable: requires_document_generation
+                && !is_super_ppt_request(user_input),
             required_evidence,
             source_attachments: Vec::new(),
             observed_tools: BTreeSet::new(),
@@ -527,11 +530,11 @@ impl TurnTaskState {
     }
 
     fn document_generation_complete(&self) -> bool {
-        !self.requires_document_generation || self.generated_document
+        !self.requires_generate_file_deliverable || self.generated_document
     }
 
     fn should_prompt_for_document_generation(&mut self) -> bool {
-        if !self.requires_document_generation
+        if !self.requires_generate_file_deliverable
             || self.document_generation_complete()
             || self.document_generation_gate_prompts >= 2
         {
@@ -560,10 +563,17 @@ impl TurnTaskState {
         }
         if self.requires_document_generation {
             lines.push("- Task class: binary document generation".to_string());
-            lines.push(
-                "- Required deliverable before final answer: successful generate_file tool result"
-                    .to_string(),
-            );
+            if self.requires_generate_file_deliverable {
+                lines.push(
+                    "- Required deliverable before final answer: successful generate_file tool result"
+                        .to_string(),
+                );
+            } else {
+                lines.push(
+                    "- Required deliverable is governed by the active SuperPPT skill: imagegen manifests and PPTX artifacts; do not fall back to generate_file if the skill's imagegen hard gate is blocked."
+                        .to_string(),
+                );
+            }
             if !self.source_attachments.is_empty() {
                 lines.push(format!(
                     "- User-provided source attachments: {}",
@@ -579,10 +589,17 @@ impl TurnTaskState {
                         .to_string(),
                 );
             }
-            lines.push(format!(
-                "- Document generation complete: {}",
-                self.document_generation_complete()
-            ));
+            if self.requires_generate_file_deliverable {
+                lines.push(format!(
+                    "- Generate-file completion gate complete: {}",
+                    self.generated_document
+                ));
+            } else {
+                lines.push(
+                    "- Generate-file completion gate active: false; skill-specific deliverable applies."
+                        .to_string(),
+                );
+            }
         }
         if !self.observed_tools.is_empty() {
             lines.push(format!(
@@ -2935,7 +2952,7 @@ where
                 return Err(error);
             }
             if pending_tool_uses.is_empty()
-                && task_state.requires_document_generation
+                && task_state.requires_generate_file_deliverable
                 && !task_state.document_generation_complete()
             {
                 if !document_generation_tool_available(&available_tool_names) {
@@ -5671,6 +5688,62 @@ mod tests {
         assert!(prompt.contains("阶段 2 至少 45 次"));
         assert!(prompt.contains("确认 imagegen 可用"));
         assert!(prompt.contains("不能用代码绘图兜底"));
+    }
+
+    #[test]
+    fn super_ppt_imagegen_blocker_is_not_redriven_to_generate_file() {
+        struct SuperPptBlockedApiClient;
+
+        impl ApiClient for SuperPptBlockedApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert!(request
+                    .system_prompt
+                    .iter()
+                    .any(|item| item.contains("SuperPPT")));
+                Ok(vec![
+                    AssistantEvent::TextDelta(
+                        "当前状态：阻塞。缺少必需的 imagegen 图像生成工具，无法执行 GordenSuperPPTSkill。"
+                            .to_string(),
+                    ),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SuperPptBlockedApiClient,
+            StaticToolExecutor::new().register("generate_file", |_input| {
+                Ok(r#"{"filePath":"output/fallback.pptx"}"#.to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn(
+                "请依据附件生成答辩 PPT。Use the local Himalaya skill `GordenSuperPPTSkill`.",
+                None,
+            )
+            .expect("SuperPPT imagegen blocker should be a valid skill-level stop");
+
+        assert_eq!(summary.iterations, 1);
+        assert!(
+            summary.tool_results.is_empty(),
+            "SuperPPT blocker must not be converted into generate_file fallback"
+        );
+        let final_text = summary
+            .assistant_messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(final_text.contains("imagegen"));
+        assert!(final_text.contains("阻塞"));
     }
 
     struct UnsupportedToolApiClient {
