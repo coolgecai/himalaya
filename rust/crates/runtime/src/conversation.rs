@@ -418,15 +418,20 @@ struct TurnTaskState {
     requires_workspace_analysis: bool,
     requires_document_generation: bool,
     requires_generate_file_deliverable: bool,
+    requires_super_ppt_deliverable: bool,
     required_evidence: Vec<&'static str>,
     source_attachments: Vec<AttachmentEvidence>,
     observed_tools: BTreeSet<String>,
     observed_files: BTreeSet<String>,
     read_file_calls: usize,
     generated_document: bool,
+    super_ppt_pptx_artifact: bool,
+    super_ppt_manifest_artifact: bool,
+    super_ppt_slide_artifact: bool,
     failed_tools: Vec<String>,
     evidence_gate_prompts: usize,
     document_generation_gate_prompts: usize,
+    super_ppt_gate_prompts: usize,
     output_language: Option<String>,
 }
 
@@ -446,21 +451,28 @@ impl TurnTaskState {
         } else {
             Vec::new()
         };
+        let requires_super_ppt_deliverable =
+            requires_document_generation && is_super_ppt_request(user_input);
         Self {
             objective: user_input.trim().chars().take(240).collect(),
             requires_workspace_analysis,
             requires_document_generation,
             requires_generate_file_deliverable: requires_document_generation
-                && !is_super_ppt_request(user_input),
+                && !requires_super_ppt_deliverable,
+            requires_super_ppt_deliverable,
             required_evidence,
             source_attachments: Vec::new(),
             observed_tools: BTreeSet::new(),
             observed_files: BTreeSet::new(),
             read_file_calls: 0,
             generated_document: false,
+            super_ppt_pptx_artifact: false,
+            super_ppt_manifest_artifact: false,
+            super_ppt_slide_artifact: false,
             failed_tools: Vec::new(),
             evidence_gate_prompts: 0,
             document_generation_gate_prompts: 0,
+            super_ppt_gate_prompts: 0,
             output_language: None,
         }
     }
@@ -496,7 +508,9 @@ impl TurnTaskState {
         } else if is_generate_file_tool(tool_name) {
             self.generated_document = true;
         }
+        self.observe_super_ppt_artifacts(output);
         for file in extract_file_candidates(output).into_iter().take(12) {
+            self.observe_super_ppt_artifacts(&file);
             self.observed_files.insert(file);
         }
     }
@@ -531,6 +545,43 @@ impl TurnTaskState {
 
     fn document_generation_complete(&self) -> bool {
         !self.requires_generate_file_deliverable || self.generated_document
+    }
+
+    fn observe_super_ppt_artifacts(&mut self, text: &str) {
+        if !self.requires_super_ppt_deliverable {
+            return;
+        }
+        let lower = text.to_lowercase();
+        if lower.contains(".pptx") {
+            self.super_ppt_pptx_artifact = true;
+        }
+        if super_ppt_manifest_text(&lower) {
+            self.super_ppt_manifest_artifact = true;
+        }
+        if super_ppt_slide_text(&lower) {
+            self.super_ppt_slide_artifact = true;
+        }
+    }
+
+    fn super_ppt_artifact_complete(&self) -> bool {
+        !self.requires_super_ppt_deliverable
+            || (self.super_ppt_pptx_artifact
+                && (self.super_ppt_manifest_artifact || self.super_ppt_slide_artifact))
+    }
+
+    fn should_prompt_for_super_ppt_completion(&mut self, assistant_text: &str) -> bool {
+        if !self.requires_super_ppt_deliverable {
+            return false;
+        }
+        self.observe_super_ppt_artifacts(assistant_text);
+        if self.super_ppt_artifact_complete()
+            || super_ppt_blocker_text(assistant_text)
+            || self.super_ppt_gate_prompts >= 1
+        {
+            return false;
+        }
+        self.super_ppt_gate_prompts += 1;
+        true
     }
 
     fn should_prompt_for_document_generation(&mut self) -> bool {
@@ -593,6 +644,14 @@ impl TurnTaskState {
                 lines.push(format!(
                     "- Generate-file completion gate complete: {}",
                     self.generated_document
+                ));
+            } else if self.requires_super_ppt_deliverable {
+                lines.push(format!(
+                    "- SuperPPT completion gate complete: {}; pptx: {}; manifest: {}; slides: {}",
+                    self.super_ppt_artifact_complete(),
+                    self.super_ppt_pptx_artifact,
+                    self.super_ppt_manifest_artifact,
+                    self.super_ppt_slide_artifact
                 ));
             } else {
                 lines.push(
@@ -922,6 +981,83 @@ fn is_super_ppt_request(user_input: &str) -> bool {
         || user_input.contains("GordenImagePPTGen")
         || user_input.contains("GordenImage2PPTX")
         || user_input.contains("imagegen-manifest")
+}
+
+fn super_ppt_manifest_text(lower_text: &str) -> bool {
+    lower_text.contains("imagegen-manifest")
+        || lower_text.contains("imagegen_manifest")
+        || lower_text.contains("imagegen manifest")
+        || lower_text.contains("imagegen-assets-manifest")
+        || lower_text.contains("imagegen_assets_manifest")
+        || lower_text.contains("imagegen assets manifest")
+        || lower_text.contains("editable deck manifest")
+        || lower_text.contains("deck manifest")
+        || lower_text.contains("manifestpath")
+        || (lower_text.contains("imagegen") && lower_text.contains("manifest"))
+}
+
+fn super_ppt_slide_text(lower_text: &str) -> bool {
+    lower_text.contains("slides/")
+        || lower_text.contains("/slides/")
+        || lower_text.contains("slides\\")
+        || lower_text.contains("\\slides\\")
+        || ((lower_text.contains(".png") || lower_text.contains(".jpg"))
+            && (lower_text.contains("slide") || lower_text.contains("幻灯片")))
+}
+
+fn super_ppt_blocker_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let mentions_super_ppt = lower.contains("superppt")
+        || lower.contains("gordensuperpptskill")
+        || lower.contains("gordenimagepptgen")
+        || lower.contains("gordenimage2pptx")
+        || lower.contains("imagegen");
+    let reports_blocker = [
+        "阻塞",
+        "不可用",
+        "缺少",
+        "无法",
+        "未安装",
+        "无权限",
+        "超时",
+        "失败",
+        "blocked",
+        "unavailable",
+        "missing",
+        "not available",
+        "not installed",
+        "cannot access",
+        "cannot use",
+        "can't access",
+        "hard gate",
+        "failed",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    mentions_super_ppt && reports_blocker
+}
+
+fn super_ppt_completion_gate_prompt(
+    user_input: &str,
+    source_attachments: &[AttachmentEvidence],
+) -> String {
+    if matches!(
+        detect_input_language(user_input).as_deref(),
+        Some("Chinese")
+    ) {
+        let attachments = gate_attachment_lines(source_attachments, "本轮已有附件/源材料");
+        format!(
+            "# SuperPPT 完成门禁\n当前任务要求通过 SuperPPT/imagegen 流程生成 PPT，但上一轮没有工具调用，也没有看到 `.pptx` + `imagegen` manifest/slides 产物证据；进度说明不能作为最终交付。{attachments}\n请继续执行：先确认 imagegen 可用；若可用，按 GordenSuperPPTSkill 流程生成图片型 PPT、可编辑 PPTX、`imagegen-manifest.json`/相关 manifest 和 slides 图片，并在最终答复中给出实际路径。若 imagegen 或必需技能硬性不可用，请明确说明“阻塞”及原因。不要要求用户重新上传附件或粘贴论文正文。"
+        )
+    } else {
+        let attachments = gate_attachment_lines(
+            source_attachments,
+            "Attached/source material already available",
+        );
+        format!(
+            "# SuperPPT completion gate\nThis task requires the SuperPPT/imagegen pipeline, but the previous attempt made no tool call and provided no `.pptx` plus imagegen manifest/slides artifact evidence. Progress prose is not the deliverable.{attachments}\nContinue now: verify imagegen availability; if available, run the GordenSuperPPTSkill pipeline and produce the image deck, editable PPTX, `imagegen-manifest.json`/related manifests, and slide images, then final-answer with the actual paths. If imagegen or a required skill is hard-blocked, explicitly report the blocker and reason. Do not ask the user to re-upload the attachment or paste the source text."
+        )
+    }
 }
 
 fn estimate_requested_slide_count(user_input: &str) -> Option<usize> {
@@ -2932,6 +3068,8 @@ where
                 .collect::<BTreeSet<_>>();
             let pending_tool_uses =
                 normalize_tool_uses(&mut assistant_message, &available_tool_names);
+            let assistant_text = assistant_plain_text(&assistant_message);
+            task_state.observe_super_ppt_artifacts(&assistant_text);
             if pending_tool_uses.is_empty()
                 && task_state.requires_workspace_analysis
                 && !task_state.evidence_complete()
@@ -2947,6 +3085,34 @@ where
                 }
                 let error = RuntimeError::new(
                     "workspace analysis required local search/read evidence, but the assistant did not request the required workspace tools before answering",
+                );
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
+            if pending_tool_uses.is_empty()
+                && task_state.requires_super_ppt_deliverable
+                && !task_state.super_ppt_artifact_complete()
+                && !super_ppt_blocker_text(&assistant_text)
+            {
+                if task_state.should_prompt_for_super_ppt_completion(&assistant_text) {
+                    self.record_and_emit_task_progress(
+                        &runtime_task_id,
+                        &mut task_ledger_offset,
+                        "super_ppt_completion_redrive",
+                        Some("assistant stopped before producing SuperPPT artifacts or an explicit imagegen blocker; completion gate redrive scheduled".to_string()),
+                    );
+                    self.session
+                        .push_message(ConversationMessage::user_text(
+                            super_ppt_completion_gate_prompt(
+                                &user_input,
+                                &task_state.source_attachments,
+                            ),
+                        ))
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    continue;
+                }
+                let error = RuntimeError::new(
+                    "SuperPPT request required PPTX plus imagegen manifest/slides artifacts or an explicit imagegen blocker, but the assistant stopped with progress text only",
                 );
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
@@ -5150,6 +5316,18 @@ fn build_assistant_message(
     ))
 }
 
+fn assistant_plain_text(message: &ConversationMessage) -> String {
+    message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
@@ -5675,6 +5853,40 @@ mod tests {
     }
 
     #[test]
+    fn super_ppt_skill_discussion_is_not_delivery_gated() {
+        struct SkillDiscussionApiClient;
+
+        impl ApiClient for SkillDiscussionApiClient {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta(
+                        "GordenSuperPPTSkill 的问题在于完成态缺少产物校验。".to_string(),
+                    ),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SkillDiscussionApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("请分析 GordenSuperPPTSkill 的实现问题", None)
+            .expect("skill discussion should not require PPT artifacts");
+
+        assert_eq!(summary.iterations, 1);
+        assert!(summary.tool_results.is_empty());
+    }
+
+    #[test]
     fn super_ppt_long_task_prompt_estimates_imagegen_work() {
         let prompt = document_generation_long_task_prompt(
             "请生成 15 页答辩 PPT。Use the local Himalaya skill `GordenSuperPPTSkill`.",
@@ -5744,6 +5956,172 @@ mod tests {
             .join("\n");
         assert!(final_text.contains("imagegen"));
         assert!(final_text.contains("阻塞"));
+    }
+
+    #[test]
+    fn super_ppt_progress_only_response_is_redriven_to_blocker_or_artifacts() {
+        struct SuperPptProgressApiClient {
+            call_count: usize,
+        }
+
+        impl ApiClient for SuperPptProgressApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                match self.call_count {
+                    1 => {
+                        assert!(request
+                            .system_prompt
+                            .iter()
+                            .any(|item| item.contains("SuperPPT")));
+                        Ok(vec![
+                            AssistantEvent::TextDelta("请稍等，我正在处理中...".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    2 => {
+                        let user_text = request
+                            .messages
+                            .iter()
+                            .filter(|message| message.role == MessageRole::User)
+                            .flat_map(|message| {
+                                message.blocks.iter().filter_map(|block| match block {
+                                    ContentBlock::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        assert!(
+                            user_text.contains("SuperPPT 完成门禁")
+                                || user_text.contains("SuperPPT completion gate")
+                        );
+                        assert!(user_text.contains("imagegen-manifest"));
+                        assert!(
+                            user_text.contains("不要要求用户重新上传附件")
+                                || user_text.contains("Do not ask the user to re-upload")
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta(
+                                "当前状态：阻塞。imagegen 不可用，无法执行 GordenSuperPPTSkill。"
+                                    .to_string(),
+                            ),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => unreachable!("SuperPPT progress gate should settle after redrive"),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SuperPptProgressApiClient { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn(
+                "请依据附件生成答辩 PPT。Use the local Himalaya skill `GordenSuperPPTSkill`.",
+                None,
+            )
+            .expect("SuperPPT progress-only text should be redriven");
+
+        assert_eq!(summary.iterations, 2);
+        let final_text = summary
+            .assistant_messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(final_text.contains("imagegen"));
+        assert!(final_text.contains("阻塞"));
+        assert!(summary.tool_results.is_empty());
+    }
+
+    #[test]
+    fn super_ppt_artifact_evidence_allows_completion_without_generate_file() {
+        struct SuperPptArtifactApiClient;
+
+        impl ApiClient for SuperPptArtifactApiClient {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta(
+                        "已生成图片型 PPT：out/image-deck.pptx；可编辑 PPTX：out/editable-deck.pptx；imagegen-manifest.json：out/imagegen-manifest.json；slides：out/slides/slide-01.png。"
+                            .to_string(),
+                    ),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SuperPptArtifactApiClient,
+            StaticToolExecutor::new().register("generate_file", |_input| {
+                Ok(r#"{"filePath":"output/fallback.pptx"}"#.to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn(
+                "请依据附件生成答辩 PPT。Use the local Himalaya skill `GordenSuperPPTSkill`.",
+                None,
+            )
+            .expect("SuperPPT artifact evidence should satisfy the skill gate");
+
+        assert_eq!(summary.iterations, 1);
+        assert!(
+            summary.tool_results.is_empty(),
+            "SuperPPT artifact delivery must not be converted into generate_file fallback"
+        );
+    }
+
+    #[test]
+    fn super_ppt_repeated_progress_only_response_fails_instead_of_completing() {
+        struct SuperPptRepeatedProgressApiClient {
+            call_count: usize,
+        }
+
+        impl ApiClient for SuperPptRepeatedProgressApiClient {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                Ok(vec![
+                    AssistantEvent::TextDelta("请稍等，我正在处理中...".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SuperPptRepeatedProgressApiClient { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn(
+                "请依据附件生成答辩 PPT。Use the local Himalaya skill `GordenSuperPPTSkill`.",
+                None,
+            )
+            .expect_err("repeated progress-only SuperPPT text should not complete");
+
+        assert!(error.to_string().contains("SuperPPT request required PPTX"));
     }
 
     struct UnsupportedToolApiClient {
