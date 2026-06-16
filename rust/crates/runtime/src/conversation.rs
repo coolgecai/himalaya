@@ -699,17 +699,49 @@ struct AttachmentEvidence {
     label: String,
     kind: &'static str,
     extracted_chars: Option<usize>,
+    details: Vec<String>,
 }
 
 impl AttachmentEvidence {
     fn summary(&self) -> String {
-        match (self.kind, self.extracted_chars) {
+        let mut summary = match (self.kind, self.extracted_chars) {
             ("text", Some(chars)) => {
                 format!("{} (extracted text: {chars} chars)", self.label)
             }
             ("image", _) => format!("{} (image)", self.label),
             _ => self.label.clone(),
+        };
+        if !self.details.is_empty() {
+            summary.push_str("; ");
+            summary.push_str(&self.details.join("; "));
         }
+        summary
+    }
+
+    fn text(label: impl Into<String>, extracted_chars: Option<usize>) -> Self {
+        Self {
+            label: label.into(),
+            kind: "text",
+            extracted_chars,
+            details: Vec::new(),
+        }
+    }
+
+    fn image(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            kind: "image",
+            extracted_chars: None,
+            details: Vec::new(),
+        }
+    }
+
+    fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        if !detail.trim().is_empty() {
+            self.details.push(detail);
+        }
+        self
     }
 }
 
@@ -788,6 +820,22 @@ fn infer_prompt_capabilities(user_input: &str) -> Vec<String> {
     .any(|needle| lower.contains(needle))
     {
         push_capabilities(&mut capabilities, &["web", "research", "search", "fetch"]);
+    }
+
+    if user_requests_document_generation(user_input) {
+        push_capabilities(
+            &mut capabilities,
+            &[
+                "generatefile",
+                "document",
+                "document-generation",
+                "file",
+                "ppt",
+                "pptx",
+                "slides",
+                "deck",
+            ],
+        );
     }
 
     if [
@@ -1133,16 +1181,57 @@ fn collect_attachment_evidence_from_messages(
     evidence
 }
 
+fn collect_recent_workspace_attachment_manifests(
+    workspace_root: Option<&Path>,
+    limit: usize,
+) -> Vec<AttachmentEvidence> {
+    let Some(root) = workspace_root else {
+        return Vec::new();
+    };
+    let attachments_dir = root.join(".Himalayad").join("attachments");
+    let Ok(entries) = fs::read_dir(&attachments_dir) else {
+        return Vec::new();
+    };
+
+    let mut manifests = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let is_manifest = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".manifest.json"));
+            if !is_manifest {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_secs());
+            Some((modified, path))
+        })
+        .collect::<Vec<_>>();
+    manifests.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+    manifests
+        .into_iter()
+        .take(limit)
+        .filter_map(|(_, path)| attachment_evidence_from_manifest(&path))
+        .collect()
+}
+
 fn collect_attachment_evidence_from_blocks(blocks: &[ContentBlock]) -> Vec<AttachmentEvidence> {
     blocks
         .iter()
         .flat_map(|block| match block {
             ContentBlock::Text { text } => extract_file_attachment_markers(text),
-            ContentBlock::Image { media_type, .. } => vec![AttachmentEvidence {
-                label: format!("image attachment ({media_type})"),
-                kind: "image",
-                extracted_chars: None,
-            }],
+            ContentBlock::Image { media_type, .. } => {
+                vec![AttachmentEvidence::image(format!(
+                    "image attachment ({media_type})"
+                ))]
+            }
             ContentBlock::ToolUse { .. }
             | ContentBlock::ToolResult { .. }
             | ContentBlock::Thinking { .. }
@@ -1165,15 +1254,110 @@ fn extract_file_attachment_markers(text: &str) -> Vec<AttachmentEvidence> {
             let body = after_label.strip_prefix('\n').unwrap_or(after_label);
             let body_end = body.find("\n[File: ").unwrap_or(body.len());
             let extracted_chars = body[..body_end].trim().chars().count();
-            evidence.push(AttachmentEvidence {
-                label: label.to_string(),
-                kind: "text",
-                extracted_chars: (extracted_chars > 0).then_some(extracted_chars),
-            });
+            evidence.push(AttachmentEvidence::text(
+                label.to_string(),
+                (extracted_chars > 0).then_some(extracted_chars),
+            ));
         }
         remaining = &after_marker[end + 1..];
     }
+    evidence.extend(extract_compacted_attachment_markers(text));
+    evidence.extend(extract_attachment_warning_markers(text));
     evidence
+}
+
+fn extract_compacted_attachment_markers(text: &str) -> Vec<AttachmentEvidence> {
+    const MARKER: &str = "User-provided attachments before compaction:";
+    text.lines()
+        .filter_map(|line| line.split_once(MARKER).map(|(_, rest)| rest))
+        .flat_map(|rest| rest.split(','))
+        .filter_map(|raw| {
+            let label = clean_attachment_label(raw);
+            if label.is_empty() || label.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(AttachmentEvidence::text(label, None))
+            }
+        })
+        .collect()
+}
+
+fn extract_attachment_warning_markers(text: &str) -> Vec<AttachmentEvidence> {
+    const PREFIX: &str = "Attachment warning: extracted ";
+    const MIDDLE: &str = " characters from ";
+    let mut evidence = Vec::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find(PREFIX) {
+        let after_prefix = &remaining[start + PREFIX.len()..];
+        let Some((digits, after_digits)) = after_prefix.split_once(MIDDLE) else {
+            break;
+        };
+        let extracted_chars = digits.trim().parse::<usize>().ok();
+        let label_end = after_digits
+            .find(|ch| ch == ';' || ch == '\n' || ch == '\r')
+            .unwrap_or(after_digits.len());
+        let label = clean_attachment_label(&after_digits[..label_end]);
+        if !label.is_empty() {
+            evidence.push(AttachmentEvidence::text(label, extracted_chars));
+        }
+        remaining = &after_digits[label_end..];
+    }
+    evidence
+}
+
+fn clean_attachment_label(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches("- ")
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '.' | '。' | ';' | '；' | '"' | '\''))
+        .trim()
+        .to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct AttachmentManifestProbe {
+    #[serde(rename = "sourceName")]
+    source_name: Option<String>,
+    #[serde(rename = "sourcePath")]
+    source_path: Option<String>,
+    #[serde(rename = "fullTextPath")]
+    full_text_path: Option<String>,
+    #[serde(rename = "extractedChars")]
+    extracted_chars: Option<usize>,
+    #[serde(rename = "chunkCount")]
+    chunk_count: Option<usize>,
+}
+
+fn attachment_evidence_from_manifest(path: &Path) -> Option<AttachmentEvidence> {
+    let content = fs::read_to_string(path).ok()?;
+    let manifest = serde_json::from_str::<AttachmentManifestProbe>(&content).ok()?;
+    let label = manifest
+        .source_path
+        .as_deref()
+        .or(manifest.source_name.as_deref())
+        .or_else(|| path.to_str())
+        .map(clean_attachment_label)?;
+    if label.is_empty() {
+        return None;
+    }
+    let mut evidence = AttachmentEvidence::text(label, manifest.extracted_chars);
+    if let Some(source_name) = manifest
+        .source_name
+        .filter(|value| !value.trim().is_empty())
+    {
+        evidence = evidence.with_detail(format!("sourceName: {source_name}"));
+    }
+    if let Some(full_text_path) = manifest
+        .full_text_path
+        .filter(|value| !value.trim().is_empty())
+    {
+        evidence = evidence.with_detail(format!("fullTextPath: {full_text_path}"));
+    }
+    if let Some(chunk_count) = manifest.chunk_count {
+        evidence = evidence.with_detail(format!("chunks: {chunk_count}"));
+    }
+    evidence = evidence.with_detail(format!("manifestPath: {}", path.display()));
+    Some(evidence)
 }
 
 /// Build the user-facing guidance injected when a turn re-drives after a failed
@@ -2861,9 +3045,13 @@ where
                 usage: None,
             })
             .map_err(|error| RuntimeError::new(error.to_string()))?;
-        task_state.set_source_attachments(collect_attachment_evidence_from_messages(
-            &self.session.messages,
-        ));
+        let mut source_attachments =
+            collect_attachment_evidence_from_messages(&self.session.messages);
+        if source_attachments.is_empty() && task_state.requires_document_generation {
+            source_attachments =
+                collect_recent_workspace_attachment_manifests(self.session.workspace_root(), 3);
+        }
+        task_state.set_source_attachments(source_attachments);
         if !task_state.source_attachments.is_empty() {
             self.record_and_emit_task_progress(
                 &runtime_task_id,
@@ -3001,7 +3189,12 @@ where
                 let error = RuntimeError::new(
                     "conversation loop exceeded the maximum number of iterations",
                 );
-                self.record_turn_failed(iterations, &error);
+                let error = self.fail_turn_with_task_status(
+                    &runtime_task_id,
+                    &mut task_ledger_offset,
+                    iterations,
+                    error,
+                );
                 return Err(error);
             }
 
@@ -3023,7 +3216,12 @@ where
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
                 Err(error) => {
-                    self.record_turn_failed(iterations, &error);
+                    let error = self.fail_turn_with_task_status(
+                        &runtime_task_id,
+                        &mut task_ledger_offset,
+                        iterations,
+                        error,
+                    );
                     return Err(error);
                 }
             };
@@ -3031,7 +3229,12 @@ where
                 match build_assistant_message(events) {
                     Ok(result) => result,
                     Err(error) => {
-                        self.record_turn_failed(iterations, &error);
+                        let error = self.fail_turn_with_task_status(
+                            &runtime_task_id,
+                            &mut task_ledger_offset,
+                            iterations,
+                            error,
+                        );
                         return Err(error);
                     }
                 };
@@ -3086,7 +3289,12 @@ where
                 let error = RuntimeError::new(
                     "workspace analysis required local search/read evidence, but the assistant did not request the required workspace tools before answering",
                 );
-                self.record_turn_failed(iterations, &error);
+                let error = self.fail_turn_with_task_status(
+                    &runtime_task_id,
+                    &mut task_ledger_offset,
+                    iterations,
+                    error,
+                );
                 return Err(error);
             }
             if pending_tool_uses.is_empty()
@@ -3114,7 +3322,12 @@ where
                 let error = RuntimeError::new(
                     "SuperPPT request required PPTX plus imagegen manifest/slides artifacts or an explicit imagegen blocker, but the assistant stopped with progress text only",
                 );
-                self.record_turn_failed(iterations, &error);
+                let error = self.fail_turn_with_task_status(
+                    &runtime_task_id,
+                    &mut task_ledger_offset,
+                    iterations,
+                    error,
+                );
                 return Err(error);
             }
             if pending_tool_uses.is_empty()
@@ -3125,7 +3338,12 @@ where
                     let error = RuntimeError::new(
                         "document generation request requires the generate_file tool, but generate_file is not available",
                     );
-                    self.record_turn_failed(iterations, &error);
+                    let error = self.fail_turn_with_task_status(
+                        &runtime_task_id,
+                        &mut task_ledger_offset,
+                        iterations,
+                        error,
+                    );
                     return Err(error);
                 }
                 if task_state.should_prompt_for_document_generation() {
@@ -3148,7 +3366,12 @@ where
                 let error = RuntimeError::new(
                     "document generation request required a successful generate_file result, but the assistant stopped without generating the requested file",
                 );
-                self.record_turn_failed(iterations, &error);
+                let error = self.fail_turn_with_task_status(
+                    &runtime_task_id,
+                    &mut task_ledger_offset,
+                    iterations,
+                    error,
+                );
                 return Err(error);
             }
             self.record_assistant_iteration(
@@ -4176,6 +4399,27 @@ where
             }
         }
 
+        if user_requests_document_generation(user_input) && !is_super_ppt_request(user_input) {
+            for tool in tools.values_mut() {
+                if is_generate_file_tool(&tool.name) {
+                    tool.capabilities.extend([
+                        "generatefile".to_string(),
+                        "document".to_string(),
+                        "document-generation".to_string(),
+                        "ppt".to_string(),
+                        "pptx".to_string(),
+                        "slides".to_string(),
+                        "deck".to_string(),
+                        "file".to_string(),
+                    ]);
+                    tool.capabilities.sort();
+                    tool.capabilities.dedup();
+                    tool.avg_success_rate = (tool.avg_success_rate + 0.25).min(0.99);
+                    tool.cost = (tool.cost - 0.10).max(0.0);
+                }
+            }
+        }
+
         tools.into_values().collect()
     }
 
@@ -5099,6 +5343,22 @@ where
             .unwrap_or_else(|reason| VerificationDecision::Failed { reason })
     }
 
+    fn fail_turn_with_task_status(
+        &mut self,
+        runtime_task_id: &str,
+        task_ledger_offset: &mut usize,
+        iterations: usize,
+        error: RuntimeError,
+    ) -> RuntimeError {
+        let _ = self
+            .task_registry
+            .set_status(runtime_task_id, crate::TaskStatus::Failed);
+        self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
+        *task_ledger_offset = self.task_registry.ledger_for_task(runtime_task_id).len();
+        self.record_turn_failed(iterations, &error);
+        error
+    }
+
     fn emit_decisioning_adjustment_event(
         &self,
         plan: &DecisioningTurnPlan,
@@ -5888,6 +6148,169 @@ mod tests {
                 ..
             } if tool_name == "generate_file"
         )));
+    }
+
+    #[test]
+    fn document_generation_followup_reuses_workspace_attachment_manifest() {
+        struct FollowupDocumentApiClient {
+            call_count: usize,
+        }
+
+        impl ApiClient for FollowupDocumentApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                match self.call_count {
+                    1 => {
+                        let prompt = request.system_prompt.join("\n");
+                        assert!(
+                            prompt.contains("集群对抗下的多层复杂网络建模与瓦解方法.pdf"),
+                            "expected recovered attachment in prompt, got: {prompt}"
+                        );
+                        assert!(
+                            prompt.contains("fullTextPath:"),
+                            "expected recovered fullTextPath in prompt, got: {prompt}"
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta("我会继续生成 PPT。".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    2 => {
+                        let user_text = request
+                            .messages
+                            .iter()
+                            .filter(|message| message.role == MessageRole::User)
+                            .flat_map(|message| {
+                                message.blocks.iter().filter_map(|block| match block {
+                                    ContentBlock::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        assert!(user_text.contains("文档生成完成门禁"));
+                        assert!(user_text.contains("fullTextPath:"));
+                        assert!(user_text.contains("不要要求用户再次上传附件"));
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "generate-followup".to_string(),
+                                name: "generate_file".to_string(),
+                                input: r#"{"path":"output/followup.pptx","format":"pptx","document_spec":{"title":"集群对抗下的多层复杂网络建模与瓦解方法","blocks":[{"type":"heading","text":"答辩汇报"}]}}"#.to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "已生成常规可编辑 PPT：output/followup.pptx".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]),
+                }
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "himalaya-docgen-followup-{}-{}",
+            std::process::id(),
+            super::current_time_millis()
+        ));
+        let attachments = root.join(".Himalayad").join("attachments");
+        fs::create_dir_all(&attachments).expect("attachments dir");
+        fs::write(
+            attachments.join("attachment-test.manifest.json"),
+            r#"{
+                "sourceName": "集群对抗下的多层复杂网络建模与瓦解方法.pdf",
+                "sourcePath": "/tmp/集群对抗下的多层复杂网络建模与瓦解方法.pdf",
+                "fullTextPath": "/tmp/attachment-test.extracted.txt",
+                "extractedChars": 230581,
+                "chunkCount": 12
+            }"#,
+        )
+        .expect("manifest");
+
+        let feature_config = RuntimeFeatureConfig::default().with_decisioning(
+            DecisioningConfig::default()
+                .with_enabled(true)
+                .with_emit_events(true)
+                .with_max_parallelism(2),
+        );
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new().with_workspace_root(&root),
+            FollowupDocumentApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("generate_file", |_input| {
+                Ok(r#"{"filePath":"output/followup.pptx","format":"pptx","manifestPath":"output/followup.pptx.manifest.json","quality":{"warnings":[]}}"#.to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+
+        let summary = runtime
+            .run_turn("尝试用常规方式生成高质量 PPT", None)
+            .expect("follow-up document generation should reuse workspace attachment manifest");
+
+        assert!(summary.tool_results.iter().any(|message| matches!(
+            &message.blocks[0],
+            ContentBlock::ToolResult {
+                tool_name,
+                is_error: false,
+                ..
+            } if tool_name == "generate_file"
+        )));
+        let plan = runtime
+            .task_registry()
+            .list(None)
+            .into_iter()
+            .next()
+            .and_then(|task| task.plan)
+            .expect("decisioning plan should be recorded");
+        assert!(
+            plan.dag.nodes.iter().any(|node| node
+                .candidate_tools
+                .iter()
+                .any(|tool| tool == "generate_file")),
+            "document generation plan should include generate_file, got: {:?}",
+            plan.dag.nodes
+        );
+        fs::remove_dir_all(root).expect("cleanup workspace");
+    }
+
+    #[test]
+    fn empty_assistant_response_marks_runtime_task_failed() {
+        struct EmptyApiClient;
+
+        impl ApiClient for EmptyApiClient {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![AssistantEvent::MessageStop])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            EmptyApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn("你好", None)
+            .expect_err("empty assistant response should fail the turn");
+
+        assert!(error
+            .to_string()
+            .contains("assistant stream produced no content"));
+        let task = runtime
+            .task_registry()
+            .list(None)
+            .into_iter()
+            .next()
+            .expect("runtime task should be recorded");
+        assert_eq!(task.status, crate::TaskStatus::Failed);
     }
 
     #[test]
