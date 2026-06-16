@@ -3163,6 +3163,20 @@ where
             assistant_messages.push(assistant_message);
 
             if pending_tool_uses.is_empty() {
+                if task_state.requires_super_ppt_deliverable
+                    && !task_state.super_ppt_artifact_complete()
+                    && super_ppt_blocker_text(&assistant_text)
+                {
+                    self.finalize_turn_as_blocked(
+                        &runtime_task_id,
+                        &mut task_ledger_offset,
+                        format!(
+                            "SuperPPT blocked before delivery: {}",
+                            assistant_text.trim().chars().take(320).collect::<String>()
+                        ),
+                    );
+                    break 'turn;
+                }
                 match self.finalize_turn_or_recover(
                     &runtime_task_id,
                     &mut task_ledger_offset,
@@ -3749,6 +3763,46 @@ where
                 TurnFlow::Complete
             }
         }
+    }
+
+    fn finalize_turn_as_blocked(
+        &mut self,
+        runtime_task_id: &str,
+        task_ledger_offset: &mut usize,
+        reason: String,
+    ) {
+        let verification_route =
+            self.select_model_route_for_task(runtime_task_id, crate::ModelRoutePhase::Verification);
+        let verification_decision = VerificationDecision::Failed {
+            reason: reason.clone(),
+        };
+        let mut team_ledger = TeamExecutionLedger::new(
+            format!("team-{}", self.session.session_id),
+            runtime_task_id.to_string(),
+        );
+        self.emit_team_execution_event_for_task(
+            runtime_task_id,
+            team_ledger
+                .record_verification(&verification_decision, Some(verification_route.clone())),
+        );
+        let _ = self
+            .task_registry
+            .set_status(runtime_task_id, crate::TaskStatus::Blocked);
+        self.emit_task_ledger_events(runtime_task_id, *task_ledger_offset);
+        *task_ledger_offset = self.task_registry.ledger_for_task(runtime_task_id).len();
+        let classification = self.failure_classifier.classify_reason(&reason);
+        self.emit_conversation_task_report(
+            runtime_task_id,
+            verification_route,
+            reason,
+            false,
+            true,
+            Some(false),
+            verification_decision,
+            Some(classification),
+            None,
+            None,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5956,6 +6010,17 @@ mod tests {
             .join("\n");
         assert!(final_text.contains("imagegen"));
         assert!(final_text.contains("阻塞"));
+        let task = runtime
+            .task_registry()
+            .list(None)
+            .into_iter()
+            .next()
+            .expect("runtime task should be recorded");
+        assert_eq!(task.status, crate::TaskStatus::Blocked);
+        assert!(task
+            .execution_reports
+            .last()
+            .is_some_and(|report| report.blocked && !report.completed));
     }
 
     #[test]
@@ -6042,6 +6107,17 @@ mod tests {
         assert!(final_text.contains("imagegen"));
         assert!(final_text.contains("阻塞"));
         assert!(summary.tool_results.is_empty());
+        let task = runtime
+            .task_registry()
+            .list(None)
+            .into_iter()
+            .next()
+            .expect("runtime task should be recorded");
+        assert_eq!(task.status, crate::TaskStatus::Blocked);
+        assert!(task
+            .execution_reports
+            .last()
+            .is_some_and(|report| report.blocked && !report.completed));
     }
 
     #[test]
@@ -6085,6 +6161,17 @@ mod tests {
             summary.tool_results.is_empty(),
             "SuperPPT artifact delivery must not be converted into generate_file fallback"
         );
+        let task = runtime
+            .task_registry()
+            .list(None)
+            .into_iter()
+            .next()
+            .expect("runtime task should be recorded");
+        assert_eq!(task.status, crate::TaskStatus::Completed);
+        assert!(task
+            .execution_reports
+            .last()
+            .is_some_and(|report| !report.blocked && report.completed));
     }
 
     #[test]
