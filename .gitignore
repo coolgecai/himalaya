@@ -12,7 +12,10 @@ dist/
 
 # Generated packaged binaries
 bin/
-vscode-extension/bin/
+!vscode-extension/bin/
+vscode-extension/bin/*
+!vscode-extension/bin/python/
+!vscode-extension/bin/python/**
 installer/staging/
 
 # Local runtime state

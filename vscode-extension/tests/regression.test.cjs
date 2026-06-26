@@ -31,13 +31,13 @@ const cliSource = fs.readFileSync(path.join(root, 'src', 'cli.ts'), 'utf8');
 const permissionPolicySource = fs.readFileSync(path.join(root, 'src', 'permissionPolicy.ts'), 'utf8');
 const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 
-test('default permission mode aligns with CLI read-only default', () => {
+test('default permission mode aligns with CLI workspace-write default', () => {
   const props = packageJson.contributes?.configuration?.properties ?? {};
   const permissionMode = props['himalayaCode.defaultPermissionMode'];
   assert.ok(permissionMode, 'missing defaultPermissionMode setting');
-  assert.equal(permissionMode.default, 'read-only');
+  assert.equal(permissionMode.default, 'workspace-write');
   assert.deepEqual(permissionMode.enum, ['read-only', 'workspace-write', 'danger-full-access']);
-  assert.match(permissionPolicySource, /DEFAULT_PERMISSION_MODE:\s*PublicPermissionMode\s*=\s*'read-only'/);
+  assert.match(permissionPolicySource, /DEFAULT_PERMISSION_MODE:\s*PublicPermissionMode\s*=\s*'workspace-write'/);
   assert.match(permissionPolicySource, /PUBLIC_PERMISSION_MODES:\s*readonly PublicPermissionMode\[\]/);
   assert.match(extensionSource, /normalizePermissionMode\(config\.get<string>\('defaultPermissionMode',\s*DEFAULT_PERMISSION_MODE\)\)/);
   assert.match(chatPanelSource, /normalizePermissionMode\(config\.get<string>\('defaultPermissionMode',\s*DEFAULT_PERMISSION_MODE\)\)/);
@@ -65,6 +65,10 @@ test('VSIX prepackage checks verify compiled output and staged binary', () => {
   assert.match(prepackageCheckSource, /requireFile\('out\/chatPanel\.js', \{ nonEmpty: true \}\)/);
   assert.match(prepackageCheckSource, /requireFile\('out\/streamProtocol\.js', \{ nonEmpty: true \}\)/);
   assert.match(prepackageCheckSource, /requireFile\('bin\/Himalaya-linux-x64', \{ executable: true, nonEmpty: true \}\)/);
+  assert.match(prepackageCheckSource, /requireFile\('bin\/python\/run_doc_service\.py', \{ executable: true, nonEmpty: true \}\)/);
+  assert.match(prepackageCheckSource, /requireFile\('bin\/python\/himalaya_doc_service\/src\/himalaya_doc_service\/server\.py', \{ nonEmpty: true \}\)/);
+  assert.match(prepackageCheckSource, /requireFile\('bin\/python\/wheelhouse\/pymupdf-1\.27\.2\.3-cp310-abi3-manylinux_2_28_x86_64\.whl', \{ nonEmpty: true \}\)/);
+  assert.match(prepackageCheckSource, /requireFile\('bin\/python\/wheelhouse\/pdfplumber-0\.11\.10-py3-none-any\.whl', \{ nonEmpty: true \}\)/);
   assert.match(prepackageCheckSource, /requireFile\('LICENSE', \{ nonEmpty: true \}\)/);
   assert.match(prepackageCheckSource, /packageJson\.main !== '\.\/out\/extension\.js'/);
 });
@@ -104,7 +108,9 @@ test('danger permission args are no longer hardcoded to skip permissions', () =>
 test('configure model workflow remains present', () => {
   assert.match(chatPanelSource, /async\s+openModelConfigurationWizard\(\):\s*Promise<void>/);
   assert.match(chatPanelSource, /private\s+async\s+configureCloudModelRoute\(\):\s*Promise<void>/);
-  assert.match(chatPanelSource, /private\s+async\s+configureLocalModelRoute\(\):\s*Promise<void>/);
+  assert.match(chatPanelSource, /private\s+async\s+configureLocalModelRoute\(configuredProfiles:\s*Record<string,\s*SettingsModelProfile>\s*=\s*\{\}\):\s*Promise<void>/);
+  assert.match(chatPanelSource, /listSettingsModelProfiles\(\)/);
+  assert.match(chatPanelSource, /private\s+async\s+selectFromSettingsModelProfiles/);
   assert.match(chatPanelSource, /await\s+writeModelRoute\(this\.context,\s*\{/);
 });
 
@@ -112,6 +118,30 @@ test('webview doctor/status command path is wired', () => {
   assert.match(chatPanelSource, /typedMessage\.command === 'doctor' \|\| typedMessage\.command === 'status'/);
   assert.match(chatPanelSource, /executeUtilityCommand\(typedMessage\.command\)/);
   assert.match(chatPanelSource, /private\s+async\s+executeUtilityCommand\(command:\s*'doctor'\s*\|\s*'status'\):\s*Promise<void>/);
+});
+
+test('right trace/task board is decoupled from left reasoning preference', () => {
+  assert.match(chatPanelSource, /traceOpen:\s*true/);
+  assert.match(chatPanelSource, /traceManualClosed:\s*false/);
+  assert.match(chatPanelSource, /if \(event\.decisioning_event\)\s*\{/);
+  assert.doesNotMatch(chatPanelSource, /traceOpen:\s*Boolean\(INIT\.showReasoning\)/);
+  assert.doesNotMatch(chatPanelSource, /state\.traceOpen\s*=\s*state\.showReasoning/);
+  assert.doesNotMatch(chatPanelSource, /state\.showReasoning\s*=\s*state\.traceOpen/);
+  assert.doesNotMatch(chatPanelSource, /event\.decisioning_event\s*&&\s*Boolean\(this\.currentOptions\.showReasoning\)/);
+});
+
+test('trace panel resize updates grid-scoped css variable', () => {
+  assert.match(chatPanelSource, /grid-template-columns:\s*minmax\(320px,\s*1fr\)\s*8px\s*minmax\(300px,\s*var\(--trace-width,\s*380px\)\)/);
+  assert.match(chatPanelSource, /document\.documentElement\.style\.setProperty\('--trace-width',\s*width \+ 'px'\)/);
+});
+
+test('composer supports arrow key prompt history recall', () => {
+  assert.match(chatPanelSource, /composerHistory:\s*\[\]/);
+  assert.match(chatPanelSource, /function\s+rememberComposerHistory\(text\)/);
+  assert.match(chatPanelSource, /function\s+recallComposerHistory\(direction\)/);
+  assert.match(chatPanelSource, /e\.key === 'ArrowUp'/);
+  assert.match(chatPanelSource, /e\.key === 'ArrowDown'/);
+  assert.match(chatPanelSource, /rememberComposerHistory\(text\)/);
 });
 
 test('chat submissions prefer reusable repl worker with one-shot fallback', () => {
@@ -1126,13 +1156,14 @@ test('orphaned standalone webview assets are removed in favor of the inline UI',
   assert.ok(fs.existsSync(path.join(mediaDir, 'marked.umd.js')), 'media/marked.umd.js must still ship');
 });
 
-test('reasoning visualization is fully gated by the showReasoning toggle', () => {
-  // #2: decisioning events carry chain-of-thought; must NOT leak when toggle off.
-  assert.match(chatPanelSource, /event\.decisioning_event && Boolean\(this\.currentOptions\.showReasoning\)/);
-  // reasoning_step forwarding stays gated too.
+test('provider reasoning stays gated while operational trace remains visible', () => {
+  // Provider reasoning_step forwarding stays gated.
   assert.match(chatPanelSource, /const show = Boolean\(this\.currentOptions\.showReasoning\)/);
-  // Defense in depth: webview render also checks state.showReasoning.
-  assert.match(chatPanelSource, /function addDecisioningEvent\(event\)\s*\{[\s\S]*?if \(!state\.showReasoning\) \{ return; \}/);
+  assert.match(chatPanelSource, /if \(show\) \{\s*this\.host\.webview\.postMessage\(\{ type: 'reasoningStep'/);
+  // Operational decisioning events feed the right trace/task board even when
+  // left-side reasoning is disabled.
+  assert.match(chatPanelSource, /if \(event\.decisioning_event\)\s*\{/);
+  assert.doesNotMatch(chatPanelSource, /function addDecisioningEvent\(event\)\s*\{[\s\S]*?if \(!state\.showReasoning\) \{ return; \}/);
 });
 
 test('new chat auto-resumes latest session unless explicitly new', () => {

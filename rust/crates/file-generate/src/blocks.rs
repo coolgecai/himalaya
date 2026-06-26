@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 /// Inline content within a block.
 #[derive(Debug, Clone)]
@@ -12,27 +13,29 @@ pub enum Inline {
 pub struct TableBlock {
     #[serde(default)]
     pub caption: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_vec")]
     pub headers: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_matrix")]
     pub rows: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartSeries {
+    #[serde(default = "default_series_name")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_vec")]
     pub values: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartBlock {
+    #[serde(default = "default_chart_title")]
     pub title: String,
     #[serde(default = "default_chart_kind")]
     pub kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_vec")]
     pub labels: Vec<String>,
     #[serde(default)]
     pub series: Vec<ChartSeries>,
@@ -41,6 +44,7 @@ pub struct ChartBlock {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageBlock {
+    #[serde(default, alias = "src", alias = "file")]
     pub path: String,
     #[serde(default)]
     pub alt: Option<String>,
@@ -239,6 +243,60 @@ pub fn inlines_to_string(inlines: &[Inline]) -> String {
 
 fn default_chart_kind() -> String {
     "bar".to_string()
+}
+
+fn default_chart_title() -> String {
+    "Chart".to_string()
+}
+
+fn default_series_name() -> String {
+    "Series".to_string()
+}
+
+fn deserialize_string_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value_to_string_vec(&value))
+}
+
+fn deserialize_string_matrix<'de, D>(deserializer: D) -> Result<Vec<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Array(rows) => Ok(rows
+            .iter()
+            .map(|row| match row {
+                Value::Array(cells) => cells.iter().map(value_to_string).collect(),
+                other => vec![value_to_string(other)],
+            })
+            .collect()),
+        Value::Null => Ok(Vec::new()),
+        other => Err(de::Error::custom(format!(
+            "expected rows array, got {other:?}"
+        ))),
+    }
+}
+
+fn value_to_string_vec(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => items.iter().map(value_to_string).collect(),
+        Value::Null => Vec::new(),
+        other => vec![value_to_string(other)],
+    }
+}
+
+fn value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 fn parse_markdown_table_row(line: &str) -> Option<Vec<String>> {

@@ -1,10 +1,10 @@
 export type PublicPermissionMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 
-export const DEFAULT_PERMISSION_MODE: PublicPermissionMode = 'read-only';
+export const DEFAULT_PERMISSION_MODE: PublicPermissionMode = 'workspace-write';
 export const DANGEROUS_PERMISSION_MODE: PublicPermissionMode = 'danger-full-access';
 export const PUBLIC_PERMISSION_MODES: readonly PublicPermissionMode[] = [
+  'read-only',
   DEFAULT_PERMISSION_MODE,
-  'workspace-write',
   DANGEROUS_PERMISSION_MODE,
 ];
 

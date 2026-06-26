@@ -41,12 +41,13 @@ use crate::{
 };
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
-const DEFAULT_MAX_CONVERSATION_ITERATIONS: usize = 32;
+const DEFAULT_MAX_CONVERSATION_ITERATIONS: usize = 64;
 /// How many times a turn may automatically re-drive the model to fix a failed
 /// verification before giving up. Each attempt feeds the verification failure
 /// and recovery plan back into the conversation, then re-verifies. A value of
 /// `0` preserves the legacy single-shot behavior (fail the turn immediately).
 const DEFAULT_MAX_RECOVERY_ATTEMPTS: usize = 2;
+const DOCUMENT_GENERATION_GATE_MAX_PROMPTS: usize = 3;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "Himalaya_CODE_AUTO_COMPACT_INPUT_TOKENS";
 const WORKSPACE_CONTEXT_MAX_ENTRIES: usize = 220;
 const WORKSPACE_CONTEXT_MAX_DEPTH: usize = 4;
@@ -425,6 +426,9 @@ struct TurnTaskState {
     observed_files: BTreeSet<String>,
     read_file_calls: usize,
     generated_document: bool,
+    generated_document_quality_blocked: bool,
+    generated_document_quality_summary: Option<String>,
+    document_asset_manifest_path: Option<String>,
     super_ppt_pptx_artifact: bool,
     super_ppt_manifest_artifact: bool,
     super_ppt_slide_artifact: bool,
@@ -466,6 +470,9 @@ impl TurnTaskState {
             observed_files: BTreeSet::new(),
             read_file_calls: 0,
             generated_document: false,
+            generated_document_quality_blocked: false,
+            generated_document_quality_summary: None,
+            document_asset_manifest_path: None,
             super_ppt_pptx_artifact: false,
             super_ppt_manifest_artifact: false,
             super_ppt_slide_artifact: false,
@@ -505,8 +512,23 @@ impl TurnTaskState {
                 "{tool_name}: {}",
                 output.chars().take(160).collect::<String>()
             ));
+        } else if is_document_asset_extract_tool(tool_name) {
+            if let Some(path) = document_asset_manifest_path_from_output(output) {
+                self.document_asset_manifest_path = Some(path);
+            }
         } else if is_generate_file_tool(tool_name) {
             self.generated_document = true;
+            if let Some(summary) = document_quality_blocking_summary_for_request(
+                output,
+                &self.objective,
+                &self.source_attachments,
+            ) {
+                self.generated_document_quality_blocked = true;
+                self.generated_document_quality_summary = Some(summary);
+            } else {
+                self.generated_document_quality_blocked = false;
+                self.generated_document_quality_summary = None;
+            }
         }
         self.observe_super_ppt_artifacts(output);
         for file in extract_file_candidates(output).into_iter().take(12) {
@@ -544,7 +566,8 @@ impl TurnTaskState {
     }
 
     fn document_generation_complete(&self) -> bool {
-        !self.requires_generate_file_deliverable || self.generated_document
+        !self.requires_generate_file_deliverable
+            || (self.generated_document && !self.generated_document_quality_blocked)
     }
 
     fn observe_super_ppt_artifacts(&mut self, text: &str) {
@@ -587,7 +610,7 @@ impl TurnTaskState {
     fn should_prompt_for_document_generation(&mut self) -> bool {
         if !self.requires_generate_file_deliverable
             || self.document_generation_complete()
-            || self.document_generation_gate_prompts >= 2
+            || self.document_generation_gate_prompts >= DOCUMENT_GENERATION_GATE_MAX_PROMPTS
         {
             return false;
         }
@@ -616,7 +639,7 @@ impl TurnTaskState {
             lines.push("- Task class: binary document generation".to_string());
             if self.requires_generate_file_deliverable {
                 lines.push(
-                    "- Required deliverable before final answer: successful generate_file tool result"
+                    "- Required deliverable before final answer: successful quality-compliant document-generation tool result"
                         .to_string(),
                 );
             } else {
@@ -643,8 +666,18 @@ impl TurnTaskState {
             if self.requires_generate_file_deliverable {
                 lines.push(format!(
                     "- Generate-file completion gate complete: {}",
-                    self.generated_document
+                    self.document_generation_complete()
                 ));
+                if let Some(summary) = &self.generated_document_quality_summary {
+                    lines.push(format!(
+                        "- Last generated document failed quality contract: {summary}"
+                    ));
+                }
+                if let Some(path) = &self.document_asset_manifest_path {
+                    lines.push(format!(
+                        "- Extracted source asset manifest available for generation: {path}"
+                    ));
+                }
             } else if self.requires_super_ppt_deliverable {
                 lines.push(format!(
                     "- SuperPPT completion gate complete: {}; pptx: {}; manifest: {}; slides: {}",
@@ -926,7 +959,33 @@ fn user_requests_document_generation(input: &str) -> bool {
 fn is_generate_file_tool(tool_name: &str) -> bool {
     matches!(
         normalize_tool_key(tool_name).as_str(),
-        "generatefile" | "functiongeneratefile"
+        "generatefile"
+            | "functiongeneratefile"
+            | "generatepptx"
+            | "generatedocx"
+            | "generatepdf"
+            | "generatexlsx"
+            | "mcpdocservicegeneratepptx"
+            | "mcpdocservicegeneratedocx"
+            | "mcpdocservicegeneratepdf"
+            | "mcpdocservicegeneratexlsx"
+    )
+}
+
+fn is_document_asset_extract_tool(tool_name: &str) -> bool {
+    matches!(
+        normalize_tool_key(tool_name).as_str(),
+        "extractdocumentassets" | "mcpdocserviceextractdocumentassets"
+    )
+}
+
+fn is_doc_service_generation_tool(tool_name: &str) -> bool {
+    matches!(
+        normalize_tool_key(tool_name).as_str(),
+        "mcpdocservicegeneratepptx"
+            | "mcpdocservicegeneratedocx"
+            | "mcpdocservicegeneratepdf"
+            | "mcpdocservicegeneratexlsx"
     )
 }
 
@@ -936,6 +995,781 @@ fn document_generation_tool_available(available_tool_names: &BTreeSet<String>) -
         .any(|name| is_generate_file_tool(name))
 }
 
+fn document_generation_tool_format(user_input: &str, tool_name: &str) -> &'static str {
+    match normalize_tool_key(tool_name).as_str() {
+        "mcpdocservicegeneratedocx" | "generatedocx" => "docx",
+        "mcpdocservicegeneratepdf" | "generatepdf" => "pdf",
+        "mcpdocservicegeneratexlsx" | "generatexlsx" => "xlsx",
+        "mcpdocservicegeneratepptx" | "generatepptx" => "pptx",
+        _ => infer_requested_document_format(user_input),
+    }
+}
+
+fn infer_requested_document_format(user_input: &str) -> &'static str {
+    let lower = user_input.to_lowercase();
+    if lower.contains("docx") || lower.contains("word") {
+        "docx"
+    } else if lower.contains("xlsx") || lower.contains("excel") || lower.contains("表格") {
+        "xlsx"
+    } else if lower.contains("pdf") {
+        "pdf"
+    } else if requested_presentation(user_input) {
+        "pptx"
+    } else {
+        "docx"
+    }
+}
+
+fn requested_presentation(user_input: &str) -> bool {
+    let lower = user_input.to_lowercase();
+    [
+        "ppt",
+        "pptx",
+        "powerpoint",
+        "slide",
+        "slides",
+        "deck",
+        "幻灯片",
+        "演示文稿",
+        "答辩",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn preferred_document_generation_tool_name(
+    user_input: &str,
+    available_tool_names: &BTreeSet<String>,
+) -> Option<String> {
+    let preferred = match infer_requested_document_format(user_input) {
+        "pptx" => [
+            "mcpdocservicegeneratepptx",
+            "generatepptx",
+            "generatefile",
+            "functiongeneratefile",
+        ]
+        .as_slice(),
+        "docx" => [
+            "mcpdocservicegeneratedocx",
+            "generatedocx",
+            "generatefile",
+            "functiongeneratefile",
+        ]
+        .as_slice(),
+        "pdf" => [
+            "mcpdocservicegeneratepdf",
+            "generatepdf",
+            "generatefile",
+            "functiongeneratefile",
+        ]
+        .as_slice(),
+        "xlsx" => [
+            "mcpdocservicegeneratexlsx",
+            "generatexlsx",
+            "generatefile",
+            "functiongeneratefile",
+        ]
+        .as_slice(),
+        _ => ["generatefile", "functiongeneratefile"].as_slice(),
+    };
+    for target in preferred {
+        if let Some(name) = available_tool_names
+            .iter()
+            .find(|name| normalize_tool_key(name) == *target)
+        {
+            return Some(name.clone());
+        }
+    }
+    available_tool_names
+        .iter()
+        .find(|name| is_generate_file_tool(name))
+        .cloned()
+}
+
+fn document_asset_extract_tool_name(available_tool_names: &BTreeSet<String>) -> Option<String> {
+    available_tool_names
+        .iter()
+        .find(|name| is_document_asset_extract_tool(name))
+        .cloned()
+}
+
+fn document_asset_manifest_path_from_output(output: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(output).ok()?;
+    json_str(&value, "manifest_path", "manifestPath")
+        .or_else(|| json_str(&value, "asset_manifest_path", "assetManifestPath"))
+        .or_else(|| json_str(&value, "assets_manifest_path", "assetsManifestPath"))
+        .filter(|path| !path.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn request_requires_figure_assets(user_input: &str) -> bool {
+    let lower = user_input.to_lowercase();
+    [
+        "图片", "插图", "图像", "图表", "原图", "扣取", "挖取", "figure", "figures", "image",
+        "images",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn request_requires_table_assets(user_input: &str) -> bool {
+    let lower = user_input.to_lowercase();
+    ["表格", "数据表", "table", "tables"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn request_requires_formula_assets(user_input: &str) -> bool {
+    let lower = user_input.to_lowercase();
+    ["公式", "方程", "equation", "formula", "latex"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn request_requires_chart_assets(user_input: &str) -> bool {
+    let lower = user_input.to_lowercase();
+    [
+        "图表",
+        "曲线",
+        "柱状图",
+        "折线图",
+        "chart",
+        "charts",
+        "plot",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn minimum_expected_slide_count(
+    user_input: &str,
+    source_attachments: &[AttachmentEvidence],
+) -> usize {
+    if let Some(count) = estimate_requested_slide_count(user_input) {
+        return count.max(6);
+    }
+    let lower = user_input.to_lowercase();
+    if lower.contains("30分钟") || lower.contains("30 分钟") || lower.contains("30-minute") {
+        22
+    } else if !source_attachments.is_empty()
+        && (lower.contains("学位") || lower.contains("论文") || lower.contains("答辩"))
+    {
+        18
+    } else if requested_presentation(user_input) {
+        12
+    } else {
+        0
+    }
+}
+
+fn document_quality_blocking_summary(output: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(output).ok()?;
+    let quality = value.get("quality")?;
+    let failures = json_count(quality, "failureCount", "failure_count");
+    let blockers = json_count(quality, "blockerCount", "blocker_count");
+    let level = json_str(quality, "qualityLevel", "quality_level")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let has_failed_check = quality
+        .get("checks")
+        .and_then(Value::as_array)
+        .is_some_and(|checks| {
+            checks.iter().any(|check| {
+                json_str(check, "status", "status")
+                    .is_some_and(|status| matches!(status, "fail" | "blocker"))
+            })
+        });
+    if failures == 0
+        && blockers == 0
+        && !matches!(level.as_str(), "fail" | "failed" | "blocker" | "blocked")
+        && !has_failed_check
+    {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if blockers > 0 {
+        parts.push(format!("{blockers} blocker(s)"));
+    }
+    if failures > 0 {
+        parts.push(format!("{failures} failure(s)"));
+    }
+    if matches!(level.as_str(), "fail" | "failed" | "blocker" | "blocked") {
+        parts.push(format!("qualityLevel={level}"));
+    }
+    for message in quality_failure_messages(quality) {
+        parts.push(message);
+    }
+    Some(if parts.is_empty() {
+        "quality contract failed".to_string()
+    } else {
+        parts.join("; ")
+    })
+}
+
+fn document_quality_blocking_summary_for_request(
+    output: &str,
+    user_input: &str,
+    source_attachments: &[AttachmentEvidence],
+) -> Option<String> {
+    if let Some(summary) = document_quality_blocking_summary(output) {
+        return Some(summary);
+    }
+    let value: Value = serde_json::from_str(output).ok()?;
+    let quality = value.get("quality").unwrap_or(&value);
+    if requested_presentation(user_input) {
+        let minimum = minimum_expected_slide_count(user_input, source_attachments);
+        let slide_count = json_count(quality, "slideCount", "slide_count");
+        if minimum > 0 && slide_count > 0 && slide_count < minimum {
+            return Some(format!(
+                "slide count {slide_count} is below the expected minimum {minimum}"
+            ));
+        }
+    }
+    if !source_attachments.is_empty() && request_requires_figure_assets(user_input) {
+        let image_count = json_count(quality, "imageCount", "image_count")
+            + json_count(quality, "extractedAssetCount", "extracted_asset_count");
+        if image_count == 0 {
+            return Some(
+                "request required source images/figures, but generated quality reported none"
+                    .to_string(),
+            );
+        }
+    }
+    if !source_attachments.is_empty() && request_requires_table_assets(user_input) {
+        let table_count = json_count(quality, "tableCount", "table_count");
+        if table_count == 0 {
+            return Some(
+                "request required tables, but generated quality reported none".to_string(),
+            );
+        }
+    }
+    if !source_attachments.is_empty() && request_requires_formula_assets(user_input) {
+        let formula_count = json_count(quality, "formulaCount", "formula_count")
+            + json_count(quality, "formulaImageCount", "formula_image_count");
+        if formula_count == 0 {
+            return Some(
+                "request required formulas, but generated quality reported none".to_string(),
+            );
+        }
+    }
+    None
+}
+
+fn json_count(value: &Value, camel: &str, snake: &str) -> usize {
+    value
+        .get(camel)
+        .or_else(|| value.get(snake))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize
+}
+
+fn json_str<'a>(value: &'a Value, camel: &str, snake: &str) -> Option<&'a str> {
+    value
+        .get(camel)
+        .or_else(|| value.get(snake))
+        .and_then(Value::as_str)
+}
+
+fn quality_failure_messages(quality: &Value) -> Vec<String> {
+    let mut messages = Vec::new();
+    if let Some(checks) = quality.get("checks").and_then(Value::as_array) {
+        for check in checks {
+            let status = json_str(check, "status", "status").unwrap_or_default();
+            if matches!(status, "fail" | "blocker") {
+                let id = json_str(check, "id", "id").unwrap_or("quality.issue");
+                let message = json_str(check, "message", "message").unwrap_or("");
+                messages.push(format!("{id}: {message}").chars().take(180).collect());
+            }
+            if messages.len() >= 3 {
+                break;
+            }
+        }
+    }
+    messages
+}
+
+fn document_generation_needs_asset_preflight(
+    user_input: &str,
+    source_attachments: &[AttachmentEvidence],
+) -> bool {
+    !source_attachments.is_empty()
+        && (request_requires_figure_assets(user_input)
+            || request_requires_table_assets(user_input)
+            || request_requires_formula_assets(user_input)
+            || request_requires_chart_assets(user_input))
+}
+
+fn source_attachment_pdf_path(source_attachments: &[AttachmentEvidence]) -> Option<String> {
+    source_attachments.iter().find_map(|attachment| {
+        let label = attachment.label.trim();
+        if label.is_empty() {
+            return None;
+        }
+        let path = Path::new(label);
+        let is_pdf = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
+        (is_pdf && path.exists()).then(|| label.to_string())
+    })
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    let mut out = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    while out.contains("__") {
+        out = out.replace("__", "_");
+    }
+    out.trim_matches('_').chars().take(80).collect()
+}
+
+fn document_generation_asset_extract_tool_use(
+    user_input: &str,
+    source_attachments: &[AttachmentEvidence],
+    available_tool_names: &BTreeSet<String>,
+) -> Option<(String, String, String)> {
+    if !document_generation_needs_asset_preflight(user_input, source_attachments) {
+        return None;
+    }
+    let tool_name = document_asset_extract_tool_name(available_tool_names)?;
+    let source_path = source_attachment_pdf_path(source_attachments)?;
+    let stem = Path::new(&source_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(sanitize_path_component)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "source".to_string());
+    let input = serde_json::json!({
+        "path": source_path,
+        "format": "pdf",
+        "output_dir": format!("output/extracted-assets/{stem}"),
+        "scan_all": true,
+        "resume": true,
+        "max_runtime_seconds": 180,
+        "page_batch_size": 24,
+        "render_page_previews": false,
+        "extract_images": request_requires_figure_assets(user_input) || request_requires_chart_assets(user_input),
+        "extract_captioned_figures": request_requires_figure_assets(user_input) || request_requires_chart_assets(user_input),
+        "extract_tables": request_requires_table_assets(user_input),
+        "extract_formula_candidates": request_requires_formula_assets(user_input),
+    })
+    .to_string();
+    Some((
+        format!("himalaya-document-assets-{}", current_time_millis()),
+        tool_name,
+        input,
+    ))
+}
+
+fn document_generation_text_tool_use(
+    assistant_text: &str,
+    user_input: &str,
+    source_attachments: &[AttachmentEvidence],
+    available_tool_names: &BTreeSet<String>,
+    asset_manifest_path: Option<&str>,
+) -> Option<(String, String, String)> {
+    for (requested_name, mut input) in
+        document_generation_text_tool_candidates(assistant_text, user_input, available_tool_names)
+    {
+        let Some(tool_name) = resolve_requested_tool_name(&requested_name, available_tool_names)
+        else {
+            continue;
+        };
+        if !is_generate_file_tool(&tool_name) {
+            continue;
+        }
+        normalize_document_generation_tool_input(&mut input, user_input);
+        if !input.is_object() {
+            continue;
+        }
+        repair_document_generation_tool_input(
+            &mut input,
+            &tool_name,
+            user_input,
+            source_attachments,
+            asset_manifest_path,
+        );
+        return Some((
+            format!("himalaya-text-tool-{}", current_time_millis()),
+            tool_name,
+            input.to_string(),
+        ));
+    }
+    None
+}
+
+fn document_generation_text_tool_candidates(
+    assistant_text: &str,
+    user_input: &str,
+    available_tool_names: &BTreeSet<String>,
+) -> Vec<(String, Value)> {
+    let mut candidates = Vec::new();
+    candidates.extend(xml_style_document_tool_candidates(assistant_text));
+    for object_text in extract_json_objects(assistant_text) {
+        let Ok(value) = serde_json::from_str::<Value>(&object_text) else {
+            continue;
+        };
+        if let Some((name, input)) = explicit_tool_candidate_from_value(&value) {
+            candidates.push((name, input));
+            continue;
+        }
+        if document_generation_like_value(&value) {
+            if let Some(name) = mentioned_document_tool_name(assistant_text, available_tool_names)
+                .or_else(|| {
+                    preferred_document_generation_tool_name(user_input, available_tool_names)
+                })
+            {
+                candidates.push((name, value));
+            }
+        }
+    }
+    candidates
+}
+
+fn xml_style_document_tool_candidates(assistant_text: &str) -> Vec<(String, Value)> {
+    let mut candidates = Vec::new();
+    let mut remaining = assistant_text;
+    while let Some(start) = remaining.find("<call:") {
+        let after_call = &remaining[start + "<call:".len()..];
+        let Some(end_name) = after_call.find('>') else {
+            break;
+        };
+        let raw_name = after_call[..end_name]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches('/');
+        let after_name = &after_call[end_name + 1..];
+        let Some(params_start) = after_name.find("<params>") else {
+            remaining = after_name;
+            continue;
+        };
+        let after_params = &after_name[params_start + "<params>".len()..];
+        let Some(params_end) = after_params.find("</params>") else {
+            remaining = after_params;
+            continue;
+        };
+        if let Some(object_text) = extract_json_object(&after_params[..params_end]) {
+            if let Ok(value) = serde_json::from_str::<Value>(&object_text) {
+                candidates.push((raw_name.to_string(), value));
+            }
+        }
+        remaining = &after_params[params_end + "</params>".len()..];
+    }
+    candidates
+}
+
+fn explicit_tool_candidate_from_value(value: &Value) -> Option<(String, Value)> {
+    let requested_name = value
+        .get("name")
+        .or_else(|| value.get("tool"))
+        .or_else(|| value.get("tool_name"))
+        .and_then(Value::as_str)?;
+    let mut input = value
+        .get("parameters")
+        .or_else(|| value.get("arguments"))
+        .or_else(|| value.get("input"))
+        .cloned()
+        .unwrap_or_else(|| {
+            let mut fallback = value.clone();
+            if let Some(object) = fallback.as_object_mut() {
+                object.remove("name");
+                object.remove("tool");
+                object.remove("tool_name");
+            }
+            fallback
+        });
+    if let Some(raw) = input.as_str() {
+        input = serde_json::from_str(raw).ok()?;
+    }
+    Some((requested_name.to_string(), input))
+}
+
+fn mentioned_document_tool_name(
+    assistant_text: &str,
+    available_tool_names: &BTreeSet<String>,
+) -> Option<String> {
+    let normalized_text = normalize_tool_key(assistant_text);
+    available_tool_names
+        .iter()
+        .find(|name| {
+            is_generate_file_tool(name) && normalized_text.contains(&normalize_tool_key(name))
+        })
+        .cloned()
+}
+
+fn document_generation_like_value(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    [
+        "document_spec",
+        "documentSpec",
+        "slides",
+        "blocks",
+        "outline",
+        "sheets",
+        "title",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+}
+
+fn normalize_document_generation_tool_input(input: &mut Value, user_input: &str) {
+    let Some(object) = input.as_object_mut() else {
+        return;
+    };
+    if let Some(spec) = object.remove("documentSpec") {
+        object.entry("document_spec".to_string()).or_insert(spec);
+    }
+    if !object.contains_key("document_spec") {
+        if let Some(outline) = object.remove("outline") {
+            if !object.contains_key("slides") && !object.contains_key("blocks") {
+                object.insert("slides".to_string(), outline);
+            }
+        }
+        let spec_keys = [
+            "title",
+            "subtitle",
+            "author",
+            "language",
+            "document_type",
+            "documentType",
+            "source_documents",
+            "sourceDocuments",
+            "generation_contract",
+            "generationContract",
+            "theme",
+            "blocks",
+            "slides",
+            "sheets",
+            "metadata",
+        ];
+        if spec_keys.iter().any(|key| object.contains_key(*key)) {
+            let mut spec = Map::new();
+            for key in spec_keys {
+                if let Some(value) = object.remove(key) {
+                    spec.insert(key.to_string(), value);
+                }
+            }
+            object.insert("document_spec".to_string(), Value::Object(spec));
+        }
+    }
+    if !object.contains_key("format") && normalize_tool_key(user_input).contains("ppt") {
+        object.insert("format".to_string(), Value::String("pptx".to_string()));
+    }
+}
+
+fn repair_document_generation_tool_input(
+    input: &mut Value,
+    tool_name: &str,
+    user_input: &str,
+    source_attachments: &[AttachmentEvidence],
+    asset_manifest_path: Option<&str>,
+) {
+    let Some(object) = input.as_object_mut() else {
+        return;
+    };
+    let format = document_generation_tool_format(user_input, tool_name);
+    if !object.contains_key("path") {
+        object.insert(
+            "path".to_string(),
+            Value::String(format!(
+                "output/himalaya_document_{}.{}",
+                current_time_millis(),
+                format
+            )),
+        );
+    }
+    if matches!(
+        normalize_tool_key(tool_name).as_str(),
+        "generatefile" | "functiongeneratefile"
+    ) && !object.contains_key("format")
+    {
+        object.insert("format".to_string(), Value::String(format.to_string()));
+    }
+    if is_doc_service_generation_tool(tool_name) {
+        if let Some(path) = asset_manifest_path.filter(|path| !path.trim().is_empty()) {
+            object
+                .entry("asset_manifest_path".to_string())
+                .or_insert_with(|| Value::String(path.to_string()));
+        }
+    }
+
+    let spec_entry = object
+        .entry("document_spec".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !spec_entry.is_object() {
+        return;
+    }
+    let spec = spec_entry.as_object_mut().expect("checked object");
+    if let Some(document_type) = spec.remove("documentType") {
+        spec.entry("document_type".to_string())
+            .or_insert(document_type);
+    }
+    if let Some(source_documents) = spec.remove("sourceDocuments") {
+        spec.entry("source_documents".to_string())
+            .or_insert(source_documents);
+    }
+    if let Some(contract) = spec.remove("generationContract") {
+        spec.entry("generation_contract".to_string())
+            .or_insert(contract);
+    }
+    if !spec.contains_key("title") {
+        spec.insert(
+            "title".to_string(),
+            Value::String(infer_rescue_document_title(user_input, true)),
+        );
+    }
+    if requested_presentation(user_input) && !spec.contains_key("document_type") {
+        spec.insert(
+            "document_type".to_string(),
+            Value::String(
+                if user_input.contains("答辩") || user_input.to_lowercase().contains("defense") {
+                    "degree_defense"
+                } else {
+                    "academic_talk"
+                }
+                .to_string(),
+            ),
+        );
+    }
+    if !source_attachments.is_empty()
+        && spec
+            .get("source_documents")
+            .and_then(Value::as_array)
+            .is_none_or(|documents| documents.is_empty())
+    {
+        spec.insert(
+            "source_documents".to_string(),
+            Value::Array(
+                source_attachments
+                    .iter()
+                    .take(8)
+                    .map(|attachment| {
+                        serde_json::json!({
+                            "document": attachment.label,
+                            "paragraph": attachment.details.join("; ")
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    let contract = spec
+        .entry("generation_contract".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(contract) = contract.as_object_mut() {
+        contract
+            .entry("strict_source_grounding".to_string())
+            .or_insert(Value::Bool(!source_attachments.is_empty()));
+        contract
+            .entry("fail_on_contract_violation".to_string())
+            .or_insert(Value::Bool(true));
+        contract
+            .entry("allow_degraded_output".to_string())
+            .or_insert(Value::Bool(false));
+        contract
+            .entry("require_manifest".to_string())
+            .or_insert(Value::Bool(true));
+        if requested_presentation(user_input) {
+            contract
+                .entry("expected_slide_count".to_string())
+                .or_insert(Value::Number(serde_json::Number::from(
+                    minimum_expected_slide_count(user_input, source_attachments),
+                )));
+        }
+        if request_requires_figure_assets(user_input)
+            || request_requires_table_assets(user_input)
+            || request_requires_formula_assets(user_input)
+            || request_requires_chart_assets(user_input)
+        {
+            let lower_input = user_input.to_lowercase();
+            let academic_deck = requested_presentation(user_input)
+                && !source_attachments.is_empty()
+                && (lower_input.contains("学位")
+                    || lower_input.contains("论文")
+                    || lower_input.contains("答辩")
+                    || lower_input.contains("thesis")
+                    || lower_input.contains("defense"));
+            let rich_min = if academic_deck { 2 } else { 1 };
+            contract
+                .entry("required_assets".to_string())
+                .or_insert_with(|| {
+                    serde_json::json!({
+                        "figures": if request_requires_figure_assets(user_input) { rich_min } else { 0 },
+                        "tables": if request_requires_table_assets(user_input) { rich_min } else { 0 },
+                        "formulas": if request_requires_formula_assets(user_input) { rich_min } else { 0 },
+                        "charts": if request_requires_chart_assets(user_input) { 1 } else { 0 },
+                        "require_source_refs": !source_attachments.is_empty(),
+                        "require_extracted_assets": !source_attachments.is_empty()
+                    })
+                });
+        }
+    }
+}
+
+fn infer_rescue_document_title(user_input: &str, chinese: bool) -> String {
+    let trimmed = user_input.trim();
+    if trimmed.chars().count() <= 40 {
+        return trimmed.to_string();
+    }
+    for (start_marker, end_marker) in [
+        ("题目：", "\n"),
+        ("标题：", "\n"),
+        ("title:", "\n"),
+        ("Title:", "\n"),
+        ("论文", "，"),
+        ("论文", ","),
+    ] {
+        if let Some(start) = trimmed.find(start_marker) {
+            let after = &trimmed[start + start_marker.len()..];
+            let end = after.find(end_marker).unwrap_or(after.len());
+            let candidate = clean_attachment_label(&after[..end]);
+            if !candidate.is_empty() && candidate.chars().count() <= 80 {
+                return candidate;
+            }
+        }
+    }
+    trimmed
+        .chars()
+        .take(if chinese { 32 } else { 48 })
+        .collect::<String>()
+}
+
+fn document_generation_failure_message(
+    source_attachments: &[AttachmentEvidence],
+    available_tool_names: &BTreeSet<String>,
+) -> String {
+    let available = available_tool_names
+        .iter()
+        .filter(|name| is_generate_file_tool(name))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let attachment_hint = if source_attachments
+        .iter()
+        .any(|attachment| attachment.extracted_chars.unwrap_or_default() >= 120_000)
+    {
+        " The request includes a large attachment; use a cloud/long-context model for planning, or keep the local model on manifest/chunk-guided extraction before generating."
+    } else {
+        ""
+    };
+    format!(
+        "document generation request required a successful, quality-compliant document-generation tool result, but the assistant stopped without generating an acceptable file after {DOCUMENT_GENERATION_GATE_MAX_PROMPTS} redrive prompt(s). Available document tool(s): {}.{}",
+        if available.is_empty() { "none".to_string() } else { available },
+        attachment_hint
+    )
+}
+
 fn workspace_evidence_gate_prompt() -> &'static str {
     "Workspace analysis is not allowed to finish from the injected navigation snapshot. Use local evidence tools now: run glob_search or grep_search to discover relevant files/entry points, read root manifests with read_file, read at least three relevant source files with read_file, then answer only from those observations. Preserve the active output-language contract from the system prompt."
 }
@@ -943,22 +1777,33 @@ fn workspace_evidence_gate_prompt() -> &'static str {
 fn document_generation_gate_prompt(
     user_input: &str,
     source_attachments: &[AttachmentEvidence],
+    quality_summary: Option<&str>,
 ) -> String {
+    let quality_line = quality_summary
+        .filter(|summary| !summary.trim().is_empty())
+        .map(|summary| format!("\n上一轮生成结果未通过质量合同：{summary}"))
+        .unwrap_or_default();
     if matches!(
         detect_input_language(user_input).as_deref(),
         Some("Chinese")
     ) {
         let attachments = gate_attachment_lines(source_attachments, "本轮已有附件/源材料");
         format!(
-            "# 文档生成完成门禁\n当前任务明确要求生成 PPT/Word/PDF/Excel 等电子文档，但上一轮没有成功调用 `generate_file`，不能用论文分析、摘要或大纲作为最终交付。{attachments}\n请继续执行：基于附件或会话中已经提取的 `[File: ...]` 内容，整理为适合目标文档的结构化 `document_spec`，调用 `generate_file` 输出实际文件；检查工具返回的 `manifestPath` 和 `quality`，可修复的问题先修复。不要要求用户再次上传附件、粘贴论文正文或提供文档内容。生成文件成功之前不要给最终答复。"
+            "# 文档生成完成门禁\n当前任务明确要求生成 PPT/Word/PDF/Excel 等电子文档，但上一轮没有成功调用可用的文档生成工具，或生成结果未通过质量合同；不能用论文分析、摘要或大纲作为最终交付。{quality_line}{attachments}\n请继续执行：基于附件或会话中已经提取的 `[File: ...]` 内容，整理为适合目标文档的结构化 `document_spec`，调用可用的最佳文档生成工具输出实际文件（优先 doc-service，兜底 `generate_file`）；检查工具返回的 `manifestPath` 和 `quality`，可修复的问题先修复。不要要求用户再次上传附件、粘贴论文正文或提供文档内容。生成文件成功且质量合同通过之前不要给最终答复。"
         )
     } else {
+        let quality_line = quality_summary
+            .filter(|summary| !summary.trim().is_empty())
+            .map(|summary| {
+                format!("\nPrevious generated result failed the quality contract: {summary}")
+            })
+            .unwrap_or_default();
         let attachments = gate_attachment_lines(
             source_attachments,
             "Attached/source material already available",
         );
         format!(
-            "# Document generation completion gate\nThis task explicitly requires a PPT/Word/PDF/Excel document file, but the previous attempt did not successfully call `generate_file`. A prose analysis, summary, or outline is not the deliverable.{attachments}\nContinue now: base the document on the attached source material or the already-extracted `[File: ...]` content in the conversation, organize it into a structured `document_spec`, call `generate_file` to create the actual file, inspect the returned `manifestPath` and `quality`, and fix any actionable issues before the final response. Do not ask the user to upload the attachment again, paste the source document, or provide document content. Do not finish until file generation succeeds."
+            "# Document generation completion gate\nThis task explicitly requires a PPT/Word/PDF/Excel document file, but the previous attempt did not successfully call an available document-generation tool or the generated result failed the quality contract. A prose analysis, summary, or outline is not the deliverable.{quality_line}{attachments}\nContinue now: base the document on the attached source material or the already-extracted `[File: ...]` content in the conversation, organize it into a structured `document_spec`, call the best available document-generation tool to create the actual file (prefer doc-service, fall back to `generate_file`), inspect the returned `manifestPath` and `quality`, and fix any actionable issues before the final response. Do not ask the user to upload the attachment again, paste the source document, or provide document content. Do not finish until file generation succeeds and the quality contract passes."
         )
     }
 }
@@ -977,7 +1822,7 @@ fn document_generation_preflight_message(
         )
     } else {
         format!(
-            "Document generation preflight: {attachment_count} attachment/source item(s); estimated {estimated_slides} deck slide(s) when PPT is requested; generate_file is the required deliverable."
+            "Document generation preflight: {attachment_count} attachment/source item(s); estimated {estimated_slides} deck slide(s) when PPT is requested; use the best available document-generation tool and pass quality checks before completion."
         )
     }
 }
@@ -1009,7 +1854,7 @@ fn document_generation_long_task_prompt(
             , estimated_slides * 3)
         } else {
             format!(
-                "# 长任务执行契约（文档生成）\n- 这是附件驱动的电子文档生成任务，最终交付必须是实际文件，不是摘要或策划案。\n{attachment_lines}\n- 对超长附件，优先使用附件 brief 和 manifest；需要细节时读取 fullTextPath 或 chunk index，不要要求用户再次上传或粘贴正文。\n- 生成前先整理结构化 document_spec；生成后检查 manifestPath 和 quality，能修复的问题先修复再答复。"
+                "# 长任务执行契约（文档生成）\n- 这是附件驱动的电子文档生成任务，最终交付必须是实际文件，不是摘要、策划案或逐页讲稿文本。\n{attachment_lines}\n- 对超长附件，优先使用附件 brief 和 manifest；需要细节时读取 fullTextPath 或 chunk index，不要要求用户再次上传或粘贴正文。\n- 如果当前模型上下文较小或是本地模型，不要尝试一次性理解整篇论文；先建立章节索引、图表索引、公式索引和实验结果索引，再按索引分块读取关键内容。\n- 严格基于论文来源：不要臆造实验数据、图号、表号或公式；缺少证据时先读附件/manifest/源文件。\n- 生成前先整理结构化 document_spec；优先使用可用的 doc-service 文档工具，兜底使用 generate_file。生成后检查 manifestPath 和 quality。若质量合同失败，必须修复并重新生成，不能作为最终交付。"
             )
         }
     } else if super_ppt {
@@ -1019,7 +1864,7 @@ fn document_generation_long_task_prompt(
         )
     } else {
         format!(
-            "# Long-Running Task Contract (Document Generation)\n- This attachment-backed document request must end with a real generated file, not a summary or outline.\n{attachment_lines}\n- For long attachments, use the brief and manifest first; read fullTextPath or chunk index for details instead of asking the user to upload or paste the source again.\n- Build a structured document_spec before generation; after generation inspect manifestPath and quality and fix actionable issues before final response."
+            "# Long-Running Task Contract (Document Generation)\n- This attachment-backed document request must end with a real generated file, not a summary, outline, or slide-by-slide script text.\n{attachment_lines}\n- For long attachments, use the brief and manifest first; read fullTextPath or chunk index for details instead of asking the user to upload or paste the source again.\n- If the active model has a small context window or is local, do not try to understand the whole paper in one pass; first build section, figure, table, formula, and experiment indexes, then read key chunks by index.\n- Stay source-grounded: do not invent experiment data, figure/table numbers, or equations; read the attachment/manifest/source file when evidence is missing.\n- Build a structured document_spec before generation; prefer available doc-service document tools and fall back to generate_file. After generation inspect manifestPath and quality. If the quality contract fails, repair and regenerate instead of treating the file as final."
         )
     }
 }
@@ -1499,6 +2344,53 @@ fn extract_json_object(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_json_objects(text: &str) -> Vec<String> {
+    let mut objects = Vec::new();
+    let mut search_from = 0usize;
+    while search_from < text.len() {
+        let Some(relative_start) = text[search_from..].find('{') else {
+            break;
+        };
+        let start = search_from + relative_start;
+        let bytes = text.as_bytes();
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut found_end = None;
+        for (offset, &byte) in bytes.iter().enumerate().skip(start) {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        found_end = Some(offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(end) = found_end {
+            objects.push(text[start..=end].to_string());
+            search_from = end + 1;
+        } else {
+            break;
+        }
+    }
+    objects
 }
 
 /// Render messages into a compact, role-tagged transcript for summarization,
@@ -2082,6 +2974,13 @@ fn tool_alias_key(normalized_key: &str) -> Option<&'static str> {
         "read" | "readfile" | "functionreadfile" => Some("readfile"),
         "write" | "writefile" | "functionwritefile" => Some("writefile"),
         "generate" | "generatefile" | "functiongeneratefile" => Some("generatefile"),
+        "generatepptx" | "mcpdocservicegeneratepptx" => Some("mcpdocservicegeneratepptx"),
+        "generatedocx" | "mcpdocservicegeneratedocx" => Some("mcpdocservicegeneratedocx"),
+        "generatepdf" | "mcpdocservicegeneratepdf" => Some("mcpdocservicegeneratepdf"),
+        "generatexlsx" | "mcpdocservicegeneratexlsx" => Some("mcpdocservicegeneratexlsx"),
+        "extractdocumentassets" | "mcpdocserviceextractdocumentassets" => {
+            Some("mcpdocserviceextractdocumentassets")
+        }
         "edit" | "editfile" | "functioneditfile" => Some("editfile"),
         "grep" | "grepsearch" | "functiongrepsearch" => Some("grepsearch"),
         "glob" | "globsearch" | "functionglobsearch" => Some("globsearch"),
@@ -3269,7 +4168,7 @@ where
                 .into_iter()
                 .map(|tool| tool.name)
                 .collect::<BTreeSet<_>>();
-            let pending_tool_uses =
+            let mut pending_tool_uses =
                 normalize_tool_uses(&mut assistant_message, &available_tool_names);
             let assistant_text = assistant_plain_text(&assistant_message);
             task_state.observe_super_ppt_artifacts(&assistant_text);
@@ -3336,7 +4235,7 @@ where
             {
                 if !document_generation_tool_available(&available_tool_names) {
                     let error = RuntimeError::new(
-                        "document generation request requires the generate_file tool, but generate_file is not available",
+                        "document generation request requires a document-generation tool, but none is available",
                     );
                     let error = self.fail_turn_with_task_status(
                         &runtime_task_id,
@@ -3346,7 +4245,55 @@ where
                     );
                     return Err(error);
                 }
-                if task_state.should_prompt_for_document_generation() {
+                let asset_preflight_tool_use = if task_state.document_asset_manifest_path.is_none()
+                    && !task_state
+                        .observed_tools
+                        .iter()
+                        .any(|name| is_document_asset_extract_tool(name))
+                {
+                    document_generation_asset_extract_tool_use(
+                        &user_input,
+                        &task_state.source_attachments,
+                        &available_tool_names,
+                    )
+                } else {
+                    None
+                };
+                if let Some((tool_use_id, tool_name, input)) = asset_preflight_tool_use {
+                    self.record_and_emit_task_progress(
+                        &runtime_task_id,
+                        &mut task_ledger_offset,
+                        "document_asset_extraction_preflight",
+                        Some("scheduling deterministic source asset extraction before document generation".to_string()),
+                    );
+                    assistant_message.blocks.push(ContentBlock::ToolUse {
+                        id: tool_use_id.clone(),
+                        name: tool_name.clone(),
+                        input: input.clone(),
+                    });
+                    pending_tool_uses.push((tool_use_id, tool_name, input));
+                } else if let Some((tool_use_id, tool_name, input)) =
+                    document_generation_text_tool_use(
+                        &assistant_text,
+                        &user_input,
+                        &task_state.source_attachments,
+                        &available_tool_names,
+                        task_state.document_asset_manifest_path.as_deref(),
+                    )
+                {
+                    self.record_and_emit_task_progress(
+                        &runtime_task_id,
+                        &mut task_ledger_offset,
+                        "document_generation_text_tool_call",
+                        Some("assistant wrote a document-generation tool call as text; converting it into an executable tool call".to_string()),
+                    );
+                    assistant_message.blocks.push(ContentBlock::ToolUse {
+                        id: tool_use_id.clone(),
+                        name: tool_name.clone(),
+                        input: input.clone(),
+                    });
+                    pending_tool_uses.push((tool_use_id, tool_name, input));
+                } else if task_state.should_prompt_for_document_generation() {
                     self.record_and_emit_task_progress(
                         &runtime_task_id,
                         &mut task_ledger_offset,
@@ -3358,14 +4305,16 @@ where
                             document_generation_gate_prompt(
                                 &user_input,
                                 &task_state.source_attachments,
+                                task_state.generated_document_quality_summary.as_deref(),
                             ),
                         ))
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                     continue;
                 }
-                let error = RuntimeError::new(
-                    "document generation request required a successful generate_file result, but the assistant stopped without generating the requested file",
-                );
+                let error = RuntimeError::new(document_generation_failure_message(
+                    &task_state.source_attachments,
+                    &available_tool_names,
+                ));
                 let error = self.fail_turn_with_task_status(
                     &runtime_task_id,
                     &mut task_ledger_offset,

@@ -5,7 +5,7 @@ import { HimalayaCli, type HimalayaReplHandle } from './cli';
 import { ChatHistoryRecord, ChatHistorySnapshot, HimalayaHistoryStore, RecoveryEvidence } from './history';
 import { readModelRoute, writeModelRoute } from './modelRoute';
 import { SeqDeduper } from './seqDedup';
-import { loadProviderSelection, listProviderProfiles, loadProviderProfile, ProviderProfile, providerCredentialsPath, saveProviderProfile, saveProviderSelection } from './providerConfig';
+import { loadProviderSelection, listProviderProfiles, loadProviderProfile, ProviderProfile, providerCredentialsPath, saveProviderProfile, saveProviderSelection, listSettingsModelProfiles, saveActiveSettingsModel, SettingsModelProfile } from './providerConfig';
 import {
   DANGEROUS_PERMISSION_MODE,
   DEFAULT_PERMISSION_MODE,
@@ -1015,10 +1015,10 @@ export class HimalayaChatPanel {
           break;
         case 'decisioning_event':
           try {
-            // Decisioning events ARE the reasoning visualization (they carry the
-            // chain-of-thought / analysis). Only forward when the user opted in,
-            // otherwise reasoning leaks into the thread despite the toggle being off.
-            if (event.decisioning_event && Boolean(this.currentOptions.showReasoning)) {
+            // Decisioning events feed the right-side trace/task board. Provider
+            // reasoning_step events remain opt-in; operational plan/task state
+            // should stay visible without cluttering the left conversation.
+            if (event.decisioning_event) {
               this.host.webview.postMessage({ type: 'decisioningEvent', event: event.decisioning_event });
             }
           } catch (e) {
@@ -1609,8 +1609,8 @@ export class HimalayaChatPanel {
     }
 
     return {
-      OPENAI_BASE_URL: ollamaBaseUrl || 'http://127.0.0.1:11434/v1',
-      OPENAI_API_KEY: 'ollama'
+      OPENAI_BASE_URL: route?.cloudBaseUrl?.trim() || ollamaBaseUrl || 'http://127.0.0.1:11434/v1',
+      OPENAI_API_KEY: route?.cloudApiKey?.trim() || 'ollama'
     };
   }
 
@@ -1697,26 +1697,20 @@ export class HimalayaChatPanel {
 
   async openModelConfigurationWizard(): Promise<void> {
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    const profiles = workspaceRoot ? listProviderProfiles(workspaceRoot) : {};
+    const settingsProfiles = listSettingsModelProfiles();
+    const cloudCount = Object.keys(settingsProfiles.cloud).length;
+    const localCount = Object.keys(settingsProfiles.local).length;
 
-    // When saved provider profiles exist, present them directly for one-click switching.
-    // This skips the "Cloud / Local" picker when profiles are available.
-    if (Object.keys(profiles).length > 0) {
-      await this.selectFromProfiles(workspaceRoot!, profiles);
-      return;
-    }
-
-    // No saved profiles: show the original Cloud / Local picker.
     const routeMode = await vscode.window.showQuickPick(
       [
         {
           label: 'Cloud model',
-          description: 'Provide a network address, API key, and model name',
+          description: cloudCount > 0 ? `${cloudCount} configured in settings.json` : 'Provide a network address, API key, and model name',
           value: 'cloud' as const
         },
         {
           label: 'Local model',
-          description: 'Choose from Ollama-managed local models',
+          description: localCount > 0 ? `${localCount} configured in settings.json` : 'Choose from Ollama-managed local models',
           value: 'local' as const
         }
       ],
@@ -1731,11 +1725,140 @@ export class HimalayaChatPanel {
     }
 
     if (routeMode.value === 'cloud') {
+      if (cloudCount > 0) {
+        await this.selectFromSettingsModelProfiles('cloud', settingsProfiles.cloud, workspaceRoot);
+        return;
+      }
+      const profiles = workspaceRoot ? listProviderProfiles(workspaceRoot) : {};
+      if (workspaceRoot && Object.keys(profiles).length > 0) {
+        await this.selectFromProfiles(workspaceRoot, profiles);
+        return;
+      }
       await this.configureNewCloudRoute(workspaceRoot);
       return;
     }
 
-    await this.configureLocalModelRoute();
+    await this.configureLocalModelRoute(settingsProfiles.local);
+  }
+
+  private async selectFromSettingsModelProfiles(
+    source: 'cloud' | 'local',
+    profiles: Record<string, SettingsModelProfile>,
+    workspaceRoot?: string
+  ): Promise<void> {
+    const items: vscode.QuickPickItem[] = Object.entries(profiles)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, profile]) => ({
+        label: name,
+        description: [
+          profile.model ? `model: ${profile.model}` : undefined,
+          profile.provider ? `provider: ${profile.provider}` : undefined,
+          profile.base_url ? `url: ${profile.base_url}` : undefined,
+          profile.api_key ? 'key: saved' : undefined
+        ].filter(Boolean).join(' · '),
+        detail: `settings.json ${source} model`
+      }));
+
+    if (source === 'cloud') {
+      items.push(
+        { label: '', kind: vscode.QuickPickItemKind.Separator },
+        { label: 'Configure new cloud route…', description: 'Add another cloud model to settings.json', detail: 'New' }
+      );
+    }
+
+    const pick = await vscode.window.showQuickPick(items, {
+      title: source === 'cloud' ? 'Cloud models' : 'Local models',
+      placeHolder: 'Select a configured model',
+      ignoreFocusOut: true,
+      matchOnDescription: true,
+      matchOnDetail: true
+    });
+    if (!pick) {
+      return;
+    }
+    if (pick.label === 'Configure new cloud route…') {
+      await this.configureNewCloudRoute(workspaceRoot);
+      return;
+    }
+    const profile = profiles[pick.label];
+    if (!profile) {
+      return;
+    }
+    await this.applySettingsModelProfile(source, pick.label, profile);
+  }
+
+  private async applySettingsModelProfile(
+    source: 'cloud' | 'local',
+    profileName: string,
+    profile: SettingsModelProfile
+  ): Promise<void> {
+    const model = profile.model?.trim();
+    if (!model) {
+      void vscode.window.showWarningMessage(`Model profile "${profileName}" is missing a model name.`);
+      return;
+    }
+    const baseUrl = profile.base_url?.trim();
+    let apiKey = profile.api_key?.trim() ?? '';
+
+    if (source === 'cloud' && (!baseUrl || !apiKey)) {
+      const entered = await vscode.window.showInputBox({
+        title: 'Cloud model route settings',
+        prompt: `Enter api_key for "${profileName}"`,
+        password: true,
+        ignoreFocusOut: true
+      });
+      if (entered === undefined) {
+        return;
+      }
+      apiKey = entered.trim();
+      if (!baseUrl || !apiKey) {
+        void vscode.window.showWarningMessage('Cloud model setup requires base_url and api_key.');
+        return;
+      }
+    }
+
+    if (source === 'cloud') {
+      await writeModelRoute(this.context, {
+        model,
+        modelBackend: 'cloud',
+        modelSource: 'cloud',
+        cloudBaseUrl: baseUrl,
+        cloudApiKey: apiKey,
+        cloudModel: model
+      });
+    } else {
+      await writeModelRoute(this.context, {
+        model,
+        modelBackend: 'ollama',
+        modelSource: 'local',
+        cloudBaseUrl: baseUrl,
+        cloudApiKey: profile.api_key?.trim() || 'ollama'
+      });
+    }
+
+    try {
+      saveActiveSettingsModel(source, profileName, {
+        ...profile,
+        model,
+        ...(baseUrl ? { base_url: baseUrl } : {}),
+        ...(apiKey ? { api_key: apiKey } : {})
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[model] failed to update settings.json active model: ${message}`);
+    }
+
+    this.currentOptions = {
+      ...this.currentOptions,
+      model,
+      modelBackend: source === 'cloud' ? 'cloud' : 'ollama',
+      cloudBaseUrl: source === 'cloud' ? baseUrl : undefined,
+      cloudApiKey: source === 'cloud' ? apiKey : undefined,
+      cloudModel: source === 'cloud' ? model : undefined
+    };
+
+    void this.host.webview.postMessage({ type: 'model-updated', model, modelBackend: source === 'cloud' ? 'cloud' : 'ollama' });
+    void vscode.window.showInformationMessage(`Himalaya ${source} model set to ${model}.`);
   }
 
   private async configureCloudModelRoute(): Promise<void> {
@@ -1864,6 +1987,18 @@ export class HimalayaChatPanel {
         this.output.appendLine(`[model] failed to mirror cloud config to provider.json: ${message}`);
       }
     }
+    try {
+      saveActiveSettingsModel('cloud', selectedProfileName || selectedModel, {
+        model: selectedModel,
+        provider: 'openai_compat',
+        base_url: cloudBaseUrl.trim(),
+        api_key: effectiveApiKey,
+        credential_ref: selectedProfileName || selectedModel
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[model] failed to mirror cloud config to settings.json: ${message}`);
+    }
 
     this.currentOptions = {
       ...this.currentOptions,
@@ -1988,6 +2123,18 @@ export class HimalayaChatPanel {
       cloudApiKey: apiKey || undefined,
       cloudModel: model
     });
+    try {
+      saveActiveSettingsModel('cloud', profileName, {
+        model,
+        provider: 'openai_compat',
+        ...(baseUrl ? { base_url: baseUrl } : {}),
+        ...(apiKey ? { api_key: apiKey } : {}),
+        credential_ref: profileName
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[model] failed to mirror provider profile to settings.json: ${message}`);
+    }
 
     this.currentOptions = {
       ...this.currentOptions,
@@ -2072,6 +2219,18 @@ export class HimalayaChatPanel {
         const message = error instanceof Error ? error.message : String(error);
         this.output.appendLine(`[model] failed to persist cloud config: ${message}`);
       }
+    }
+    try {
+      saveActiveSettingsModel('cloud', profileName.trim(), {
+        model: selectedModel,
+        provider: 'openai_compat',
+        base_url: baseUrl.trim(),
+        api_key: apiKey.trim(),
+        credential_ref: profileName.trim()
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[model] failed to persist cloud config to settings.json: ${message}`);
     }
 
     this.currentOptions = {
@@ -2194,7 +2353,41 @@ export class HimalayaChatPanel {
     return modelPick.label.trim();
   }
 
-  private async configureLocalModelRoute(): Promise<void> {
+  private async configureLocalModelRoute(configuredProfiles: Record<string, SettingsModelProfile> = {}): Promise<void> {
+    if (Object.keys(configuredProfiles).length > 0) {
+      const configuredItems: vscode.QuickPickItem[] = Object.entries(configuredProfiles)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([name, profile]) => ({
+          label: name,
+          description: [
+            profile.model ? `model: ${profile.model}` : undefined,
+            profile.provider ? `provider: ${profile.provider}` : undefined,
+            profile.base_url ? `url: ${profile.base_url}` : undefined
+          ].filter(Boolean).join(' · '),
+          detail: 'settings.json local model'
+        }));
+      configuredItems.push(
+        { label: '', kind: vscode.QuickPickItemKind.Separator },
+        { label: 'Discover Ollama models…', description: 'Query the local Ollama endpoint', detail: 'Refresh' }
+      );
+      const configuredPick = await vscode.window.showQuickPick(configuredItems, {
+        placeHolder: 'Select a configured local model',
+        ignoreFocusOut: true,
+        matchOnDescription: true,
+        matchOnDetail: true
+      });
+      if (!configuredPick) {
+        return;
+      }
+      if (configuredPick.label !== 'Discover Ollama models…') {
+        const profile = configuredProfiles[configuredPick.label];
+        if (profile) {
+          await this.applySettingsModelProfile('local', configuredPick.label, profile);
+        }
+        return;
+      }
+    }
+
     const localModels = this.currentBootstrap.modelCatalog.localModels.length > 0
       ? this.currentBootstrap.modelCatalog.localModels
       : await this.cli.listLocalModels({ force: true });
@@ -2221,6 +2414,17 @@ export class HimalayaChatPanel {
       modelBackend: 'ollama',
       modelSource: 'local'
     });
+    try {
+      saveActiveSettingsModel('local', selectedModel.label, {
+        model: selectedModel.label,
+        provider: 'ollama',
+        base_url: this.currentBootstrap.config.ollamaBaseUrl || 'http://127.0.0.1:11434/v1',
+        api_key: 'ollama'
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[model] failed to update settings.json active local model: ${message}`);
+    }
 
     this.currentOptions = {
       ...this.currentOptions,
@@ -3389,7 +3593,7 @@ export class HimalayaChatPanel {
     .content-shell {
       flex: 1 1 0;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(280px, var(--trace-width, 340px));
+      grid-template-columns: minmax(320px, 1fr) 8px minmax(300px, var(--trace-width, 380px));
       gap: 10px;
       overflow: hidden;
       padding: 0 10px;
@@ -3609,6 +3813,9 @@ export class HimalayaChatPanel {
         };
       }),
       recoveryEvidence: (ACTIVE_RECORD.recoveryEvidence || []).slice(),
+      composerHistory: [],
+      composerHistoryIndex: -1,
+      composerDraft: '',
       taskBoard: {
         collapsed: true,
         tasks: {},
@@ -3625,8 +3832,8 @@ export class HimalayaChatPanel {
         routeSummary: null,
         benchmark: null
       },
-      traceOpen: Boolean(INIT.showReasoning),
-      traceManualClosed: !Boolean(INIT.showReasoning),
+      traceOpen: true,
+      traceManualClosed: false,
       traceAutoOpenEnabled: true,
       historyRecords: HISTORY
     };
@@ -3655,6 +3862,72 @@ export class HimalayaChatPanel {
 
     /* ── attachment state ── */
     let attachedFiles = [];
+
+    function rememberComposerHistory(text) {
+      const value = String(text || '').trim();
+      if (!value) { return; }
+      state.composerHistory = (state.composerHistory || []).filter(function(item) { return item !== value; });
+      state.composerHistory.push(value);
+      if (state.composerHistory.length > 80) {
+        state.composerHistory = state.composerHistory.slice(state.composerHistory.length - 80);
+      }
+      state.composerHistoryIndex = -1;
+      state.composerDraft = '';
+    }
+
+    function seedComposerHistoryFromRecords() {
+      try {
+        const seen = new Set();
+        const items = [];
+        (state.historyRecords || []).slice().reverse().forEach(function(rec) {
+          (rec.messages || []).forEach(function(message) {
+            if (!message || message.role !== 'user') { return; }
+            const text = String(message.text || '').trim();
+            if (!text || seen.has(text)) { return; }
+            seen.add(text);
+            items.push(text);
+          });
+        });
+        state.composerHistory = items.slice(-80);
+        state.composerHistoryIndex = -1;
+        state.composerDraft = '';
+      } catch (_) {}
+    }
+
+    function recallComposerHistory(direction) {
+      try {
+        if (!promptInput) { return false; }
+        const history = state.composerHistory || [];
+        if (!history.length) { return false; }
+        if (state.composerHistoryIndex < 0) {
+          state.composerDraft = promptInput.value || '';
+        }
+        if (direction < 0) {
+          state.composerHistoryIndex = state.composerHistoryIndex < 0
+            ? history.length - 1
+            : Math.max(0, state.composerHistoryIndex - 1);
+        } else {
+          if (state.composerHistoryIndex < 0) { return false; }
+          state.composerHistoryIndex += 1;
+          if (state.composerHistoryIndex >= history.length) {
+            state.composerHistoryIndex = -1;
+            promptInput.value = state.composerDraft || '';
+            promptInput.setSelectionRange(promptInput.value.length, promptInput.value.length);
+            autoResize();
+            return true;
+          }
+        }
+        const next = history[state.composerHistoryIndex] || '';
+        promptInput.value = next;
+        promptInput.setSelectionRange(next.length, next.length);
+        autoResize();
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    seedComposerHistoryFromRecords();
 
     function renderAttachChips() {
       if (attachedFiles.length === 0) {
@@ -3917,6 +4190,7 @@ export class HimalayaChatPanel {
       } else {
         state.historyRecords.unshift(rec);
       }
+      seedComposerHistoryFromRecords();
       renderThread();
     }
 
@@ -5414,7 +5688,6 @@ export class HimalayaChatPanel {
     function addDecisioningEvent(event) {
       try {
         if (!event) { return; }
-        if (!state.showReasoning) { return; }
         const div = document.createElement('div');
         div.className = 'msg decisioning-step';
         div.innerHTML = renderDecisioningEventMarkup(event);
@@ -5444,7 +5717,6 @@ export class HimalayaChatPanel {
       try {
         if (!state.traceAutoOpenEnabled || state.traceOpen || state.traceManualClosed) { return; }
         state.traceOpen = true;
-        state.showReasoning = true;
         updateReasoningToggle();
         updateTracePanel();
       } catch (e) {
@@ -5520,6 +5792,7 @@ export class HimalayaChatPanel {
         return;
       }
       updateIdentityFromPrompt(text);
+      rememberComposerHistory(text);
       state.messages.push({ role: 'user', text, attachments: attachedFiles.map(function(file) {
         const name = String(file).split(/[\\/]/).pop() || String(file);
         return { path: String(file), displayName: name, mediaKind: 'file' };
@@ -5575,6 +5848,21 @@ export class HimalayaChatPanel {
     if (promptInput) {
       promptInput.addEventListener('keydown', function(e) {
         try {
+          if (e.key === 'ArrowUp' && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey) {
+            const atStart = promptInput.selectionStart === 0 && promptInput.selectionEnd === 0;
+            const empty = !String(promptInput.value || '').trim();
+            if ((empty || atStart) && recallComposerHistory(-1)) {
+              e.preventDefault();
+              return;
+            }
+          }
+          if (e.key === 'ArrowDown' && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey) {
+            const atEnd = promptInput.selectionStart === promptInput.value.length && promptInput.selectionEnd === promptInput.value.length;
+            if (atEnd && recallComposerHistory(1)) {
+              e.preventDefault();
+              return;
+            }
+          }
           if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             submit();
@@ -5582,7 +5870,11 @@ export class HimalayaChatPanel {
         } catch (_) {}
         setTimeout(autoResize, 0);
       });
-      promptInput.addEventListener('input', autoResize);
+      promptInput.addEventListener('input', function() {
+        state.composerHistoryIndex = -1;
+        state.composerDraft = '';
+        autoResize();
+      });
     }
 
     const btnModelEl = document.getElementById('btnModel');
@@ -5621,7 +5913,6 @@ export class HimalayaChatPanel {
           state.activeRecordId = null;
           state.resumeTarget = '';
           state.taskBoard = taskBoardInitialState();
-          state.traceOpen = false;
           clearTraceFeed();
           renderThread();
           updateTracePanel();
@@ -5644,10 +5935,8 @@ export class HimalayaChatPanel {
         try {
           state.traceOpen = !state.traceOpen;
           state.traceManualClosed = !state.traceOpen;
-          state.showReasoning = state.traceOpen;
           updateReasoningToggle();
           updateTracePanel();
-          try { vscode.postMessage({ type: 'toggle-reasoning', enabled: state.showReasoning }); } catch (_) {}
         } catch (_) {}
       });
     }
@@ -5656,11 +5945,9 @@ export class HimalayaChatPanel {
       btnTraceCloseEl.addEventListener('click', function() {
         try {
           state.traceOpen = false;
-          state.showReasoning = false;
           state.traceManualClosed = true;
           updateReasoningToggle();
           updateTracePanel();
-          try { vscode.postMessage({ type: 'toggle-reasoning', enabled: state.showReasoning }); } catch (_) {}
         } catch (_) {}
       });
     }
@@ -5723,8 +6010,8 @@ export class HimalayaChatPanel {
       let isTraceResizing = false;
       let traceResizeStartX = 0;
       let traceStartWidth = 0;
-      const minTraceWidth = 280;
-      const maxTraceWidth = 640;
+      const minTraceWidth = 300;
+      const maxTraceWidth = 960;
       traceResizer.addEventListener('pointerdown', function(event) {
         try {
           event.preventDefault();
@@ -5742,7 +6029,7 @@ export class HimalayaChatPanel {
         const delta = traceResizeStartX - event.clientX;
         let width = traceStartWidth + delta;
         width = Math.min(Math.max(width, minTraceWidth), maxTraceWidth);
-        traceShell.style.setProperty('--trace-width', width + 'px');
+        document.documentElement.style.setProperty('--trace-width', width + 'px');
       }
       function stopTraceResize() {
         if (!isTraceResizing) { return; }
@@ -5803,6 +6090,7 @@ export class HimalayaChatPanel {
             }
             if (msg.bootstrap.history) {
               state.historyRecords = msg.bootstrap.history.records || [];
+              seedComposerHistoryFromRecords();
               state.activeRecordId = msg.bootstrap.history.activeRecordId || null;
               const activeRecord = state.historyRecords.find(function(rec) { return rec.id === state.activeRecordId; });
               state.resumeTarget = activeRecord && activeRecord.resumeTarget ? activeRecord.resumeTarget : state.resumeTarget;
@@ -5825,7 +6113,6 @@ export class HimalayaChatPanel {
             if (msg.options.resumeTarget !== undefined) { state.resumeTarget = msg.options.resumeTarget || ''; }
             if (msg.options.showReasoning !== undefined) {
               state.showReasoning = Boolean(msg.options.showReasoning);
-              state.traceOpen = state.showReasoning;
             }
           }
           trustBanner.hidden = state.isTrusted;
@@ -5849,6 +6136,7 @@ export class HimalayaChatPanel {
         case 'historyDeleted':
           if (msg.historyId) {
             state.historyRecords = state.historyRecords.filter(function(rec) { return rec.id !== msg.historyId; });
+            seedComposerHistoryFromRecords();
             if (state.activeRecordId === msg.historyId || msg.selectedHistoryId === null) {
               state.activeRecordId = msg.activeRecordId || null;
               if (!state.activeRecordId) {
@@ -5874,7 +6162,6 @@ export class HimalayaChatPanel {
           state.activeRecordId = null;
           state.resumeTarget = '';
           state.taskBoard = taskBoardInitialState();
-          state.traceOpen = false;
           clearTraceFeed();
           renderThread();
           updateTracePanel();

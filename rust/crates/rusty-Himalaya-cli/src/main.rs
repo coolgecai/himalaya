@@ -60,10 +60,11 @@ use runtime::{
     parse_oauth_callback_request_target, pricing_for_model, resolve_expected_base,
     resolve_sandbox_status, save_oauth_credentials, tool_from_profile, ApiClient, ApiRequest,
     AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
-    MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
-    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ReasoningStep,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    ConversationMessage, ConversationRuntime, McpServer, McpServerConfig, McpServerManager,
+    McpServerSpec, McpStdioServerConfig, McpTool, MessageRole, ModelPricing,
+    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, ReasoningStep, RuntimeError,
+    ScopedMcpServerConfig, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -96,6 +97,8 @@ const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
+const BUILTIN_DOC_SERVICE_SERVER_NAME: &str = "doc-service";
+const BUILTIN_DOC_SERVICE_TOOL_CALL_TIMEOUT_MS: u64 = 600_000;
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--help",
     "-h",
@@ -3159,7 +3162,7 @@ fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
     let cwd = env::current_dir().map_err(|error| error.to_string())?;
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load().map_err(|error| error.to_string())?;
-    let state = build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
+    let state = build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config, false)
         .map_err(|error| error.to_string())?;
     let registry = state.tool_registry.clone();
     if let Some(mcp_state) = state.mcp_state {
@@ -3192,7 +3195,7 @@ fn default_permission_mode() -> PermissionMode {
         .as_deref()
         .and_then(PermissionMode::parse_public)
         .or_else(config_permission_mode_for_current_dir)
-        .unwrap_or(PermissionMode::Prompt)
+        .unwrap_or(PermissionMode::WorkspaceWrite)
 }
 
 fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
@@ -3208,7 +3211,81 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
 fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
-    loader.load().ok()?.model().map(ToOwned::to_owned)
+    let config = loader.load().ok()?;
+    apply_active_model_profile_env(&config).or_else(|| config.model().map(ToOwned::to_owned))
+}
+
+fn apply_active_model_profile_env(config: &runtime::RuntimeConfig) -> Option<String> {
+    let root = config.as_json();
+    let object = root.as_object()?;
+    let models = object.get("models")?.as_object()?;
+    let active = models.get("active")?.as_str()?;
+    let active_source = models
+        .get("activeSource")
+        .and_then(|value| value.as_str())
+        .unwrap_or("cloud");
+    let profile = models
+        .get(active_source)?
+        .as_object()?
+        .get(active)?
+        .as_object()?;
+    let model = profile.get("model")?.as_str()?.trim().to_string();
+    if model.is_empty() {
+        return None;
+    }
+
+    let provider = profile
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .unwrap_or("openai_compat")
+        .to_ascii_lowercase();
+    let base_url = profile
+        .get("base_url")
+        .or_else(|| profile.get("baseUrl"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let api_key = profile
+        .get("api_key")
+        .or_else(|| profile.get("apiKey"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match provider.as_str() {
+        "anthropic" => {
+            if let Some(url) = base_url {
+                env::set_var("ANTHROPIC_BASE_URL", url);
+            }
+            if let Some(key) = api_key {
+                env::set_var("ANTHROPIC_API_KEY", key);
+            }
+        }
+        "xai" | "grok" => {
+            if let Some(url) = base_url {
+                env::set_var("XAI_BASE_URL", url);
+            }
+            if let Some(key) = api_key {
+                env::set_var("XAI_API_KEY", key);
+            }
+        }
+        "ollama" => {
+            if let Some(url) = base_url {
+                env::set_var("OPENAI_BASE_URL", url);
+            }
+            env::set_var("OPENAI_API_KEY", api_key.unwrap_or("ollama"));
+        }
+        _ => {
+            if let Some(url) = base_url {
+                env::set_var("OPENAI_BASE_URL", url);
+            }
+            if let Some(key) = api_key {
+                env::set_var("OPENAI_API_KEY", key);
+            }
+        }
+    }
+
+    Some(model)
 }
 
 fn resolve_repl_model(cli_model: String) -> String {
@@ -6669,7 +6746,13 @@ impl RuntimeMcpState {
     fn new(
         runtime_config: &runtime::RuntimeConfig,
     ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
-        let mut manager = McpServerManager::from_runtime_config(runtime_config);
+        Self::new_from_servers(runtime_config.mcp().servers())
+    }
+
+    fn new_from_servers(
+        servers: &BTreeMap<String, ScopedMcpServerConfig>,
+    ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
+        let mut manager = McpServerManager::from_servers(servers);
         if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
             return Ok(None);
         }
@@ -6856,8 +6939,12 @@ impl RuntimeMcpState {
 
 fn build_runtime_mcp_state(
     runtime_config: &runtime::RuntimeConfig,
+    enable_builtin_doc_service: bool,
 ) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
-    let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
+    let mut servers = runtime_config.mcp().servers().clone();
+    maybe_insert_builtin_doc_service_server(&mut servers, enable_builtin_doc_service);
+
+    let Some((mcp_state, discovery)) = RuntimeMcpState::new_from_servers(&servers)? else {
         return Ok((None, Vec::new()));
     };
 
@@ -6871,6 +6958,82 @@ fn build_runtime_mcp_state(
     }
 
     Ok((Some(Arc::new(Mutex::new(mcp_state))), runtime_tools))
+}
+
+fn maybe_insert_builtin_doc_service_server(
+    servers: &mut BTreeMap<String, ScopedMcpServerConfig>,
+    enable_builtin_doc_service: bool,
+) {
+    if !enable_builtin_doc_service || servers.contains_key(BUILTIN_DOC_SERVICE_SERVER_NAME) {
+        return;
+    }
+    let Some(launcher_path) = find_builtin_doc_service_launcher() else {
+        return;
+    };
+    servers.insert(
+        BUILTIN_DOC_SERVICE_SERVER_NAME.to_string(),
+        ScopedMcpServerConfig {
+            scope: ConfigSource::Local,
+            config: McpServerConfig::Stdio(McpStdioServerConfig {
+                command: "python3".to_string(),
+                args: vec![launcher_path.to_string_lossy().to_string()],
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: Some(BUILTIN_DOC_SERVICE_TOOL_CALL_TIMEOUT_MS),
+            }),
+        },
+    );
+}
+
+fn find_builtin_doc_service_launcher() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(bundle) = env::var("HIMALAYA_DOC_SERVICE_BUNDLE") {
+        let bundle = PathBuf::from(bundle);
+        candidates.push(bundle.clone());
+        candidates.push(bundle.join("run_doc_service.py"));
+    }
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            candidates.push(exe_dir.join("python").join("run_doc_service.py"));
+            for ancestor in exe_dir.ancestors().take(6) {
+                candidates.push(
+                    ancestor
+                        .join("vscode-extension")
+                        .join("bin")
+                        .join("python")
+                        .join("run_doc_service.py"),
+                );
+            }
+        }
+    }
+
+    if let Some(data_home) = env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+    {
+        candidates.push(
+            data_home
+                .join("himalaya")
+                .join("python")
+                .join("run_doc_service.py"),
+        );
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    candidates.push(
+        manifest_dir
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("vscode-extension")
+            .join("bin")
+            .join("python")
+            .join("run_doc_service.py"),
+    );
+
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| candidate.canonicalize().ok().or(Some(candidate)))
 }
 
 fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
@@ -7040,6 +7203,7 @@ impl LiveCli {
             allowed_tools.clone(),
             permission_mode,
             None,
+            false,
         )?;
         let cli = Self {
             model,
@@ -7085,6 +7249,7 @@ impl LiveCli {
             allowed_tools.clone(),
             permission_mode,
             None,
+            false,
         )?;
         Ok(Self {
             model,
@@ -7180,6 +7345,7 @@ impl LiveCli {
         &mut self,
         emit_output: bool,
         stream_json: bool,
+        enable_builtin_doc_service: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         self.system_prompt = build_system_prompt()?;
         let mut session_state = self.runtime.session().clone();
@@ -7198,6 +7364,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            enable_builtin_doc_service,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
         if let Some(task_id) = self.resume_task_id.take() {
@@ -7219,7 +7386,8 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true, false)?;
+        let (mut runtime, hook_abort_monitor) =
+            self.prepare_turn_runtime(true, false, is_document_generation_request(input))?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
@@ -7292,7 +7460,8 @@ impl LiveCli {
         let input = self
             .render_known_skill_prompt(input)?
             .unwrap_or_else(|| input.to_string());
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, false)?;
+        let (mut runtime, hook_abort_monitor) =
+            self.prepare_turn_runtime(false, false, is_document_generation_request(&input))?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(&input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -7314,7 +7483,8 @@ impl LiveCli {
         let input = self
             .render_known_skill_prompt(input)?
             .unwrap_or_else(|| input.to_string());
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, false)?;
+        let (mut runtime, hook_abort_monitor) =
+            self.prepare_turn_runtime(false, false, is_document_generation_request(&input))?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(&input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -7365,7 +7535,8 @@ impl LiveCli {
         // NDJSON event + a single-line answer (so a VS Code webview can render
         // options) instead of printing a human stdin prompt.
         std::env::set_var("HIMALAYAD_INTERACTIVE_PROTOCOL", "stream-json");
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, true)?;
+        let (mut runtime, hook_abort_monitor) =
+            self.prepare_turn_runtime(false, true, is_document_generation_request(&input))?;
         let mut permission_prompter =
             CliPermissionPrompter::new_with_stream_json(self.permission_mode, true);
         print_stream_json_event(json!({
@@ -7845,6 +8016,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            false,
         )?;
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
@@ -7888,6 +8060,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            false,
         )?;
         println!(
             "{}",
@@ -7934,6 +8107,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            false,
         )?;
         self.replace_runtime(runtime)?;
         println!(
@@ -7966,6 +8140,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            false,
         )?;
         self.replace_runtime(runtime)?;
         println!(
@@ -8009,6 +8184,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            false,
         )?;
         self.replace_runtime(runtime)?;
         self.session = SessionHandle {
@@ -8166,6 +8342,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
+                    false,
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = SessionHandle {
@@ -8202,6 +8379,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
+                    false,
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = handle;
@@ -8299,6 +8477,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            false,
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()
@@ -8320,6 +8499,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            false,
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
@@ -8345,6 +8525,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             progress,
+            false,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
@@ -13205,17 +13386,25 @@ fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     )?)
 }
 
-fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+fn build_runtime_plugin_state(
+    enable_builtin_doc_service: bool,
+) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load()?;
-    build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
+    build_runtime_plugin_state_with_loader(
+        &cwd,
+        &loader,
+        &runtime_config,
+        enable_builtin_doc_service,
+    )
 }
 
 fn build_runtime_plugin_state_with_loader(
     cwd: &Path,
     loader: &ConfigLoader,
     runtime_config: &runtime::RuntimeConfig,
+    enable_builtin_doc_service: bool,
 ) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
     let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
     let plugin_registry = plugin_manager.plugin_registry()?;
@@ -13240,7 +13429,8 @@ fn build_runtime_plugin_state_with_loader(
             .with_emit_events(true);
         feature_config.with_decisioning(decisioning)
     };
-    let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config)?;
+    let (mcp_state, runtime_tools) =
+        build_runtime_mcp_state(runtime_config, enable_builtin_doc_service)?;
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
     Ok(RuntimePluginState {
@@ -13636,8 +13826,9 @@ fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    enable_builtin_doc_service: bool,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
-    let runtime_plugin_state = build_runtime_plugin_state()?;
+    let runtime_plugin_state = build_runtime_plugin_state(enable_builtin_doc_service)?;
     build_runtime_with_plugin_state(
         session,
         session_id,
@@ -13649,6 +13840,7 @@ fn build_runtime(
         allowed_tools,
         permission_mode,
         progress_reporter,
+        enable_builtin_doc_service,
         runtime_plugin_state,
     )
 }
@@ -13666,6 +13858,7 @@ fn build_runtime_with_plugin_state(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    _enable_builtin_doc_service: bool,
     runtime_plugin_state: RuntimePluginState,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     // Persist the model in session metadata so resumed sessions can report it.
@@ -13714,8 +13907,8 @@ fn build_runtime_with_plugin_state(
     runtime = runtime.with_task_registry(load_task_registry()?);
     if stream_json {
         runtime = runtime.with_runtime_event_reporter(CliRuntimeEventReporter);
-    } else if emit_output {
-        // Interactive (rich) mode: surface runtime progress as compact colorized lines.
+    } else if emit_output && cli_rich_runtime_events_enabled() {
+        // Optional interactive diagnostics: surface runtime progress as compact colorized lines.
         runtime = runtime.with_runtime_event_reporter(CliRichRuntimeEventReporter);
     }
     let route_policy_dir = workspace_root.join(".Himalaya").join("routes");
@@ -13818,6 +14011,21 @@ impl runtime::RuntimeEventReporter for CliRuntimeEventReporter {
             }
         }
     }
+}
+
+fn cli_rich_runtime_events_enabled() -> bool {
+    cli_rich_runtime_events_enabled_from(
+        env::var("HIMALAYA_CLI_SHOW_RUNTIME_EVENTS").ok().as_deref(),
+    )
+}
+
+fn cli_rich_runtime_events_enabled_from(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// Reporter for the interactive (rich) mode: renders runtime events as compact, colorized
@@ -16406,7 +16614,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --permission-mode MODE     Set default, plan, acceptEdits, auto, or bypassPermissions"
+        "  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access"
     )?;
     writeln!(
         out,
@@ -16508,16 +16716,17 @@ mod tests {
         attachment_may_require_vision, build_plan_output, build_runtime_plugin_state_with_loader,
         build_runtime_with_plugin_state, collect_session_prompt_history,
         create_managed_session_handle, describe_tool_progress, extracted_attachment_warnings,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_runtime_event_line, format_status_report,
+        filter_tool_specs, find_builtin_doc_service_launcher, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_runtime_event_line, format_status_report,
         format_tool_call_start, format_tool_result, format_ultraplan_report,
         format_unknown_slash_command, format_unknown_slash_command_message,
         format_user_visible_api_error, is_document_generation_request,
-        load_files_as_content_blocks, maturity_matrix_value, merge_prompt_with_stdin,
+        load_files_as_content_blocks, maturity_matrix_value,
+        maybe_insert_builtin_doc_service_server, merge_prompt_with_stdin,
         normalize_permission_mode, parse_args, parse_benchmark_cli_command, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, parse_policy_cli_command, parse_route_cli_command,
@@ -16538,7 +16747,7 @@ mod tests {
         InternalPromptProgressState, LiveCli, LocalHelpTopic, PolicyCliCommand, PromptHistoryEntry,
         RouteCliCommand, SlashCommand, SlashCommandStatus, StatusUsage, TaskCliCommand,
         TaskDaemonCliCommand, TaskPacketCliCommand, TaskSchedulerCliCommand, WorkerCliCommand,
-        DEFAULT_MODEL, LARGE_TEXT_ATTACHMENT_INLINE_LIMIT_CHARS,
+        BUILTIN_DOC_SERVICE_SERVER_NAME, DEFAULT_MODEL, LARGE_TEXT_ATTACHMENT_INLINE_LIMIT_CHARS,
         LARGE_TEXT_ATTACHMENT_WARNING_CHARS, LATEST_SESSION_REFERENCE, STREAM_PROTOCOL_VERSION,
     };
     use crate::autonomous_cli::{
@@ -16552,8 +16761,9 @@ mod tests {
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
     use runtime::{
-        load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
-        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, PermissionOutcome, Session,
+        load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ConfigSource,
+        ContentBlock, ConversationMessage, McpServerConfig, McpStdioServerConfig, MessageRole,
+        OAuthConfig, PermissionMode, PermissionOutcome, ScopedMcpServerConfig, Session,
         ToolExecutor,
     };
     use serde_json::{json, Value};
@@ -17247,6 +17457,35 @@ mod tests {
     }
 
     #[test]
+    fn default_permission_mode_uses_workspace_write_when_unconfigured() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+
+        let original_config_home = std::env::var("Himalaya_CONFIG_HOME").ok();
+        let original_permission_mode = std::env::var("RUSTY_Himalaya_PERMISSION_MODE").ok();
+        std::env::set_var("Himalaya_CONFIG_HOME", &config_home);
+        std::env::remove_var("RUSTY_Himalaya_PERMISSION_MODE");
+
+        let resolved = with_current_dir(&cwd, super::default_permission_mode);
+
+        match original_config_home {
+            Some(value) => std::env::set_var("Himalaya_CONFIG_HOME", value),
+            None => std::env::remove_var("Himalaya_CONFIG_HOME"),
+        }
+        match original_permission_mode {
+            Some(value) => std::env::set_var("RUSTY_Himalaya_PERMISSION_MODE", value),
+            None => std::env::remove_var("RUSTY_Himalaya_PERMISSION_MODE"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        assert_eq!(resolved, PermissionMode::WorkspaceWrite);
+    }
+
+    #[test]
     fn default_permission_mode_uses_project_config_when_env_is_unset() {
         let _guard = env_lock();
         let root = temp_dir();
@@ -17312,6 +17551,63 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
         assert_eq!(resolved, PermissionMode::ReadOnly);
+    }
+
+    #[test]
+    fn grouped_active_model_profile_sets_openai_compatible_env() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
+        std::fs::write(
+            config_home.join("settings.json"),
+            r#"{
+              "models": {
+                "cloud": {
+                  "glm": {
+                    "model": "glm-test",
+                    "provider": "openai_compat",
+                    "base_url": "https://example.test/v1",
+                    "api_key": "test-key"
+                  }
+                },
+                "active": "glm",
+                "activeSource": "cloud"
+              }
+            }"#,
+        )
+        .expect("settings should write");
+
+        let original_config_home = std::env::var("Himalaya_CONFIG_HOME").ok();
+        let original_base_url = std::env::var("OPENAI_BASE_URL").ok();
+        let original_api_key = std::env::var("OPENAI_API_KEY").ok();
+        std::env::set_var("Himalaya_CONFIG_HOME", &config_home);
+        std::env::remove_var("OPENAI_BASE_URL");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let model = with_current_dir(&cwd, super::config_model_for_current_dir);
+        let applied_base_url = std::env::var("OPENAI_BASE_URL").ok();
+        let applied_api_key = std::env::var("OPENAI_API_KEY").ok();
+
+        match original_config_home {
+            Some(value) => std::env::set_var("Himalaya_CONFIG_HOME", value),
+            None => std::env::remove_var("Himalaya_CONFIG_HOME"),
+        }
+        match original_base_url {
+            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+        match original_api_key {
+            Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+
+        assert_eq!(model.as_deref(), Some("glm-test"));
+        assert_eq!(applied_base_url.as_deref(), Some("https://example.test/v1"));
+        assert_eq!(applied_api_key.as_deref(), Some("test-key"));
     }
 
     #[test]
@@ -19407,6 +19703,17 @@ mod tests {
     }
 
     #[test]
+    fn rich_runtime_events_are_opt_in_for_cli_text_mode() {
+        assert!(!super::cli_rich_runtime_events_enabled_from(None));
+        assert!(!super::cli_rich_runtime_events_enabled_from(Some("")));
+        assert!(!super::cli_rich_runtime_events_enabled_from(Some("0")));
+        assert!(!super::cli_rich_runtime_events_enabled_from(Some("false")));
+        assert!(super::cli_rich_runtime_events_enabled_from(Some("1")));
+        assert!(super::cli_rich_runtime_events_enabled_from(Some("true")));
+        assert!(super::cli_rich_runtime_events_enabled_from(Some("YES")));
+    }
+
+    #[test]
     fn runtime_status_tone_classifies_states() {
         assert_eq!(super::runtime_status_tone("node_failed"), "err");
         assert_eq!(super::runtime_status_tone("completed"), "ok");
@@ -19660,7 +19967,7 @@ mod tests {
         assert!(help.contains("/status"));
         assert!(help.contains("/sandbox"));
         assert!(help.contains("/model [model]"));
-        assert!(help.contains("/permissions [default|plan|acceptEdits|auto|bypassPermissions]"));
+        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
@@ -21026,8 +21333,9 @@ UU conflicted.rs",
             .expect("plugin install should succeed");
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
-        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
-            .expect("plugin state should load");
+        let state =
+            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config, false)
+                .expect("plugin state should load");
         let pre_hooks = state.feature_config.hooks().pre_tool_use();
         assert_eq!(pre_hooks.len(), 1);
         assert!(
@@ -21038,6 +21346,62 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn builtin_doc_service_registration_is_opt_in_and_preserves_user_config() {
+        let mut servers = std::collections::BTreeMap::new();
+        maybe_insert_builtin_doc_service_server(&mut servers, false);
+        assert!(servers.is_empty());
+
+        servers.insert(
+            BUILTIN_DOC_SERVICE_SERVER_NAME.to_string(),
+            ScopedMcpServerConfig {
+                scope: ConfigSource::User,
+                config: McpServerConfig::Stdio(McpStdioServerConfig {
+                    command: "custom-doc-service".to_string(),
+                    args: Vec::new(),
+                    env: std::collections::BTreeMap::new(),
+                    tool_call_timeout_ms: Some(123),
+                }),
+            },
+        );
+
+        maybe_insert_builtin_doc_service_server(&mut servers, true);
+        let server = servers
+            .get(BUILTIN_DOC_SERVICE_SERVER_NAME)
+            .expect("user doc-service config should remain");
+        match &server.config {
+            McpServerConfig::Stdio(config) => {
+                assert_eq!(config.command, "custom-doc-service");
+                assert_eq!(config.tool_call_timeout_ms, Some(123));
+            }
+            _ => panic!("doc-service should remain stdio"),
+        }
+    }
+
+    #[test]
+    fn builtin_doc_service_launcher_can_be_resolved_from_env_bundle() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("bundle root should exist");
+        let launcher = root.join("run_doc_service.py");
+        fs::write(&launcher, "#!/usr/bin/env python3\n").expect("launcher should write");
+
+        let original = std::env::var("HIMALAYA_DOC_SERVICE_BUNDLE").ok();
+        std::env::set_var("HIMALAYA_DOC_SERVICE_BUNDLE", &root);
+        let expected = launcher.canonicalize().expect("canonical launcher");
+
+        let resolved = find_builtin_doc_service_launcher()
+            .expect("launcher should resolve from HIMALAYA_DOC_SERVICE_BUNDLE");
+
+        match original {
+            Some(value) => std::env::set_var("HIMALAYA_DOC_SERVICE_BUNDLE", value),
+            None => std::env::remove_var("HIMALAYA_DOC_SERVICE_BUNDLE"),
+        }
+        fs::remove_dir_all(root).expect("temp bundle root should clean up");
+
+        assert_eq!(resolved, expected);
     }
 
     #[test]
@@ -21071,8 +21435,9 @@ UU conflicted.rs",
 
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
-        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
-            .expect("runtime plugin state should load");
+        let state =
+            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config, false)
+                .expect("runtime plugin state should load");
 
         let allowed = state
             .tool_registry
@@ -21179,8 +21544,9 @@ UU conflicted.rs",
 
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
-        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
-            .expect("runtime plugin state should load");
+        let state =
+            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config, false)
+                .expect("runtime plugin state should load");
         let mut executor = CliToolExecutor::new(
             None,
             false,
@@ -21236,7 +21602,7 @@ UU conflicted.rs",
         let loader = ConfigLoader::new(&workspace, &config_home);
         let runtime_config = loader.load().expect("runtime config should load");
         let runtime_plugin_state =
-            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+            build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config, false)
                 .expect("plugin state should load");
         let mut runtime = build_runtime_with_plugin_state(
             Session::new(),
@@ -21249,6 +21615,7 @@ UU conflicted.rs",
             None,
             default_permission_mode_for_tests(),
             None,
+            false,
             runtime_plugin_state,
         )
         .expect("runtime should build");

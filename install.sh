@@ -14,6 +14,8 @@
 # Environment overrides:
 #   Himalaya_BUILD_PROFILE=debug|release   same as --release toggle
 #   Himalaya_BUILD_JOBS=<n>                Cargo build parallelism (default: 1)
+#   Himalaya_INSTALL_DIR=<path>            CLI install directory (default: ~/.local/bin)
+#   Himalaya_DATA_DIR=<path>               bundled data directory (default: ~/.local/share/himalaya)
 #   Himalaya_SKIP_VERIFY=1                 same as --no-verify
 
 set -euo pipefail
@@ -43,7 +45,7 @@ else
 fi
 
 CURRENT_STEP=0
-TOTAL_STEPS=6
+TOTAL_STEPS=7
 
 step() {
     CURRENT_STEP=$((CURRENT_STEP + 1))
@@ -82,6 +84,8 @@ Options:
 
 Environment overrides:
   Himalaya_BUILD_PROFILE   debug | release
+  Himalaya_INSTALL_DIR     install directory for the Himalaya binary
+  Himalaya_DATA_DIR        directory for bundled document-service dependencies
   Himalaya_SKIP_VERIFY     set to 1 to skip verification
 EOF
 }
@@ -93,6 +97,8 @@ EOF
 BUILD_PROFILE="${Himalaya_BUILD_PROFILE:-debug}"
 BUILD_JOBS="${Himalaya_BUILD_JOBS:-1}"
 SKIP_VERIFY="${Himalaya_SKIP_VERIFY:-0}"
+INSTALL_DIR="${Himalaya_INSTALL_DIR:-${HOME}/.local/bin}"
+DATA_DIR="${Himalaya_DATA_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/himalaya}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -344,7 +350,39 @@ fi
 ok "built ${Himalaya_BIN}"
 
 # ---------------------------------------------------------------------------
-# Step 5: post-install verification
+# Step 5: install binary and bundled document service
+# ---------------------------------------------------------------------------
+
+step "Installing the CLI and bundled document service"
+
+mkdir -p "${INSTALL_DIR}"
+INSTALL_BIN="${INSTALL_DIR}/Himalaya"
+cp "${Himalaya_BIN}" "${INSTALL_BIN}"
+chmod +x "${INSTALL_BIN}"
+ok "installed binary at ${INSTALL_BIN}"
+
+ln -sf "${INSTALL_BIN}" "${INSTALL_DIR}/himalaya-code"
+ok "updated himalaya-code symlink"
+
+DOC_SERVICE_SRC="${SCRIPT_DIR}/vscode-extension/bin/python"
+DOC_SERVICE_DST="${DATA_DIR}/python"
+if [ ! -f "${DOC_SERVICE_SRC}/run_doc_service.py" ]; then
+    error "missing bundled document-service launcher: ${DOC_SERVICE_SRC}/run_doc_service.py"
+    exit 1
+fi
+mkdir -p "${DATA_DIR}"
+rm -rf "${DOC_SERVICE_DST}"
+cp -a "${DOC_SERVICE_SRC}" "${DOC_SERVICE_DST}"
+chmod +x "${DOC_SERVICE_DST}/run_doc_service.py"
+ok "installed document service bundle at ${DOC_SERVICE_DST}"
+
+if ! printf '%s' ":${PATH}:" | grep -q ":${INSTALL_DIR}:"; then
+    warn "${INSTALL_DIR} is not currently in PATH"
+    warn "Add it with: export PATH=\"${INSTALL_DIR}:\$PATH\""
+fi
+
+# ---------------------------------------------------------------------------
+# Step 6: post-install verification
 # ---------------------------------------------------------------------------
 
 step "Verifying the installed binary"
@@ -353,7 +391,7 @@ if [ "${SKIP_VERIFY}" = "1" ]; then
     warn "verification skipped (--no-verify or Himalaya_SKIP_VERIFY=1)"
 else
     info "running: Himalaya --version"
-    if VERSION_OUT="$("${Himalaya_BIN}" --version 2>&1)"; then
+    if VERSION_OUT="$("${INSTALL_BIN}" --version 2>&1)"; then
         ok "Himalaya --version -> ${VERSION_OUT}"
     else
         error "Himalaya --version failed:"
@@ -362,16 +400,23 @@ else
     fi
 
     info "running: Himalaya --help (smoke test)"
-    if "${Himalaya_BIN}" --help >/dev/null 2>&1; then
+    if "${INSTALL_BIN}" --help >/dev/null 2>&1; then
         ok "Himalaya --help responded"
     else
         error "Himalaya --help failed"
         exit 1
     fi
+
+    if [ -f "${DOC_SERVICE_DST}/wheelhouse/himalaya_doc_service-0.1.0-py3-none-any.whl" ]; then
+        ok "bundled himalaya-doc-service wheel found"
+    else
+        error "bundled himalaya-doc-service wheel is missing"
+        exit 1
+    fi
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: next steps
+# Step 7: next steps
 # ---------------------------------------------------------------------------
 
 step "Next steps"
@@ -379,26 +424,28 @@ step "Next steps"
 cat <<EOF
 ${COLOR_GREEN}Himalaya Code is built and ready.${COLOR_RESET}
 
-  Binary:  ${COLOR_BOLD}${Himalaya_BIN}${COLOR_RESET}
-  Profile: ${BUILD_PROFILE}
+  Binary:        ${COLOR_BOLD}${Himalaya_BIN}${COLOR_RESET}
+  Installed CLI: ${COLOR_BOLD}${INSTALL_BIN}${COLOR_RESET}
+  Doc service:   ${COLOR_BOLD}${DOC_SERVICE_DST}${COLOR_RESET}
+  Profile:       ${BUILD_PROFILE}
 
 Try it out:
 
   ${COLOR_DIM}# interactive REPL${COLOR_RESET}
-  ${Himalaya_BIN}
+  ${INSTALL_BIN}
 
   ${COLOR_DIM}# one-shot prompt${COLOR_RESET}
-  ${Himalaya_BIN} prompt "summarize this repository"
+  ${INSTALL_BIN} prompt "summarize this repository"
 
   ${COLOR_DIM}# health check (run /doctor inside the REPL)${COLOR_RESET}
-  ${Himalaya_BIN}
+  ${INSTALL_BIN}
   /doctor
 
 Authentication:
 
   export ANTHROPIC_API_KEY="sk-ant-..."
   ${COLOR_DIM}# or use OAuth:${COLOR_RESET}
-  ${Himalaya_BIN} login
+  ${INSTALL_BIN} login
 
 For deeper docs, see USAGE.md and rust/README.md.
 EOF

@@ -159,7 +159,7 @@
         },
         "himalayaCode.defaultPermissionMode": {
           "type": "string",
-          "default": "read-only",
+          "default": "workspace-write",
           "enum": [
             "read-only",
             "workspace-write",

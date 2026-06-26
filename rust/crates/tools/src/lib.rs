@@ -438,7 +438,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "generate_file",
-            description: "Generate a binary document file (DOCX, PDF, PPTX, or XLSX). Use content for lightweight markdown, or document_spec for professional documents with structured headings, tables, formulas, chart data, images, sheets, and quality manifest output.",
+            description: "Generate a binary document file (DOCX, PDF, PPTX, or XLSX). Use content for lightweight markdown, or document_spec for professional documents with structured headings, slides, source_documents, generation_contract, tables, formulas, chart data, images, sheets, and quality manifest output.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -447,7 +447,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "content": { "type": "string", "description": "Document content with optional markdown markup (# headings, **bold**, - bullets, pipe tables, $$ formulas)" },
                     "document_spec": {
                         "type": "object",
-                        "description": "Structured DocumentSpec. Top-level fields: title, subtitle, author, language, theme, blocks, sheets. Block types: heading, paragraph, bullets, table, formula, chart, image. XLSX sheets may include rows and formulas."
+                        "description": "Structured DocumentSpec. Top-level fields: title, subtitle, author, language, theme, document_type, source_documents/sourceDocuments, generation_contract/generationContract, blocks, slides, sheets. Block types: heading, paragraph, bullets, table, formula, chart, image. slides may contain title, subtitle, bullets, content, tables, formulas, images, charts, speaker_notes. generation_contract may require expected_slide_count and required_assets (figures/tables/formulas/charts)."
                     }
                 },
                 "required": ["path", "format"],

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "himalaya-doc-service"
+version = "0.1.0"
+description = "High-quality document generation MCP server for Himalaya"
+requires-python = ">=3.10"
+dependencies = [
+    "python-pptx>=0.6.23",
+    "python-docx>=1.1.0",
+    "openpyxl>=3.1.0",
+    "reportlab>=4.0.0",
+    "matplotlib>=3.8.0",
+    "Pillow>=10.0.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+extract = ["pdfplumber>=0.11.0", "PyMuPDF>=1.24.0"]
+
+[project.scripts]
+himalaya-doc-service = "himalaya_doc_service.__main__:main"

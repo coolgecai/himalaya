@@ -11,7 +11,7 @@ use runtime::{
 };
 use serde_json::{json, Value};
 
-const PERMISSIONS_ARGUMENT_HINT: &str = "[default|plan|acceptEdits|auto|bypassPermissions]";
+const PERMISSIONS_ARGUMENT_HINT: &str = "[read-only|workspace-write|danger-full-access]";
 
 fn public_permission_labels() -> String {
     let labels = PermissionMode::public_labels();
@@ -5110,7 +5110,7 @@ mod tests {
         // then
         assert!(error.contains("Unsupported /permissions mode 'admin'."));
         assert!(error.contains(
-            "  Usage            /permissions [default|plan|acceptEdits|auto|bypassPermissions]"
+            "  Usage            /permissions [read-only|workspace-write|danger-full-access]"
         ));
     }
 
@@ -5214,7 +5214,7 @@ mod tests {
         assert!(help.contains("/teleport <symbol-or-path>"));
         assert!(help.contains("/debug-tool-call"));
         assert!(help.contains("/model [model]"));
-        assert!(help.contains("/permissions [default|plan|acceptEdits|auto|bypassPermissions]"));
+        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));

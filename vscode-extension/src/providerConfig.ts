@@ -22,6 +22,21 @@ export interface ProviderSelection {
   apiKey?: string;
 }
 
+export interface SettingsModelProfile {
+  model: string;
+  provider?: string;
+  base_url?: string;
+  api_key?: string;
+  credential_ref?: string;
+}
+
+export interface SettingsModelCatalog {
+  cloud: Record<string, SettingsModelProfile>;
+  local: Record<string, SettingsModelProfile>;
+  active?: string;
+  activeSource?: 'cloud' | 'local';
+}
+
 interface ProviderConfigFile {
   model: string;
   base_url?: string;
@@ -38,6 +53,113 @@ export function providerCredentialsPath(): string {
     ? process.env.Himalaya_CONFIG_HOME
     : path.join(os.homedir() || '.', '.Himalaya');
   return path.join(configHome, 'provider_credentials.json');
+}
+
+export function settingsConfigPath(): string {
+  const configHome = process.env.Himalaya_CONFIG_HOME
+    ? process.env.Himalaya_CONFIG_HOME
+    : path.join(os.homedir() || '.', '.Himalaya');
+  return path.join(configHome, 'settings.json');
+}
+
+function readSettingsFile(): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(settingsConfigPath(), 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeSettingsProfile(value: unknown): SettingsModelProfile | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const object = value as Record<string, unknown>;
+  const model = typeof object.model === 'string' ? object.model.trim() : '';
+  if (!model) {
+    return undefined;
+  }
+  const profile: SettingsModelProfile = { model };
+  for (const [source, target] of [
+    ['provider', 'provider'],
+    ['base_url', 'base_url'],
+    ['baseUrl', 'base_url'],
+    ['api_key', 'api_key'],
+    ['apiKey', 'api_key'],
+    ['credential_ref', 'credential_ref'],
+    ['credentialRef', 'credential_ref']
+  ] as const) {
+    const raw = object[source];
+    if (typeof raw === 'string' && raw.trim()) {
+      profile[target] = raw.trim();
+    }
+  }
+  return profile;
+}
+
+function readSettingsProfileGroup(value: unknown): Record<string, SettingsModelProfile> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  const profiles: Record<string, SettingsModelProfile> = {};
+  for (const [name, rawProfile] of Object.entries(value as Record<string, unknown>)) {
+    const profile = normalizeSettingsProfile(rawProfile);
+    if (profile) {
+      profiles[name] = profile;
+    }
+  }
+  return profiles;
+}
+
+export function listSettingsModelProfiles(): SettingsModelCatalog {
+  const root = readSettingsFile();
+  const models = root.models && typeof root.models === 'object' && !Array.isArray(root.models)
+    ? root.models as Record<string, unknown>
+    : {};
+  const activeSource = models.activeSource === 'local' ? 'local' : models.activeSource === 'cloud' ? 'cloud' : undefined;
+  return {
+    cloud: readSettingsProfileGroup(models.cloud),
+    local: readSettingsProfileGroup(models.local),
+    active: typeof models.active === 'string' ? models.active : undefined,
+    activeSource
+  };
+}
+
+export function saveActiveSettingsModel(
+  source: 'cloud' | 'local',
+  profileName: string,
+  profile: SettingsModelProfile
+): void {
+  const settingsPath = settingsConfigPath();
+  const root = readSettingsFile();
+  const models = root.models && typeof root.models === 'object' && !Array.isArray(root.models)
+    ? { ...(root.models as Record<string, unknown>) }
+    : {};
+  const group = models[source] && typeof models[source] === 'object' && !Array.isArray(models[source])
+    ? { ...(models[source] as Record<string, unknown>) }
+    : {};
+
+  group[profileName] = {
+    model: profile.model,
+    ...(profile.provider ? { provider: profile.provider } : {}),
+    ...(profile.base_url ? { base_url: profile.base_url } : {}),
+    ...(profile.api_key ? { api_key: profile.api_key } : {}),
+    ...(profile.credential_ref ? { credential_ref: profile.credential_ref } : {})
+  };
+  models[source] = group;
+  models.active = profileName;
+  models.activeSource = source;
+  root.models = models;
+  root.model = profile.model;
+
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, JSON.stringify(root, null, 2), 'utf8');
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(settingsPath, 0o600); } catch { /* best effort */ }
+  }
 }
 
 function readConfigFile(workspaceRoot: string): ProviderConfigFile | null {

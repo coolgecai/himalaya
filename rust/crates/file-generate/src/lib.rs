@@ -209,4 +209,69 @@ mod tests {
             let _ = std::fs::remove_file(report.manifest_path);
         }
     }
+
+    #[test]
+    fn legacy_slides_spec_generates_contract_compliant_pptx() {
+        let path = temp_path("legacy-slides.pptx");
+        let spec = json!({
+            "title": "论文答辩",
+            "theme": "ocean",
+            "source_documents": ["thesis.pdf"],
+            "generation_contract": {
+                "expected_slide_count": 3,
+                "required_sections": ["研究背景", "方法"],
+                "required_assets": { "tables": 1, "formulas": 1, "charts": 1 },
+                "strict_source_grounding": true
+            },
+            "slides": [
+                {
+                    "title": "研究背景",
+                    "bullets": ["无人机集群自主协同侦察需要可靠建模"],
+                    "tables": [{ "headers": ["指标", "数值"], "rows": [["节点", 12], ["边", 30]] }]
+                },
+                {
+                    "title": "方法",
+                    "content": ["$$J=\\sum_i c_i x_i$$"],
+                    "charts": [{ "title": "消融结果", "labels": ["A", "B"], "series": [{ "name": "准确率", "values": [0.81, 0.88] }] }]
+                }
+            ]
+        });
+        let report =
+            generate_file_from_spec_json(&path, "pptx", &spec).expect("pptx should generate");
+
+        assert!(path.is_file());
+        assert_eq!(report.quality.slide_count, 3);
+        assert_eq!(report.quality.table_count, 1);
+        assert_eq!(report.quality.formula_count, 1);
+        assert_eq!(report.quality.chart_count, 1);
+        assert_eq!(report.quality.failure_count, 0);
+        assert_eq!(report.quality.quality_level, "warn");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(report.manifest_path);
+    }
+
+    #[test]
+    fn contract_quality_fails_when_required_slides_and_assets_are_missing() {
+        let path = temp_path("thin-deck.pptx");
+        let spec = json!({
+            "title": "薄弱答辩稿",
+            "sourceDocuments": ["thesis.pdf"],
+            "generationContract": {
+                "expectedSlideCount": 8,
+                "requiredAssets": { "figures": 1, "tables": 1, "formulas": 1 },
+                "strictSourceGrounding": true
+            },
+            "slides": [
+                { "title": "研究背景", "bullets": ["只有一页内容"] }
+            ]
+        });
+        let report =
+            generate_file_from_spec_json(&path, "pptx", &spec).expect("pptx should still generate");
+
+        assert!(path.is_file());
+        assert!(report.quality.failure_count >= 4, "{:?}", report.quality);
+        assert_eq!(report.quality.quality_level, "fail");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(report.manifest_path);
+    }
 }

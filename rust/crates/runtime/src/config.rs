@@ -1194,10 +1194,27 @@ fn merge_mcp_servers(
 }
 
 fn parse_optional_model(root: &JsonValue) -> Option<String> {
-    root.as_object()
-        .and_then(|object| object.get("model"))
+    let object = root.as_object()?;
+    object
+        .get("model")
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
+        .or_else(|| {
+            let models = object.get("models")?.as_object()?;
+            let active = models.get("active")?.as_str()?;
+            let active_source = models
+                .get("activeSource")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("cloud");
+            models
+                .get(active_source)?
+                .as_object()?
+                .get(active)?
+                .as_object()?
+                .get("model")?
+                .as_str()
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {
@@ -2634,6 +2651,52 @@ mod tests {
             aliases.get("cheap").map(String::as_str),
             Some("grok-3-mini")
         );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_active_model_from_grouped_models_settings() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".Himalaya");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "models": {
+                "cloud": {
+                  "fast-cloud": {
+                    "model": "gpt-test",
+                    "provider": "openai_compat",
+                    "base_url": "https://example.test/v1",
+                    "api_key": "test-key"
+                  }
+                },
+                "local": {
+                  "local-small": {
+                    "model": "qwen-test",
+                    "provider": "ollama",
+                    "base_url": "http://127.0.0.1:11434/v1"
+                  }
+                },
+                "active": "local-small",
+                "activeSource": "local"
+              }
+            }"#,
+        )
+        .expect("write grouped model settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        assert_eq!(loaded.model(), Some("qwen-test"));
+        assert!(loaded.get("models").is_some());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
