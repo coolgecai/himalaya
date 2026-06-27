@@ -23,6 +23,8 @@ installer/staging/
 **/.Himalaya/
 .Himalayad-todos.json
 **/.Himalayad-todos.json
+.Himalayad/
+**/.Himalayad/
 .Himalayad-agents/
 **/.Himalayad-agents/
 .clawd-agents/

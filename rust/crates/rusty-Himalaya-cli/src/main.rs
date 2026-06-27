@@ -487,6 +487,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
             run_stale_base_preflight(base_commit.as_deref());
+            let model = resolve_repl_model(model);
             let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
                 read_piped_stdin()
             } else {
@@ -516,7 +517,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             permission_mode,
             output_format,
-        } => print_status_snapshot(&model, permission_mode, output_format)?,
+        } => {
+            let model = resolve_repl_model(model);
+            print_status_snapshot(&model, permission_mode, output_format)?;
+        }
         CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
             prompt,
@@ -532,6 +536,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
             run_stale_base_preflight(base_commit.as_deref());
+            let model = resolve_repl_model(model);
             // Only consume piped stdin as prompt context when the permission
             // mode is fully unattended. In modes where the permission
             // prompter may invoke CliPermissionPrompter::decide(), stdin
@@ -566,6 +571,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
             run_stale_base_preflight(base_commit.as_deref());
+            let model = resolve_repl_model(model);
             let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
                 read_piped_stdin()
             } else {
@@ -603,13 +609,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             allow_broad_cwd,
             resume_target,
-        } => run_repl_ndjson(
-            model,
-            allowed_tools,
-            permission_mode,
-            allow_broad_cwd,
-            resume_target,
-        )?,
+            machine_protocol,
+        } => {
+            if machine_protocol {
+                run_repl_ndjson(
+                    model,
+                    allowed_tools,
+                    permission_mode,
+                    allow_broad_cwd,
+                    resume_target,
+                )?;
+            } else {
+                run_repl(
+                    model,
+                    allowed_tools,
+                    permission_mode,
+                    None,
+                    None,
+                    allow_broad_cwd,
+                )?;
+            }
+        }
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -744,6 +764,7 @@ enum CliAction {
         allowed_tools: Option<AllowedToolSet>,
         allow_broad_cwd: bool,
         resume_target: Option<PathBuf>,
+        machine_protocol: bool,
     },
     Login {
         output_format: CliOutputFormat,
@@ -1300,6 +1321,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             permission_mode,
             allow_broad_cwd,
             resume_target,
+            machine_protocol: true,
         });
     }
 
@@ -1340,6 +1362,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             } else {
                 Some(PathBuf::from(LATEST_SESSION_REFERENCE))
             },
+            machine_protocol: false,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -6365,6 +6388,7 @@ fn run_repl_ndjson(
     resume_target: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::StreamJson)?;
+    let model = resolve_repl_model(model);
     let mut cli = match resume_target {
         Some(target) => match LiveCli::from_existing_session(
             target,
@@ -9305,6 +9329,7 @@ fn run_task_command(
             from_node,
             prompt,
         } => {
+            let model = resolve_repl_model(model.clone());
             if let Some(node_id) = from_node.as_ref() {
                 let registry = load_task_registry()?;
                 let _ = registry.retry_plan_node(&task_id, node_id)?;
@@ -17436,6 +17461,7 @@ mod tests {
                 // Bare launch now auto-resumes the latest workspace session for
                 // conversational continuity (falls back to fresh when none).
                 resume_target: Some(PathBuf::from(LATEST_SESSION_REFERENCE)),
+                machine_protocol: false,
             }
         );
     }
@@ -17452,6 +17478,7 @@ mod tests {
                 permission_mode: default_permission_mode_for_tests(),
                 allow_broad_cwd: false,
                 resume_target: None,
+                machine_protocol: false,
             }
         );
     }
@@ -18108,6 +18135,7 @@ mod tests {
                 permission_mode: default_permission_mode_for_tests(),
                 allow_broad_cwd: false,
                 resume_target: Some(PathBuf::from("session-123")),
+                machine_protocol: true,
             }
         );
     }
@@ -18122,6 +18150,7 @@ mod tests {
                 permission_mode: PermissionMode::ReadOnly,
                 allow_broad_cwd: false,
                 resume_target: Some(PathBuf::from(LATEST_SESSION_REFERENCE)),
+                machine_protocol: false,
             }
         );
     }
@@ -18142,6 +18171,7 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
                 allow_broad_cwd: false,
                 resume_target: Some(PathBuf::from(LATEST_SESSION_REFERENCE)),
+                machine_protocol: false,
             }
         );
     }
@@ -18199,6 +18229,7 @@ mod tests {
                 permission_mode: default_permission_mode_for_tests(),
                 allow_broad_cwd: false,
                 resume_target: Some(PathBuf::from(LATEST_SESSION_REFERENCE)),
+                machine_protocol: false,
             }
         );
     }
