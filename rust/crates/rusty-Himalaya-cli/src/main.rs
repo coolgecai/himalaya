@@ -98,7 +98,7 @@ const LEGACY_SESSION_EXTENSION: &str = "json";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 const BUILTIN_DOC_SERVICE_SERVER_NAME: &str = "doc-service";
-const BUILTIN_DOC_SERVICE_TOOL_CALL_TIMEOUT_MS: u64 = 600_000;
+const BUILTIN_DOC_SERVICE_TOOL_CALL_TIMEOUT_MS: u64 = 240_000;
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--help",
     "-h",
@@ -6651,6 +6651,7 @@ struct RuntimeMcpState {
     manager: McpServerManager,
     pending_servers: Vec<String>,
     degraded_report: Option<runtime::McpDegradedReport>,
+    doc_service_generation_failed: bool,
 }
 
 struct BuiltRuntime {
@@ -6766,6 +6767,497 @@ struct ReadMcpResourceRequest {
     uri: String,
 }
 
+fn cli_tool_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_cli_generate_file_tool(tool_name: &str) -> bool {
+    matches!(
+        cli_tool_key(tool_name).as_str(),
+        "generatefile" | "functiongeneratefile"
+    )
+}
+
+fn is_cli_doc_service_generation_tool(tool_name: &str) -> bool {
+    let key = cli_tool_key(tool_name);
+    key.contains("docservice") && key.contains("generatepptx")
+}
+
+fn is_cli_document_generation_tool(tool_name: &str) -> bool {
+    is_cli_generate_file_tool(tool_name) || is_cli_doc_service_generation_tool(tool_name)
+}
+
+fn cli_current_time_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn normalize_cli_document_tool_value(tool_name: &str, value: Value) -> Result<Value, ToolError> {
+    if tool_name == "MCPTool" {
+        return normalize_cli_mcp_wrapper_document_tool_value(value);
+    }
+    if is_cli_document_generation_tool(tool_name) {
+        return normalize_cli_document_tool_arguments(tool_name, value);
+    }
+    Ok(value)
+}
+
+fn normalize_cli_mcp_wrapper_document_tool_value(value: Value) -> Result<Value, ToolError> {
+    let Value::Object(mut object) = value else {
+        return Ok(value);
+    };
+    let qualified_name = object
+        .get("qualifiedName")
+        .or_else(|| object.get("tool"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(qualified_name) = qualified_name else {
+        return Ok(Value::Object(object));
+    };
+    if !is_cli_doc_service_generation_tool(&qualified_name) {
+        return Ok(Value::Object(object));
+    }
+    let arguments = object
+        .remove("arguments")
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    let arguments = normalize_cli_document_tool_arguments(&qualified_name, arguments)?;
+    object.insert("arguments".to_string(), arguments);
+    Ok(Value::Object(object))
+}
+
+fn normalize_cli_document_tool_arguments(
+    tool_name: &str,
+    value: Value,
+) -> Result<Value, ToolError> {
+    let mut input = coerce_cli_document_tool_object(value)?;
+    normalize_cli_document_input_shape(&mut input)?;
+    let format = cli_document_tool_format(tool_name, &input);
+    protect_cli_document_output_path(&mut input, &format);
+    if is_cli_generate_file_tool(tool_name) && !input.contains_key("format") {
+        input.insert("format".to_string(), Value::String(format.clone()));
+    }
+    if is_cli_doc_service_generation_tool(tool_name) && !input.contains_key("document_spec") {
+        return Err(ToolError::new(
+            "doc-service generate_pptx requires `document_spec` as a JSON object; provide structured blocks/slides or use generate_file with markdown content",
+        ));
+    }
+    if let Some(spec) = input.get_mut("document_spec") {
+        normalize_cli_document_spec(spec)?;
+    }
+    Ok(Value::Object(input))
+}
+
+fn coerce_cli_document_tool_object(value: Value) -> Result<Map<String, Value>, ToolError> {
+    match value {
+        Value::Object(object) => Ok(object),
+        Value::String(raw) => serde_json::from_str::<Value>(raw.trim())
+            .ok()
+            .and_then(Value::as_object_owned)
+            .ok_or_else(|| {
+                ToolError::new(
+                    "document generation tool input must be a JSON object, not an unparseable string",
+                )
+            }),
+        _ => Err(ToolError::new(
+            "document generation tool input must be a JSON object",
+        )),
+    }
+}
+
+trait JsonObjectOwned {
+    fn as_object_owned(self) -> Option<Map<String, Value>>;
+}
+
+impl JsonObjectOwned for Value {
+    fn as_object_owned(self) -> Option<Map<String, Value>> {
+        match self {
+            Value::Object(object) => Some(object),
+            _ => None,
+        }
+    }
+}
+
+fn normalize_cli_document_input_shape(input: &mut Map<String, Value>) -> Result<(), ToolError> {
+    if let Some(spec) = input.remove("documentSpec") {
+        input.entry("document_spec".to_string()).or_insert(spec);
+    }
+    if let Some(spec) = input.get_mut("document_spec") {
+        *spec = parse_cli_document_spec_value(spec.take())?;
+    }
+    if !input.contains_key("document_spec") {
+        if let Some(outline) = input.remove("outline") {
+            if !input.contains_key("slides") && !input.contains_key("blocks") {
+                input.insert("slides".to_string(), outline);
+            }
+        }
+        let spec_keys = [
+            "title",
+            "subtitle",
+            "author",
+            "language",
+            "document_type",
+            "documentType",
+            "audience",
+            "source_documents",
+            "sourceDocuments",
+            "generation_contract",
+            "generationContract",
+            "blocks",
+            "slides",
+            "sheets",
+            "metadata",
+        ];
+        if spec_keys.iter().any(|key| input.contains_key(*key)) {
+            let mut spec = Map::new();
+            for key in spec_keys {
+                if let Some(value) = input.remove(key) {
+                    spec.insert(key.to_string(), value);
+                }
+            }
+            input.insert("document_spec".to_string(), Value::Object(spec));
+        }
+    }
+    Ok(())
+}
+
+fn parse_cli_document_spec_value(value: Value) -> Result<Value, ToolError> {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            let parsed = serde_json::from_str::<Value>(trimmed)
+                .or_else(|_| serde_json::from_str::<Value>(&jsonish_python_literals(trimmed)));
+            match parsed {
+                Ok(Value::Object(object)) => Ok(Value::Object(object)),
+                Ok(Value::Array(array)) => Ok(json!({ "blocks": array })),
+                Ok(_) => Err(ToolError::new(
+                    "`document_spec` must parse to a JSON object or block array",
+                )),
+                Err(error) => Err(ToolError::new(format!(
+                    "`document_spec` was provided as a string but is not valid JSON ({error}); pass a JSON object instead"
+                ))),
+            }
+        }
+        Value::Object(_) => Ok(value),
+        Value::Array(array) => Ok(json!({ "blocks": array })),
+        Value::Null => Ok(json!({})),
+        _ => Err(ToolError::new(
+            "`document_spec` must be a JSON object, block array, or JSON string",
+        )),
+    }
+}
+
+fn jsonish_python_literals(value: &str) -> String {
+    value
+        .replace(": True", ": true")
+        .replace(": False", ": false")
+        .replace(": None", ": null")
+        .replace(":True", ":true")
+        .replace(":False", ":false")
+        .replace(":None", ":null")
+        .replace("[True", "[true")
+        .replace("[False", "[false")
+        .replace("[None", "[null")
+        .replace(", True", ", true")
+        .replace(", False", ", false")
+        .replace(", None", ", null")
+}
+
+fn normalize_cli_document_spec(spec: &mut Value) -> Result<(), ToolError> {
+    let Value::Object(object) = spec else {
+        return Err(ToolError::new("`document_spec` must be a JSON object"));
+    };
+    if let Some(document_type) = object.remove("documentType") {
+        object
+            .entry("document_type".to_string())
+            .or_insert(document_type);
+    }
+    if let Some(source_documents) = object.remove("sourceDocuments") {
+        object
+            .entry("source_documents".to_string())
+            .or_insert(source_documents);
+    }
+    if let Some(contract) = object.remove("generationContract") {
+        object
+            .entry("generation_contract".to_string())
+            .or_insert(contract);
+    }
+    if let Some(theme) = object.get("theme") {
+        if theme.is_string() {
+            object.remove("theme");
+        }
+    }
+    if let Some(blocks) = object.get_mut("blocks") {
+        normalize_cli_spec_block_array(blocks);
+    }
+    if let Some(slides) = object.get_mut("slides") {
+        normalize_cli_legacy_slides(slides);
+    }
+    normalize_cli_generation_contract(object);
+    Ok(())
+}
+
+fn normalize_cli_generation_contract(spec: &mut Map<String, Value>) {
+    let Some(Value::Object(contract)) = spec.get_mut("generation_contract") else {
+        return;
+    };
+    contract
+        .entry("fail_on_contract_violation".to_string())
+        .or_insert(Value::Bool(true));
+    contract
+        .entry("allow_degraded_output".to_string())
+        .or_insert(Value::Bool(false));
+    contract
+        .entry("require_manifest".to_string())
+        .or_insert(Value::Bool(true));
+    if let Some(Value::Object(required_assets)) = contract.get_mut("required_assets") {
+        required_assets
+            .entry("require_source_refs".to_string())
+            .or_insert(Value::Bool(true));
+    }
+}
+
+fn normalize_cli_spec_block_array(value: &mut Value) {
+    let Some(blocks) = value.as_array_mut() else {
+        return;
+    };
+    let original = std::mem::take(blocks);
+    *blocks = original
+        .into_iter()
+        .flat_map(normalize_cli_spec_block)
+        .collect();
+}
+
+fn normalize_cli_legacy_slides(value: &mut Value) {
+    let Some(slides) = value.as_array_mut() else {
+        return;
+    };
+    for slide in slides {
+        let Some(object) = slide.as_object_mut() else {
+            continue;
+        };
+        if let Some(notes) = object.remove("speakerNotes") {
+            object.entry("speaker_notes".to_string()).or_insert(notes);
+        }
+        if let Some(Value::String(content)) = object.get("content") {
+            object.insert(
+                "content".to_string(),
+                Value::Array(vec![Value::String(content.clone())]),
+            );
+        }
+    }
+}
+
+fn normalize_cli_spec_block(mut block: Value) -> Vec<Value> {
+    let Some(object) = block.as_object_mut() else {
+        return vec![block];
+    };
+    if let Some(notes) = object.remove("speakerNotes") {
+        object.entry("speaker_notes".to_string()).or_insert(notes);
+    }
+    if let Some(format) = object.remove("formulaFormat") {
+        object.entry("formula_format".to_string()).or_insert(format);
+    }
+    let block_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("paragraph")
+        .to_ascii_lowercase();
+    match block_type.as_str() {
+        "section" | "slide" => {
+            let children = object
+                .remove("content")
+                .or_else(|| object.remove("children"))
+                .or_else(|| object.remove("blocks"));
+            let heading_text = object
+                .remove("title")
+                .or_else(|| object.remove("heading"))
+                .or_else(|| object.get("text").cloned())
+                .unwrap_or_else(|| Value::String("Section".to_string()));
+            object.insert("type".to_string(), Value::String("heading".to_string()));
+            object.insert("level".to_string(), Value::Number(1.into()));
+            object.insert("text".to_string(), heading_text);
+            let mut normalized = vec![block];
+            if let Some(Value::Array(children)) = children {
+                normalized.extend(children.into_iter().flat_map(normalize_cli_spec_block));
+            }
+            normalized
+        }
+        "list" | "bullet" | "bullet_list" | "bullets_list" => {
+            object.insert("type".to_string(), Value::String("bullets".to_string()));
+            if !object.contains_key("items") {
+                if let Some(content) = object.remove("content") {
+                    object.insert("items".to_string(), coerce_cli_string_list(content));
+                }
+            }
+            vec![block]
+        }
+        "equation" | "math" => {
+            object.insert("type".to_string(), Value::String("formula".to_string()));
+            if !object.contains_key("latex") {
+                if let Some(value) = object
+                    .remove("formula")
+                    .or_else(|| object.remove("content"))
+                {
+                    object.insert("latex".to_string(), value);
+                }
+            }
+            vec![block]
+        }
+        "figure" | "picture" => {
+            object.insert("type".to_string(), Value::String("image".to_string()));
+            if !object.contains_key("path") {
+                if let Some(path) = object
+                    .remove("source_path")
+                    .or_else(|| object.remove("src"))
+                {
+                    object.insert("path".to_string(), path);
+                }
+            }
+            vec![block]
+        }
+        _ => vec![block],
+    }
+}
+
+fn coerce_cli_string_list(value: Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| match item {
+                    Value::String(text) => Value::String(text),
+                    other => Value::String(other.to_string()),
+                })
+                .collect(),
+        ),
+        Value::String(text) => Value::Array(vec![Value::String(text)]),
+        other => Value::Array(vec![Value::String(other.to_string())]),
+    }
+}
+
+fn cli_document_tool_format(tool_name: &str, input: &Map<String, Value>) -> String {
+    if let Some(format) = input.get("format").and_then(Value::as_str) {
+        return normalize_cli_document_format(format);
+    }
+    let key = cli_tool_key(tool_name);
+    if key.contains("ppt") || key.contains("presentation") {
+        "pptx".to_string()
+    } else if key.contains("docx") {
+        "docx".to_string()
+    } else if key.contains("xlsx") || key.contains("spreadsheet") {
+        "xlsx".to_string()
+    } else if key.contains("pdf") {
+        "pdf".to_string()
+    } else {
+        "pptx".to_string()
+    }
+}
+
+fn normalize_cli_document_format(value: &str) -> String {
+    match value
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ppt" => "pptx".to_string(),
+        "xls" => "xlsx".to_string(),
+        "doc" => "docx".to_string(),
+        "powerpoint" | "presentation" => "pptx".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "pptx".to_string(),
+    }
+}
+
+fn protect_cli_document_output_path(input: &mut Map<String, Value>, format: &str) {
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let repaired = if path.is_empty() {
+        Some(format!(
+            "output/himalaya_document_{}.{}",
+            cli_current_time_millis(),
+            format
+        ))
+    } else {
+        safe_cli_document_output_path(path, format)
+    };
+    if let Some(path) = repaired {
+        input.insert("path".to_string(), Value::String(path));
+    }
+}
+
+fn safe_cli_document_output_path(path: &str, format: &str) -> Option<String> {
+    let candidate = Path::new(path);
+    let mut repaired = if candidate.is_absolute() {
+        let cwd = env::current_dir()
+            .ok()
+            .and_then(|dir| dir.canonicalize().ok());
+        let absolute = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.to_path_buf());
+        match cwd.and_then(|cwd| absolute.strip_prefix(cwd).ok().map(Path::to_path_buf)) {
+            Some(relative) if !relative.as_os_str().is_empty() => relative,
+            _ => PathBuf::from("output").join(
+                candidate
+                    .file_name()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| std::ffi::OsStr::new("himalaya_document")),
+            ),
+        }
+    } else {
+        candidate.to_path_buf()
+    };
+    if repaired.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        repaired = PathBuf::from("output").join(
+            repaired
+                .file_name()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| std::ffi::OsStr::new("himalaya_document")),
+        );
+    }
+    let expected_extension = normalize_cli_document_format(format);
+    if repaired.extension().and_then(|ext| ext.to_str()).is_none() {
+        repaired.set_extension(&expected_extension);
+    }
+    let repaired = repaired.to_string_lossy().replace('\\', "/");
+    (repaired != path).then_some(repaired)
+}
+
+fn cli_doc_service_fallback_generate_file_value(tool_name: &str, value: &Value) -> Option<Value> {
+    if tool_name == "MCPTool" {
+        let object = value.as_object()?;
+        let qualified_name = object
+            .get("qualifiedName")
+            .or_else(|| object.get("tool"))
+            .and_then(Value::as_str)?;
+        if !is_cli_doc_service_generation_tool(qualified_name) {
+            return None;
+        }
+        let arguments = object.get("arguments")?.clone();
+        return cli_doc_service_fallback_generate_file_value(qualified_name, &arguments);
+    }
+    if !is_cli_doc_service_generation_tool(tool_name) {
+        return None;
+    }
+    let mut object = value.as_object()?.clone();
+    object.insert("format".to_string(), Value::String("pptx".to_string()));
+    Some(Value::Object(object))
+}
+
 impl RuntimeMcpState {
     fn new(
         runtime_config: &runtime::RuntimeConfig,
@@ -6854,6 +7346,7 @@ impl RuntimeMcpState {
                 manager,
                 pending_servers,
                 degraded_report,
+                doc_service_generation_failed: false,
             },
             discovery,
         )))
@@ -6881,11 +7374,26 @@ impl RuntimeMcpState {
         qualified_tool_name: &str,
         arguments: Option<serde_json::Value>,
     ) -> Result<String, ToolError> {
+        if self.doc_service_generation_failed
+            && is_cli_doc_service_generation_tool(qualified_tool_name)
+        {
+            return Err(ToolError::new(
+                "doc-service generation is disabled for this run after a previous failure; use `generate_file` fallback for the same document_spec",
+            ));
+        }
         let response = self
             .runtime
             .block_on(self.manager.call_tool(qualified_tool_name, arguments))
-            .map_err(|error| ToolError::new(error.to_string()))?;
+            .map_err(|error| {
+                if is_cli_doc_service_generation_tool(qualified_tool_name) {
+                    self.doc_service_generation_failed = true;
+                }
+                ToolError::new(error.to_string())
+            })?;
         if let Some(error) = response.error {
+            if is_cli_doc_service_generation_tool(qualified_tool_name) {
+                self.doc_service_generation_failed = true;
+            }
             return Err(ToolError::new(format!(
                 "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
                 error.message, error.code
@@ -15922,6 +16430,8 @@ impl ToolExecutor for CliToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let value = normalize_cli_document_tool_value(tool_name, value)?;
+        let fallback_value = cli_doc_service_fallback_generate_file_value(tool_name, &value);
         let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
@@ -15933,6 +16443,22 @@ impl ToolExecutor for CliToolExecutor {
             self.tool_registry
                 .execute(tool_name, &value)
                 .map_err(ToolError::new)
+        };
+        let result = match result {
+            Err(error) => {
+                if let Some(fallback_value) = fallback_value {
+                    self.tool_registry
+                        .execute("generate_file", &fallback_value)
+                        .map_err(|fallback_error| {
+                            ToolError::new(format!(
+                                "{error}; generate_file fallback also failed: {fallback_error}"
+                            ))
+                        })
+                } else {
+                    Err(error)
+                }
+            }
+            ok => ok,
         };
         match result {
             Ok(output) => {
@@ -16828,6 +17354,29 @@ mod tests {
         assert_eq!(
             event["protocol_version"],
             serde_json::Value::from(STREAM_PROTOCOL_VERSION)
+        );
+    }
+
+    #[test]
+    fn document_tool_normalization_repairs_missing_path_and_jsonish_spec() {
+        let normalized = super::normalize_cli_document_tool_value(
+            "generate_file",
+            json!({
+                "document_spec": "{\"title\":\"答辩PPT\",\"blocks\":[{\"type\":\"section\",\"title\":\"研究内容\",\"content\":[{\"type\":\"equation\",\"formula\":\"E=mc^2\"}]}],\"generation_contract\":{\"fail_on_contract_violation\": True}}"
+            }),
+        )
+        .expect("document tool input should normalize");
+
+        assert!(normalized["path"]
+            .as_str()
+            .expect("path")
+            .starts_with("output/himalaya_document_"));
+        assert_eq!(normalized["format"], "pptx");
+        assert_eq!(normalized["document_spec"]["blocks"][0]["type"], "heading");
+        assert_eq!(normalized["document_spec"]["blocks"][1]["type"], "formula");
+        assert_eq!(
+            normalized["document_spec"]["generation_contract"]["fail_on_contract_violation"],
+            true
         );
     }
 

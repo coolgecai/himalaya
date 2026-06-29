@@ -662,6 +662,12 @@ impl TurnTaskState {
                     "- Attachment contract: the source document is already available in conversation context; do not ask the user to upload or paste it again."
                         .to_string(),
                 );
+                if requires_chunk_guided_document_reading(&self.source_attachments) {
+                    lines.push(
+                        "- Long-document strategy: first build/use section, figure, table, formula, and experiment-result indexes; then read only the required chunks/assets by index before composing document_spec."
+                            .to_string(),
+                    );
+                }
             }
             if self.requires_generate_file_deliverable {
                 lines.push(format!(
@@ -776,6 +782,16 @@ impl AttachmentEvidence {
         }
         self
     }
+}
+
+fn requires_chunk_guided_document_reading(source_attachments: &[AttachmentEvidence]) -> bool {
+    source_attachments.iter().any(|attachment| {
+        attachment.extracted_chars.unwrap_or_default() >= 30_000
+            || attachment
+                .details
+                .iter()
+                .any(|detail| detail.contains("chunks:") || detail.contains("fullTextPath:"))
+    })
 }
 
 fn push_capabilities(capabilities: &mut Vec<String>, values: &[&str]) {
@@ -989,6 +1005,27 @@ fn is_doc_service_generation_tool(tool_name: &str) -> bool {
     )
 }
 
+fn mcp_wrapper_document_generation_tool_name(input: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(input).ok()?;
+    let object = value.as_object()?;
+    let qualified_name = object
+        .get("qualifiedName")
+        .or_else(|| object.get("qualified_name"))
+        .or_else(|| object.get("tool"))
+        .and_then(Value::as_str)?;
+    is_doc_service_generation_tool(qualified_name).then(|| qualified_name.to_string())
+}
+
+fn observed_document_generation_tool_name(tool_name: &str, input: &str) -> Option<String> {
+    if is_generate_file_tool(tool_name) {
+        return Some(tool_name.to_string());
+    }
+    if normalize_tool_key(tool_name) == "mcptool" {
+        return mcp_wrapper_document_generation_tool_name(input);
+    }
+    None
+}
+
 fn document_generation_tool_available(available_tool_names: &BTreeSet<String>) -> bool {
     available_tool_names
         .iter()
@@ -1105,7 +1142,19 @@ fn document_asset_manifest_path_from_output(output: &str) -> Option<String> {
 fn request_requires_figure_assets(user_input: &str) -> bool {
     let lower = user_input.to_lowercase();
     [
-        "图片", "插图", "图像", "图表", "原图", "扣取", "挖取", "figure", "figures", "image",
+        "图片",
+        "插图",
+        "图像",
+        "图表",
+        "图文并茂",
+        "配图",
+        "示意图",
+        "原图",
+        "扣取",
+        "挖取",
+        "figure",
+        "figures",
+        "image",
         "images",
     ]
     .iter()
@@ -1146,11 +1195,11 @@ fn minimum_expected_slide_count(
     source_attachments: &[AttachmentEvidence],
 ) -> usize {
     if let Some(count) = estimate_requested_slide_count(user_input) {
-        return count.max(6);
+        return count.max(if source_attachments.is_empty() { 6 } else { 12 });
     }
     let lower = user_input.to_lowercase();
     if lower.contains("30分钟") || lower.contains("30 分钟") || lower.contains("30-minute") {
-        22
+        24
     } else if !source_attachments.is_empty()
         && (lower.contains("学位") || lower.contains("论文") || lower.contains("答辩"))
     {
@@ -1164,6 +1213,13 @@ fn minimum_expected_slide_count(
 
 fn document_quality_blocking_summary(output: &str) -> Option<String> {
     let value: Value = serde_json::from_str(output).ok()?;
+    if let Some(error) = json_str(&value, "error", "error").filter(|error| !error.trim().is_empty())
+    {
+        return Some(format!(
+            "document-generation tool returned error: {}",
+            error.chars().take(180).collect::<String>()
+        ));
+    }
     let quality = value.get("quality")?;
     let failures = json_count(quality, "failureCount", "failure_count");
     let blockers = json_count(quality, "blockerCount", "blocker_count");
@@ -1176,7 +1232,10 @@ fn document_quality_blocking_summary(output: &str) -> Option<String> {
         .is_some_and(|checks| {
             checks.iter().any(|check| {
                 json_str(check, "status", "status")
-                    .is_some_and(|status| matches!(status, "fail" | "blocker"))
+                    .map(|status| status.to_ascii_lowercase())
+                    .is_some_and(|status| {
+                        matches!(status.as_str(), "fail" | "failed" | "blocker" | "blocked")
+                    })
             })
         });
     if failures == 0
@@ -1217,17 +1276,55 @@ fn document_quality_blocking_summary_for_request(
     let value: Value = serde_json::from_str(output).ok()?;
     let quality = value.get("quality").unwrap_or(&value);
     if requested_presentation(user_input) {
+        if document_output_path(&value).is_none() && document_manifest_path(&value).is_none() {
+            return Some(
+                "document-generation tool did not report an output file path or manifestPath"
+                    .to_string(),
+            );
+        }
         let minimum = minimum_expected_slide_count(user_input, source_attachments);
-        let slide_count = json_count(quality, "slideCount", "slide_count");
-        if minimum > 0 && slide_count > 0 && slide_count < minimum {
-            return Some(format!(
-                "slide count {slide_count} is below the expected minimum {minimum}"
-            ));
+        let slide_count = json_count_any(quality, &["slideCount", "slide_count"])
+            .or_else(|| json_count_any(&value, &["slideCount", "slide_count"]));
+        if minimum > 0 {
+            match slide_count {
+                Some(count) if count < minimum => {
+                    return Some(format!(
+                        "slide count {count} is below the expected minimum {minimum}"
+                    ));
+                }
+                None => {
+                    return Some(format!(
+                        "generated presentation did not report slide_count; expected at least {minimum} slide(s)"
+                    ));
+                }
+                _ => {}
+            }
         }
     }
+    if !source_attachments.is_empty()
+        && requested_presentation(user_input)
+        && document_manifest_path(&value).is_none()
+    {
+        return Some(
+            "source-backed document generation did not report manifestPath for verification"
+                .to_string(),
+        );
+    }
     if !source_attachments.is_empty() && request_requires_figure_assets(user_input) {
-        let image_count = json_count(quality, "imageCount", "image_count")
-            + json_count(quality, "extractedAssetCount", "extracted_asset_count");
+        let image_count = json_count_sum(
+            quality,
+            &[
+                "imageCount",
+                "image_count",
+                "embedded_image_count",
+                "pptx_picture_count",
+                "pptx_media_file_count",
+                "extractedAssetCount",
+                "extracted_asset_count",
+                "source_extracted_figure_count",
+                "asset_manifest_figure_count",
+            ],
+        );
         if image_count == 0 {
             return Some(
                 "request required source images/figures, but generated quality reported none"
@@ -1236,7 +1333,17 @@ fn document_quality_blocking_summary_for_request(
         }
     }
     if !source_attachments.is_empty() && request_requires_table_assets(user_input) {
-        let table_count = json_count(quality, "tableCount", "table_count");
+        let table_count = json_count_sum(
+            quality,
+            &[
+                "tableCount",
+                "table_count",
+                "rendered_table_count",
+                "pptx_table_object_count",
+                "source_extracted_table_count",
+                "asset_manifest_table_count",
+            ],
+        );
         if table_count == 0 {
             return Some(
                 "request required tables, but generated quality reported none".to_string(),
@@ -1244,23 +1351,78 @@ fn document_quality_blocking_summary_for_request(
         }
     }
     if !source_attachments.is_empty() && request_requires_formula_assets(user_input) {
-        let formula_count = json_count(quality, "formulaCount", "formula_count")
-            + json_count(quality, "formulaImageCount", "formula_image_count");
+        let formula_count = json_count_sum(
+            quality,
+            &[
+                "formulaCount",
+                "formula_count",
+                "formulaImageCount",
+                "formula_image_count",
+                "editable_formula_count",
+                "rendered_formula_count",
+                "pptx_office_math_count",
+                "pptx_formula_image_count",
+                "source_extracted_formula_count",
+                "asset_manifest_formula_count",
+            ],
+        );
         if formula_count == 0 {
             return Some(
                 "request required formulas, but generated quality reported none".to_string(),
             );
         }
     }
+    if !source_attachments.is_empty() && request_requires_chart_assets(user_input) {
+        let chart_count = json_count_sum(
+            quality,
+            &[
+                "chartCount",
+                "chart_count",
+                "rendered_chart_count",
+                "pptx_chart_object_count",
+                "source_grounded_chart_count",
+            ],
+        );
+        if chart_count == 0 {
+            return Some(
+                "request required charts/plots, but generated quality reported none".to_string(),
+            );
+        }
+    }
     None
 }
 
+fn document_output_path(value: &Value) -> Option<&str> {
+    json_str(value, "filePath", "file_path")
+        .or_else(|| json_str(value, "path", "path"))
+        .or_else(|| json_str(value, "outputPath", "output_path"))
+        .filter(|path| !path.trim().is_empty())
+}
+
+fn document_manifest_path(value: &Value) -> Option<&str> {
+    json_str(value, "manifestPath", "manifest_path")
+        .or_else(|| json_str(value, "assetManifestPath", "asset_manifest_path"))
+        .filter(|path| !path.trim().is_empty())
+}
+
 fn json_count(value: &Value, camel: &str, snake: &str) -> usize {
-    value
-        .get(camel)
-        .or_else(|| value.get(snake))
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize
+    json_count_any(value, &[camel, snake]).unwrap_or(0)
+}
+
+fn json_count_any(value: &Value, keys: &[&str]) -> Option<usize> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_u64)
+            .map(|count| count as usize)
+    })
+}
+
+fn json_count_sum(value: &Value, keys: &[&str]) -> usize {
+    keys.iter()
+        .filter_map(|key| value.get(*key).and_then(Value::as_u64))
+        .map(|count| count as usize)
+        .sum()
 }
 
 fn json_str<'a>(value: &'a Value, camel: &str, snake: &str) -> Option<&'a str> {
@@ -1275,7 +1437,7 @@ fn quality_failure_messages(quality: &Value) -> Vec<String> {
     if let Some(checks) = quality.get("checks").and_then(Value::as_array) {
         for check in checks {
             let status = json_str(check, "status", "status").unwrap_or_default();
-            if matches!(status, "fail" | "blocker") {
+            if matches!(status, "fail" | "failed" | "blocker" | "blocked") {
                 let id = json_str(check, "id", "id").unwrap_or("quality.issue");
                 let message = json_str(check, "message", "message").unwrap_or("");
                 messages.push(format!("{id}: {message}").chars().take(180).collect());
@@ -1296,7 +1458,26 @@ fn document_generation_needs_asset_preflight(
         && (request_requires_figure_assets(user_input)
             || request_requires_table_assets(user_input)
             || request_requires_formula_assets(user_input)
-            || request_requires_chart_assets(user_input))
+            || request_requires_chart_assets(user_input)
+            || academic_source_presentation_request(user_input, source_attachments))
+}
+
+fn academic_source_presentation_request(
+    user_input: &str,
+    source_attachments: &[AttachmentEvidence],
+) -> bool {
+    if source_attachments.is_empty() || !requested_presentation(user_input) {
+        return false;
+    }
+    let lower = user_input.to_lowercase();
+    lower.contains("学位")
+        || lower.contains("论文")
+        || lower.contains("答辩")
+        || lower.contains("学术")
+        || lower.contains("thesis")
+        || lower.contains("dissertation")
+        || lower.contains("defense")
+        || lower.contains("academic")
 }
 
 fn source_attachment_pdf_path(source_attachments: &[AttachmentEvidence]) -> Option<String> {
@@ -1347,6 +1528,7 @@ fn document_generation_asset_extract_tool_use(
         .map(sanitize_path_component)
         .filter(|stem| !stem.is_empty())
         .unwrap_or_else(|| "source".to_string());
+    let academic_deck = academic_source_presentation_request(user_input, source_attachments);
     let input = serde_json::json!({
         "path": source_path,
         "format": "pdf",
@@ -1356,10 +1538,10 @@ fn document_generation_asset_extract_tool_use(
         "max_runtime_seconds": 180,
         "page_batch_size": 24,
         "render_page_previews": false,
-        "extract_images": request_requires_figure_assets(user_input) || request_requires_chart_assets(user_input),
-        "extract_captioned_figures": request_requires_figure_assets(user_input) || request_requires_chart_assets(user_input),
-        "extract_tables": request_requires_table_assets(user_input),
-        "extract_formula_candidates": request_requires_formula_assets(user_input),
+        "extract_images": academic_deck || request_requires_figure_assets(user_input) || request_requires_chart_assets(user_input),
+        "extract_captioned_figures": academic_deck || request_requires_figure_assets(user_input) || request_requires_chart_assets(user_input),
+        "extract_tables": academic_deck || request_requires_table_assets(user_input),
+        "extract_formula_candidates": academic_deck || request_requires_formula_assets(user_input),
     })
     .to_string();
     Some((
@@ -1530,6 +1712,9 @@ fn normalize_document_generation_tool_input(input: &mut Value, user_input: &str)
     if let Some(spec) = object.remove("documentSpec") {
         object.entry("document_spec".to_string()).or_insert(spec);
     }
+    if let Some(spec) = object.get_mut("document_spec") {
+        normalize_document_spec_value(spec);
+    }
     if !object.contains_key("document_spec") {
         if let Some(outline) = object.remove("outline") {
             if !object.contains_key("slides") && !object.contains_key("blocks") {
@@ -1568,6 +1753,202 @@ fn normalize_document_generation_tool_input(input: &mut Value, user_input: &str)
     }
 }
 
+fn normalize_document_spec_value(spec: &mut Value) {
+    match spec.take() {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            let parsed = serde_json::from_str::<Value>(trimmed)
+                .or_else(|_| serde_json::from_str::<Value>(&jsonish_python_literals(trimmed)));
+            *spec = match parsed {
+                Ok(Value::Object(object)) => Value::Object(object),
+                Ok(Value::Array(blocks)) => serde_json::json!({ "blocks": blocks }),
+                _ => Value::String(raw),
+            };
+        }
+        Value::Array(blocks) => {
+            *spec = serde_json::json!({ "blocks": blocks });
+        }
+        other => {
+            *spec = other;
+        }
+    }
+}
+
+fn jsonish_python_literals(value: &str) -> String {
+    value
+        .replace(": True", ": true")
+        .replace(": False", ": false")
+        .replace(": None", ": null")
+        .replace(":True", ":true")
+        .replace(":False", ":false")
+        .replace(":None", ":null")
+        .replace(", True", ", true")
+        .replace(", False", ", false")
+        .replace(", None", ", null")
+        .replace("[True", "[true")
+        .replace("[False", "[false")
+        .replace("[None", "[null")
+}
+
+fn protect_document_generation_output_path(object: &mut Map<String, Value>, format: &str) {
+    let Some(path) = object
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return;
+    };
+    let Some(repaired) = safe_document_generation_output_path(path, format) else {
+        return;
+    };
+    object.insert("path".to_string(), Value::String(repaired));
+}
+
+fn safe_document_generation_output_path(path: &str, format: &str) -> Option<String> {
+    let candidate = Path::new(path);
+    let mut repaired = if candidate.is_absolute() {
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|dir| dir.canonicalize().ok());
+        let absolute = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.to_path_buf());
+        match cwd.and_then(|cwd| absolute.strip_prefix(cwd).ok().map(Path::to_path_buf)) {
+            Some(relative) if !relative.as_os_str().is_empty() => relative,
+            _ => PathBuf::from("output").join(
+                candidate
+                    .file_name()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| std::ffi::OsStr::new("himalaya_document")),
+            ),
+        }
+    } else {
+        candidate.to_path_buf()
+    };
+    if repaired.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        repaired = PathBuf::from("output").join(
+            repaired
+                .file_name()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| std::ffi::OsStr::new("himalaya_document")),
+        );
+    }
+    if repaired
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_none()
+    {
+        repaired.set_extension(format);
+    }
+    let repaired = repaired.to_string_lossy().replace('\\', "/");
+    (repaired != path).then_some(repaired)
+}
+
+fn normalize_document_spec_blocks(value: &mut Value) {
+    let Some(blocks) = value.as_array_mut() else {
+        return;
+    };
+    let original = std::mem::take(blocks);
+    *blocks = original
+        .into_iter()
+        .flat_map(normalize_document_spec_block)
+        .collect();
+}
+
+fn normalize_document_spec_block(mut block: Value) -> Vec<Value> {
+    let Some(object) = block.as_object_mut() else {
+        return vec![block];
+    };
+    if let Some(notes) = object.remove("speakerNotes") {
+        object.entry("speaker_notes".to_string()).or_insert(notes);
+    }
+    if let Some(format) = object.remove("formulaFormat") {
+        object.entry("formula_format".to_string()).or_insert(format);
+    }
+    let block_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("paragraph")
+        .to_ascii_lowercase();
+    match block_type.as_str() {
+        "section" | "slide" => {
+            let children = object
+                .remove("content")
+                .or_else(|| object.remove("children"))
+                .or_else(|| object.remove("blocks"));
+            let heading_text = object
+                .remove("title")
+                .or_else(|| object.remove("heading"))
+                .or_else(|| object.get("text").cloned())
+                .unwrap_or_else(|| Value::String("Section".to_string()));
+            object.insert("type".to_string(), Value::String("heading".to_string()));
+            object.insert("level".to_string(), Value::Number(1.into()));
+            object.insert("text".to_string(), heading_text);
+            let mut normalized = vec![block];
+            if let Some(Value::Array(children)) = children {
+                normalized.extend(children.into_iter().flat_map(normalize_document_spec_block));
+            }
+            normalized
+        }
+        "list" | "bullet" | "bullet_list" | "bullets_list" => {
+            object.insert("type".to_string(), Value::String("bullets".to_string()));
+            if !object.contains_key("items") {
+                if let Some(content) = object.remove("content") {
+                    object.insert("items".to_string(), coerce_document_string_list(content));
+                }
+            }
+            vec![block]
+        }
+        "equation" | "math" => {
+            object.insert("type".to_string(), Value::String("formula".to_string()));
+            if !object.contains_key("latex") {
+                if let Some(value) = object
+                    .remove("formula")
+                    .or_else(|| object.remove("content"))
+                {
+                    object.insert("latex".to_string(), value);
+                }
+            }
+            vec![block]
+        }
+        "figure" | "picture" => {
+            object.insert("type".to_string(), Value::String("image".to_string()));
+            if !object.contains_key("path") {
+                if let Some(path) = object
+                    .remove("source_path")
+                    .or_else(|| object.remove("src"))
+                {
+                    object.insert("path".to_string(), path);
+                }
+            }
+            vec![block]
+        }
+        _ => vec![block],
+    }
+}
+
+fn coerce_document_string_list(value: Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| match item {
+                    Value::String(text) => Value::String(text),
+                    other => Value::String(other.to_string()),
+                })
+                .collect(),
+        ),
+        Value::String(text) => Value::Array(vec![Value::String(text)]),
+        other => Value::Array(vec![Value::String(other.to_string())]),
+    }
+}
+
 fn repair_document_generation_tool_input(
     input: &mut Value,
     tool_name: &str,
@@ -1588,6 +1969,8 @@ fn repair_document_generation_tool_input(
                 format
             )),
         );
+    } else {
+        protect_document_generation_output_path(object, format);
     }
     if matches!(
         normalize_tool_key(tool_name).as_str(),
@@ -1597,6 +1980,9 @@ fn repair_document_generation_tool_input(
         object.insert("format".to_string(), Value::String(format.to_string()));
     }
     if is_doc_service_generation_tool(tool_name) {
+        object
+            .entry("strict_quality".to_string())
+            .or_insert(Value::Bool(true));
         if let Some(path) = asset_manifest_path.filter(|path| !path.trim().is_empty()) {
             object
                 .entry("asset_manifest_path".to_string())
@@ -1604,116 +1990,144 @@ fn repair_document_generation_tool_input(
         }
     }
 
-    let spec_entry = object
-        .entry("document_spec".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    if !spec_entry.is_object() {
-        return;
-    }
-    let spec = spec_entry.as_object_mut().expect("checked object");
-    if let Some(document_type) = spec.remove("documentType") {
-        spec.entry("document_type".to_string())
-            .or_insert(document_type);
-    }
-    if let Some(source_documents) = spec.remove("sourceDocuments") {
-        spec.entry("source_documents".to_string())
-            .or_insert(source_documents);
-    }
-    if let Some(contract) = spec.remove("generationContract") {
-        spec.entry("generation_contract".to_string())
-            .or_insert(contract);
-    }
-    if !spec.contains_key("title") {
-        spec.insert(
-            "title".to_string(),
-            Value::String(infer_rescue_document_title(user_input, true)),
-        );
-    }
-    if requested_presentation(user_input) && !spec.contains_key("document_type") {
-        spec.insert(
-            "document_type".to_string(),
-            Value::String(
-                if user_input.contains("答辩") || user_input.to_lowercase().contains("defense") {
-                    "degree_defense"
-                } else {
-                    "academic_talk"
-                }
-                .to_string(),
-            ),
-        );
-    }
-    if !source_attachments.is_empty()
-        && spec
-            .get("source_documents")
-            .and_then(Value::as_array)
-            .is_none_or(|documents| documents.is_empty())
+    let mut promoted_theme: Option<String> = None;
     {
-        spec.insert(
-            "source_documents".to_string(),
-            Value::Array(
-                source_attachments
-                    .iter()
-                    .take(8)
-                    .map(|attachment| {
-                        serde_json::json!({
-                            "document": attachment.label,
-                            "paragraph": attachment.details.join("; ")
-                        })
-                    })
-                    .collect(),
-            ),
-        );
-    }
-    let contract = spec
-        .entry("generation_contract".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    if let Some(contract) = contract.as_object_mut() {
-        contract
-            .entry("strict_source_grounding".to_string())
-            .or_insert(Value::Bool(!source_attachments.is_empty()));
-        contract
-            .entry("fail_on_contract_violation".to_string())
-            .or_insert(Value::Bool(true));
-        contract
-            .entry("allow_degraded_output".to_string())
-            .or_insert(Value::Bool(false));
-        contract
-            .entry("require_manifest".to_string())
-            .or_insert(Value::Bool(true));
-        if requested_presentation(user_input) {
-            contract
-                .entry("expected_slide_count".to_string())
-                .or_insert(Value::Number(serde_json::Number::from(
-                    minimum_expected_slide_count(user_input, source_attachments),
-                )));
+        let spec_entry = object
+            .entry("document_spec".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !spec_entry.is_object() {
+            return;
         }
-        if request_requires_figure_assets(user_input)
-            || request_requires_table_assets(user_input)
-            || request_requires_formula_assets(user_input)
-            || request_requires_chart_assets(user_input)
+        let spec = spec_entry.as_object_mut().expect("checked object");
+        if let Some(document_type) = spec.remove("documentType") {
+            spec.entry("document_type".to_string())
+                .or_insert(document_type);
+        }
+        if let Some(source_documents) = spec.remove("sourceDocuments") {
+            spec.entry("source_documents".to_string())
+                .or_insert(source_documents);
+        }
+        if let Some(contract) = spec.remove("generationContract") {
+            spec.entry("generation_contract".to_string())
+                .or_insert(contract);
+        }
+        if let Some(Value::String(theme)) = spec.get("theme").cloned() {
+            if is_doc_service_generation_tool(tool_name) {
+                promoted_theme = Some(theme);
+                spec.remove("theme");
+            }
+        }
+        if let Some(blocks) = spec.get_mut("blocks") {
+            normalize_document_spec_blocks(blocks);
+        }
+        if !spec.contains_key("title") {
+            spec.insert(
+                "title".to_string(),
+                Value::String(infer_rescue_document_title(user_input, true)),
+            );
+        }
+        if requested_presentation(user_input) && !spec.contains_key("document_type") {
+            spec.insert(
+                "document_type".to_string(),
+                Value::String(
+                    if user_input.contains("答辩") || user_input.to_lowercase().contains("defense")
+                    {
+                        "degree_defense"
+                    } else {
+                        "academic_talk"
+                    }
+                    .to_string(),
+                ),
+            );
+        }
+        if !source_attachments.is_empty()
+            && spec
+                .get("source_documents")
+                .and_then(Value::as_array)
+                .is_none_or(|documents| documents.is_empty())
         {
-            let lower_input = user_input.to_lowercase();
-            let academic_deck = requested_presentation(user_input)
-                && !source_attachments.is_empty()
-                && (lower_input.contains("学位")
-                    || lower_input.contains("论文")
-                    || lower_input.contains("答辩")
-                    || lower_input.contains("thesis")
-                    || lower_input.contains("defense"));
-            let rich_min = if academic_deck { 2 } else { 1 };
-            contract
-                .entry("required_assets".to_string())
-                .or_insert_with(|| {
-                    serde_json::json!({
-                        "figures": if request_requires_figure_assets(user_input) { rich_min } else { 0 },
-                        "tables": if request_requires_table_assets(user_input) { rich_min } else { 0 },
-                        "formulas": if request_requires_formula_assets(user_input) { rich_min } else { 0 },
-                        "charts": if request_requires_chart_assets(user_input) { 1 } else { 0 },
-                        "require_source_refs": !source_attachments.is_empty(),
-                        "require_extracted_assets": !source_attachments.is_empty()
-                    })
-                });
+            spec.insert(
+                "source_documents".to_string(),
+                Value::Array(
+                    source_attachments
+                        .iter()
+                        .take(8)
+                        .map(|attachment| {
+                            serde_json::json!({
+                                "document": attachment.label,
+                                "paragraph": attachment.details.join("; ")
+                            })
+                        })
+                        .collect(),
+                ),
+            );
         }
+        let contract = spec
+            .entry("generation_contract".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(contract) = contract.as_object_mut() {
+            contract
+                .entry("strict_source_grounding".to_string())
+                .or_insert(Value::Bool(!source_attachments.is_empty()));
+            contract
+                .entry("fail_on_contract_violation".to_string())
+                .or_insert(Value::Bool(true));
+            contract
+                .entry("allow_degraded_output".to_string())
+                .or_insert(Value::Bool(false));
+            contract
+                .entry("require_manifest".to_string())
+                .or_insert(Value::Bool(true));
+            contract
+                .entry("minimum_quality_score".to_string())
+                .or_insert(Value::Number(serde_json::Number::from(82)));
+            if request_requires_formula_assets(user_input) {
+                contract
+                    .entry("require_editable_formulas".to_string())
+                    .or_insert(Value::Bool(true));
+            }
+            if requested_presentation(user_input) {
+                contract
+                    .entry("expected_slide_count".to_string())
+                    .or_insert(Value::Number(serde_json::Number::from(
+                        minimum_expected_slide_count(user_input, source_attachments),
+                    )));
+            }
+            if request_requires_figure_assets(user_input)
+                || request_requires_table_assets(user_input)
+                || request_requires_formula_assets(user_input)
+                || request_requires_chart_assets(user_input)
+            {
+                let lower_input = user_input.to_lowercase();
+                let academic_deck = requested_presentation(user_input)
+                    && !source_attachments.is_empty()
+                    && (lower_input.contains("学位")
+                        || lower_input.contains("论文")
+                        || lower_input.contains("答辩")
+                        || lower_input.contains("thesis")
+                        || lower_input.contains("defense"));
+                let figures_min = if academic_deck { 4 } else { 1 };
+                let tables_min = if academic_deck { 2 } else { 1 };
+                let formulas_min = if academic_deck { 2 } else { 1 };
+                contract
+                    .entry("required_assets".to_string())
+                    .or_insert_with(|| {
+                        serde_json::json!({
+                            "figures": if request_requires_figure_assets(user_input) { figures_min } else { 0 },
+                            "tables": if request_requires_table_assets(user_input) { tables_min } else { 0 },
+                            "formulas": if request_requires_formula_assets(user_input) { formulas_min } else { 0 },
+                            "charts": if request_requires_chart_assets(user_input) { 1 } else { 0 },
+                            "require_source_refs": !source_attachments.is_empty(),
+                            "require_extracted_assets": !source_attachments.is_empty()
+                        })
+                    });
+            }
+        }
+    }
+    if let Some(theme) = promoted_theme {
+        object
+            .entry("theme".to_string())
+            .or_insert(Value::String(theme));
     }
 }
 
@@ -3028,6 +3442,86 @@ fn normalize_tool_uses(
         .collect()
 }
 
+fn repair_pending_document_generation_tool_uses(
+    message: &mut ConversationMessage,
+    pending_tool_uses: &mut [(String, String, String)],
+    user_input: &str,
+    source_attachments: &[AttachmentEvidence],
+    asset_manifest_path: Option<&str>,
+) {
+    let mut repaired_by_id = BTreeMap::new();
+    for (tool_use_id, tool_name, input) in pending_tool_uses.iter_mut() {
+        let Ok(mut value) = serde_json::from_str::<Value>(input) else {
+            continue;
+        };
+        let mut repaired = false;
+        if is_generate_file_tool(tool_name) {
+            normalize_document_generation_tool_input(&mut value, user_input);
+            if value.is_object() {
+                repair_document_generation_tool_input(
+                    &mut value,
+                    tool_name,
+                    user_input,
+                    source_attachments,
+                    asset_manifest_path,
+                );
+                repaired = true;
+            }
+        } else if normalize_tool_key(tool_name) == "mcptool" {
+            let qualified_name = value
+                .get("qualifiedName")
+                .or_else(|| value.get("qualified_name"))
+                .or_else(|| value.get("tool"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(qualified_name) =
+                qualified_name.filter(|name| is_doc_service_generation_tool(name))
+            {
+                if let Some(object) = value.as_object_mut() {
+                    let mut arguments = object
+                        .remove("arguments")
+                        .unwrap_or_else(|| Value::Object(Map::new()));
+                    if let Value::String(raw) = arguments {
+                        arguments = serde_json::from_str::<Value>(raw.trim())
+                            .or_else(|_| {
+                                serde_json::from_str::<Value>(&jsonish_python_literals(raw.trim()))
+                            })
+                            .unwrap_or_else(|_| Value::Object(Map::new()));
+                    }
+                    normalize_document_generation_tool_input(&mut arguments, user_input);
+                    if arguments.is_object() {
+                        repair_document_generation_tool_input(
+                            &mut arguments,
+                            &qualified_name,
+                            user_input,
+                            source_attachments,
+                            asset_manifest_path,
+                        );
+                        object.insert("arguments".to_string(), arguments);
+                        repaired = true;
+                    }
+                }
+            }
+        }
+        if !repaired {
+            continue;
+        }
+        let repaired_input = value.to_string();
+        *input = repaired_input.clone();
+        repaired_by_id.insert(tool_use_id.clone(), repaired_input);
+    }
+    if repaired_by_id.is_empty() {
+        return;
+    }
+    for block in &mut message.blocks {
+        if let ContentBlock::ToolUse { id, input, .. } = block {
+            if let Some(repaired) = repaired_by_id.get(id) {
+                *input = repaired.clone();
+            }
+        }
+    }
+}
+
 fn unsupported_tool_output(tool_name: &str, available_tool_names: &BTreeSet<String>) -> String {
     let mut available = available_tool_names.iter().cloned().collect::<Vec<_>>();
     available.sort();
@@ -4172,6 +4666,15 @@ where
                 normalize_tool_uses(&mut assistant_message, &available_tool_names);
             let assistant_text = assistant_plain_text(&assistant_message);
             task_state.observe_super_ppt_artifacts(&assistant_text);
+            if task_state.requires_generate_file_deliverable {
+                repair_pending_document_generation_tool_uses(
+                    &mut assistant_message,
+                    &mut pending_tool_uses,
+                    &user_input,
+                    &task_state.source_attachments,
+                    task_state.document_asset_manifest_path.as_deref(),
+                );
+            }
             if pending_tool_uses.is_empty()
                 && task_state.requires_workspace_analysis
                 && !task_state.evidence_complete()
@@ -4456,7 +4959,10 @@ where
                         .push_message(result_message.clone())
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                     self.record_tool_finished(iterations, &result_message);
-                    task_state.record_tool_result(&tool_name, true, &output);
+                    let state_tool_name =
+                        observed_document_generation_tool_name(&tool_name, &input)
+                            .unwrap_or_else(|| tool_name.clone());
+                    task_state.record_tool_result(&state_tool_name, true, &output);
                     self.record_and_emit_task_progress(
                         &runtime_task_id,
                         &mut task_ledger_offset,
@@ -4670,7 +5176,10 @@ where
                     ..
                 }) = result_message.blocks.first()
                 {
-                    task_state.record_tool_result(tool_name, *is_error, output);
+                    let state_tool_name =
+                        observed_document_generation_tool_name(tool_name, &effective_input)
+                            .unwrap_or_else(|| tool_name.clone());
+                    task_state.record_tool_result(&state_tool_name, *is_error, output);
                 }
                 self.session
                     .push_message(result_message.clone())
@@ -6685,6 +7194,7 @@ mod tests {
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
+    use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -7067,7 +7577,7 @@ mod tests {
             Session::new(),
             DocumentGenerationApiClient { call_count: 0 },
             StaticToolExecutor::new().register("generate_file", |_input| {
-                Ok(r#"{"filePath":"output/defense.pptx","format":"pptx","manifestPath":"output/defense.pptx.manifest.json","quality":{"warnings":[]}}"#.to_string())
+                Ok(r#"{"filePath":"output/defense.pptx","format":"pptx","manifestPath":"output/defense.pptx.manifest.json","quality":{"warnings":[],"slideCount":24}}"#.to_string())
             }),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
@@ -7097,6 +7607,143 @@ mod tests {
                 ..
             } if tool_name == "generate_file"
         )));
+    }
+
+    #[test]
+    fn document_generation_direct_tool_use_is_repaired_before_execution() {
+        let mut message = ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "doc-1".to_string(),
+            name: "mcp__doc-service__generate_pptx".to_string(),
+            input: r#"{"path":"/test.pptx","documentSpec":"{\"title\":\"答辩PPT\",\"theme\":\"ocean\",\"blocks\":[{\"type\":\"section\",\"title\":\"研究内容\",\"content\":[{\"type\":\"list\",\"content\":[\"建模\",\"实验\"]}]}],\"generationContract\":{\"fail_on_contract_violation\": True}}"}"#.to_string(),
+        }]);
+        let mut pending = vec![(
+            "doc-1".to_string(),
+            "mcp__doc-service__generate_pptx".to_string(),
+            match &message.blocks[0] {
+                ContentBlock::ToolUse { input, .. } => input.clone(),
+                _ => unreachable!(),
+            },
+        )];
+        let attachments = vec![
+            super::AttachmentEvidence::text("/tmp/thesis.pdf", Some(88_000))
+                .with_detail("chunks: 12")
+                .with_detail("fullTextPath: /tmp/thesis.txt"),
+        ];
+
+        super::repair_pending_document_generation_tool_uses(
+            &mut message,
+            &mut pending,
+            "请依据附件中的学位论文生成30分钟答辩PPT，要求图片、表格和公式。",
+            &attachments,
+            Some("output/extracted-assets/thesis/assets.manifest.json"),
+        );
+
+        let repaired: Value =
+            serde_json::from_str(&pending[0].2).expect("repaired tool input should be json");
+        assert_eq!(repaired["path"], "output/test.pptx");
+        assert_eq!(repaired["theme"], "ocean");
+        assert_eq!(repaired["strict_quality"], true);
+        assert_eq!(
+            repaired["asset_manifest_path"],
+            "output/extracted-assets/thesis/assets.manifest.json"
+        );
+        assert_eq!(repaired["document_spec"]["blocks"][0]["type"], "heading");
+        assert_eq!(repaired["document_spec"]["blocks"][1]["type"], "bullets");
+        assert_eq!(
+            repaired["document_spec"]["generation_contract"]["expected_slide_count"],
+            24
+        );
+        assert_eq!(
+            repaired["document_spec"]["generation_contract"]["required_assets"]["figures"],
+            4
+        );
+        match &message.blocks[0] {
+            ContentBlock::ToolUse { input, .. } => assert_eq!(input, &pending[0].2),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn document_generation_mcp_wrapper_tool_use_is_repaired_before_execution() {
+        let mut message = ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "doc-wrapper-1".to_string(),
+            name: "MCPTool".to_string(),
+            input: r#"{"qualifiedName":"mcp__doc-service__generate_pptx","arguments":{"path":"/wrapped.pptx","documentSpec":"{\"title\":\"答辩PPT\",\"theme\":\"ocean\",\"blocks\":[{\"type\":\"section\",\"title\":\"研究内容\",\"content\":[{\"type\":\"list\",\"content\":[\"建模\",\"实验\"]}]}]}"}}"#.to_string(),
+        }]);
+        let mut pending = vec![(
+            "doc-wrapper-1".to_string(),
+            "MCPTool".to_string(),
+            match &message.blocks[0] {
+                ContentBlock::ToolUse { input, .. } => input.clone(),
+                _ => unreachable!(),
+            },
+        )];
+        let attachments = vec![
+            super::AttachmentEvidence::text("/tmp/thesis.pdf", Some(88_000))
+                .with_detail("chunks: 12")
+                .with_detail("fullTextPath: /tmp/thesis.txt"),
+        ];
+
+        super::repair_pending_document_generation_tool_uses(
+            &mut message,
+            &mut pending,
+            "请依据附件中的学位论文生成30分钟答辩PPT，要求图片、表格和公式。",
+            &attachments,
+            Some("output/extracted-assets/thesis/assets.manifest.json"),
+        );
+
+        let repaired: Value =
+            serde_json::from_str(&pending[0].2).expect("repaired MCP wrapper input should be json");
+        let args = &repaired["arguments"];
+        assert_eq!(args["path"], "output/wrapped.pptx");
+        assert_eq!(args["theme"], "ocean");
+        assert_eq!(args["strict_quality"], true);
+        assert_eq!(
+            args["asset_manifest_path"],
+            "output/extracted-assets/thesis/assets.manifest.json"
+        );
+        assert_eq!(args["document_spec"]["blocks"][0]["type"], "heading");
+        assert_eq!(args["document_spec"]["blocks"][1]["type"], "bullets");
+        assert_eq!(
+            args["document_spec"]["generation_contract"]["expected_slide_count"],
+            24
+        );
+        assert_eq!(
+            args["document_spec"]["generation_contract"]["required_assets"]["figures"],
+            4
+        );
+        assert_eq!(
+            super::observed_document_generation_tool_name("MCPTool", &pending[0].2),
+            Some("mcp__doc-service__generate_pptx".to_string())
+        );
+        match &message.blocks[0] {
+            ContentBlock::ToolUse { input, .. } => assert_eq!(input, &pending[0].2),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn document_quality_gate_blocks_zero_slide_and_strict_quality_error() {
+        let attachments = vec![super::AttachmentEvidence::text(
+            "/tmp/thesis.pdf",
+            Some(88_000),
+        )];
+        let request =
+            "请依据附件中的学位论文生成30分钟答辩PPT，要求图文并茂，插入必要的图片、表格和公式。";
+        let zero_slide = r#"{"path":"output/thin.pptx","manifestPath":"output/thin.pptx.manifest.json","quality":{"slide_count":0,"image_count":1,"table_count":1,"formula_count":1,"chart_count":1,"quality_level":"final"}}"#;
+        let summary =
+            super::document_quality_blocking_summary_for_request(zero_slide, request, &attachments)
+                .expect("zero-slide presentation should be blocked");
+        assert!(summary.contains("slide count 0"), "{summary}");
+
+        let strict_error = r#"{"path":"output/degraded.pptx","manifestPath":"output/degraded.pptx.manifest.json","quality":{"slide_count":24,"warning_count":1,"quality_level":"degraded"},"error":"strict_quality enabled and quality issues were produced"}"#;
+        let summary = super::document_quality_blocking_summary_for_request(
+            strict_error,
+            request,
+            &attachments,
+        )
+        .expect("strict quality error should be blocked");
+        assert!(summary.contains("strict_quality"), "{summary}");
     }
 
     #[test]
@@ -7188,7 +7835,7 @@ mod tests {
             Session::new().with_workspace_root(&root),
             FollowupDocumentApiClient { call_count: 0 },
             StaticToolExecutor::new().register("generate_file", |_input| {
-                Ok(r#"{"filePath":"output/followup.pptx","format":"pptx","manifestPath":"output/followup.pptx.manifest.json","quality":{"warnings":[]}}"#.to_string())
+                Ok(r#"{"filePath":"output/followup.pptx","format":"pptx","manifestPath":"output/followup.pptx.manifest.json","quality":{"warnings":[],"slideCount":18}}"#.to_string())
             }),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],

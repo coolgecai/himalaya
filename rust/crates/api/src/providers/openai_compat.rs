@@ -170,6 +170,14 @@ impl OpenAiCompatClient {
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
+        if looks_like_html_response(&body) {
+            return Err(openai_compat_html_response_error(
+                self.config.provider_name,
+                &request.model,
+                &body,
+                request_id,
+            ));
+        }
         // Some backends return {"error":{"message":"...","type":"...","code":...}}
         // instead of a valid completion object. Check for this before attempting
         // full deserialization so the user sees the actual error, not a cryptic
@@ -427,6 +435,16 @@ impl OpenAiSseParser {
 
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<ChatCompletionChunk>, ApiError> {
         self.buffer.extend_from_slice(chunk);
+        if let Ok(buffer) = std::str::from_utf8(&self.buffer) {
+            if looks_like_html_response(buffer) {
+                return Err(openai_compat_html_response_error(
+                    &self.provider,
+                    &self.model,
+                    buffer,
+                    None,
+                ));
+            }
+        }
         let mut events = Vec::new();
 
         while let Some(frame) = next_sse_frame(&mut self.buffer) {
@@ -1276,6 +1294,11 @@ fn parse_sse_frame(
     if trimmed.is_empty() {
         return Ok(None);
     }
+    if looks_like_html_response(trimmed) {
+        return Err(openai_compat_html_response_error(
+            provider, model, trimmed, None,
+        ));
+    }
 
     let mut data_lines = Vec::new();
     for line in trimmed.lines() {
@@ -1292,6 +1315,11 @@ fn parse_sse_frame(
     let payload = data_lines.join("\n");
     if payload == "[DONE]" {
         return Ok(None);
+    }
+    if looks_like_html_response(&payload) {
+        return Err(openai_compat_html_response_error(
+            provider, model, &payload, None,
+        ));
     }
     // Some backends embed an error object in a data: frame instead of using an
     // HTTP error status. Surface the error message directly rather than letting
@@ -1325,6 +1353,42 @@ fn parse_sse_frame(
     serde_json::from_str::<ChatCompletionChunk>(&payload)
         .map(Some)
         .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
+}
+
+fn looks_like_html_response(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    let prefix = trimmed
+        .chars()
+        .take(256)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    prefix.starts_with("<!doctype html")
+        || prefix.starts_with("<html")
+        || prefix.contains("<head")
+        || prefix.contains("<body")
+}
+
+fn openai_compat_html_response_error(
+    provider: impl Into<String>,
+    model: &str,
+    body: &str,
+    request_id: Option<String>,
+) -> ApiError {
+    let provider = provider.into();
+    ApiError::Api {
+        status: reqwest::StatusCode::BAD_GATEWAY,
+        error_type: Some("non_json_html_response".to_string()),
+        message: Some(format!(
+            "{provider} OpenAI-compatible endpoint returned HTML instead of JSON/SSE for model `{model}`. Check the configured base_url, API key, proxy/login redirect, and make sure the URL points to an OpenAI-compatible API root rather than a web page."
+        )),
+        request_id,
+        body: truncate_for_provider_error(body, 400),
+        retryable: false,
+    }
+}
+
+fn truncate_for_provider_error(body: &str, max_chars: usize) -> String {
+    body.chars().take(max_chars).collect()
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
@@ -1424,8 +1488,8 @@ impl StringExt for String {
 mod tests {
     use super::{
         build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        looks_like_html_response, normalize_finish_reason, openai_tool_choice, parse_sse_frame,
+        parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1797,6 +1861,30 @@ mod tests {
         assert!(!is_reasoning_model("qwen-max"));
         assert!(!is_reasoning_model("qwen/qwen-plus"));
         assert!(!is_reasoning_model("qwen-turbo"));
+    }
+
+    #[test]
+    fn html_openai_compatible_response_is_diagnosed_before_json_parse() {
+        let html = "<!doctype html><html lang=\"en\"><body>login</body></html>";
+        assert!(looks_like_html_response(html));
+        let error =
+            parse_sse_frame(html, "OpenAI", "gpt-5.5").expect_err("html frame should be rejected");
+        match error {
+            ApiError::Api {
+                error_type,
+                message,
+                retryable,
+                ..
+            } => {
+                assert_eq!(error_type.as_deref(), Some("non_json_html_response"));
+                assert!(message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("returned HTML instead of JSON/SSE"));
+                assert!(!retryable);
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
     }
 
     #[test]

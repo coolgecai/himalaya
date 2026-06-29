@@ -494,14 +494,14 @@ def _check_generation_contract(
 
     expected_slide_count = contract.expected_slide_count if contract else None
     actual_slide_count = int(extra.get("slide_count") or len(slide_titles) or 0)
-    if format == "pptx" and expected_slide_count and actual_slide_count:
+    if format == "pptx" and expected_slide_count:
         lower = max(1, int(expected_slide_count * 0.75))
         upper = max(expected_slide_count + 2, int(expected_slide_count * 1.35))
         if actual_slide_count < lower or actual_slide_count > upper:
             _contract_check(check, contract, "pptx.slide_count_contract", f"PPTX has {actual_slide_count} slide(s), outside expected range for {expected_slide_count}.")
 
     if format == "pptx" and doc_type == DocumentType.DEGREE_DEFENSE:
-        if actual_slide_count and actual_slide_count < 8 and (not expected_slide_count or expected_slide_count >= 8):
+        if actual_slide_count < 8 and (not expected_slide_count or expected_slide_count >= 8):
             if spec.source_documents or (contract and contract.strict_source_grounding):
                 check("defense.too_short", "Degree defense deck is unusually short; expected a complete research narrative.", QualityStatus.FAIL)
             else:
